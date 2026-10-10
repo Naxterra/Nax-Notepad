@@ -12,7 +12,11 @@ import { buildCommands, installKeybindings } from "./commands";
 import { compartments, indentExt, lineNumbersExt } from "./editor";
 import { loadSettings, onSettingsChange, settings, updateSettings } from "./settings";
 import { applyTheme, onSystemThemeChange } from "./theme";
-import { h, isModalOpen, showModal } from "./ui/dialogs";
+import { h, isModalOpen } from "./ui/dialogs";
+import { initLanguage } from "./i18n";
+import { openAboutDialog } from "./ui/about";
+import { scheduleStartupCheck } from "./update";
+import { HexView } from "./ui/hexview";
 import { mountFind } from "./ui/find";
 import { mountMenuBar } from "./ui/menu";
 import { mountStatusBar } from "./ui/statusbar";
@@ -21,6 +25,7 @@ import "./styles.css";
 
 async function main(): Promise<void> {
   await loadSettings();
+  initLanguage(settings.language);
   applyTheme(settings.theme);
 
   const root = document.getElementById("app")!;
@@ -33,34 +38,45 @@ async function main(): Promise<void> {
   root.append(menubar, tabbar, findTop, editorEl, resultsBottom, statusbar);
 
   const app = new App(editorEl);
-  (window as unknown as { __nax: unknown }).__nax = { app, settings, syntaxTree };
+  (window as unknown as { __nax: unknown }).__nax = { app, settings, syntaxTree, updateSettings };
   const find = mountFind(app, findTop, resultsBottom);
+  const hex = new HexView(editorEl);
+  const syncHex = () => {
+    const tab = app.active;
+    const want = !!tab?.hexView;
+    if (want && tab) {
+      const editorDom = app.view.dom;
+      editorDom.style.display = "none";
+      if (tab.path && !tab.dirty) {
+        const path = tab.path;
+        hex.show({ name: tab.name, size: tab.size, read: (o, l) => backend.readBytes(path, o, l) });
+      } else {
+        const bytes = new TextEncoder().encode(app.docText(tab));
+        hex.show({ name: tab.name + " (" + (tab.dirty ? "unsaved, UTF-8" : "UTF-8") + ")", size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
+      }
+    } else if (hex.visible) {
+      hex.hide();
+      app.view.dom.style.display = "";
+      app.view.focus();
+    }
+  };
+  app.on("active", syncHex);
   mountTabBar(app, tabbar);
-  mountStatusBar(app, statusbar, { gotoLine: () => cmds.find((c) => c.id === "search.goto")?.run() });
+  mountStatusBar(app, statusbar, { gotoLine: () => (hex.visible ? hex.gotoOffset() : cmds.find((c) => c.id === "search.goto")?.run()) });
 
   const toggleMenuBar = () => {
     updateSettings({ showMenuBar: !settings.showMenuBar });
   };
-  const about = () => {
-    const box = h(
-      "div",
-      { class: "modal" },
-      h("div", { class: "modal-title" }, "Nax-Notepad"),
-      h(
-        "div",
-        { class: "modal-text" },
-        "Fast tabbed editor with Markdown Live Preview and support for multi-gigabyte files.",
-        h("br"),
-        h("br"),
-        "Built with Tauri 2 and CodeMirror 6.",
-        h("br"),
-        "Session, unsaved text and settings live in %APPDATA%\\Nax-Notepad."
-      ),
-      h("div", { class: "modal-buttons" }, h("button", { class: "btn primary", click: () => close() }, "Close"))
-    );
-    const close = showModal(box);
-  };
-  const cmds = buildCommands(app, find, { toggleMenuBar, about });
+  const about = () => openAboutDialog();
+  const cmds = buildCommands(app, find, {
+    toggleMenuBar,
+    about,
+    hexGoto: () => {
+      if (!hex.visible) return false;
+      void hex.gotoOffset();
+      return true;
+    },
+  });
   mountMenuBar(menubar, cmds);
   installKeybindings(cmds, () => isModalOpen());
 
@@ -147,6 +163,12 @@ async function main(): Promise<void> {
   await win.show();
   await win.setFocus();
   app.view.focus();
+
+  // Language change: persist everything, then reload the UI with the new strings
+  window.addEventListener("nax:reload", () => {
+    void app.flushAll().then(() => location.reload());
+  });
+  scheduleStartupCheck();
 
   // Keep the window title in sync
   const updateTitle = () => {

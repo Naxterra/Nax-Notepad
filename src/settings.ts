@@ -1,4 +1,5 @@
 import { backend, Eol } from "./backend";
+import { LangSetting } from "./i18n";
 
 export interface Settings {
   theme: string; // "system" | theme id
@@ -23,6 +24,9 @@ export interface Settings {
   pagedWindowLines: number;
   showMenuBar: boolean;
   autoReloadExternal: boolean;
+  language: LangSetting;
+  checkUpdates: boolean;
+  lastUpdateCheck: number;
 }
 
 export const DEFAULTS: Settings = {
@@ -48,6 +52,9 @@ export const DEFAULTS: Settings = {
   pagedWindowLines: 3000,
   showMenuBar: true,
   autoReloadExternal: true,
+  language: "system",
+  checkUpdates: true,
+  lastUpdateCheck: 0,
 };
 
 export const settings: Settings = { ...DEFAULTS };

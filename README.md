@@ -22,7 +22,16 @@ for **multi-gigabyte files**. Built with Tauri 2 (Rust shell, WebView2) and Code
 - Command palette (`Ctrl+Shift+P`), go to line, multi-cursor, code folding, bracket matching,
   indentation guides, word wrap, zoom, sort/dedupe/case-change line tools.
 - Single instance: opening another file from Explorer adds a tab to the running window.
+- Markdown formatting menu with shortcuts (bold `Ctrl+B`, italic `Ctrl+I`, headings `Ctrl+Alt+1..6`,
+  lists `Ctrl+Shift+7/8/9`, link `Ctrl+K`, code block `Ctrl+Alt+C`, table, rule). All common Markdown
+  extensions (.md, .markdown, .mdown, .mkd, .mdx, .rmd, ...) open as Markdown.
+- **Hex view** (`Ctrl+Shift+H`) for any tab, including multi-gigabyte files, with go to offset.
+- English and German UI, following the Windows language by default.
+- About dialog with links to this repository and a **Check for updates** that reads the latest
+  GitHub release (also runs silently once a day; can be disabled in Settings).
 - Settings dialog (`Ctrl+,`), stored in `%APPDATA%\Nax-Notepad\settings.json`.
+- Installer: Inno Setup wizard with a chooseable folder, per-user or all-users install, optional
+  Explorer context menu, file associations and PATH entry; uninstall offers to remove user data.
 
 ## Build
 

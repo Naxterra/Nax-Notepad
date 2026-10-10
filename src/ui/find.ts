@@ -6,6 +6,7 @@ import { App } from "../app";
 import { backend, FileHit, FindOpts } from "../backend";
 import { setQuery } from "../searchhl";
 import { h, toast } from "./dialogs";
+import { t } from "../i18n";
 
 export interface FindPanel {
   open(mode: "find" | "replace" | "files"): void;
@@ -21,10 +22,10 @@ function dirname(p: string): string {
 }
 
 export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): FindPanel {
-  const findInput = h("input", { class: "input find-input", type: "text", placeholder: "Find" }) as HTMLInputElement;
-  const replaceInput = h("input", { class: "input find-input", type: "text", placeholder: "Replace" }) as HTMLInputElement;
-  const dirInput = h("input", { class: "input find-input", type: "text", placeholder: "Folder" }) as HTMLInputElement;
-  const globInput = h("input", { class: "input find-input glob", type: "text", placeholder: "*.txt;*.md (all if empty)" }) as HTMLInputElement;
+  const findInput = h("input", { class: "input find-input", type: "text", placeholder: t("Find") }) as HTMLInputElement;
+  const replaceInput = h("input", { class: "input find-input", type: "text", placeholder: t("Replace") }) as HTMLInputElement;
+  const dirInput = h("input", { class: "input find-input", type: "text", placeholder: t("Folder") }) as HTMLInputElement;
+  const globInput = h("input", { class: "input find-input glob", type: "text", placeholder: t("*.txt;*.md (all if empty)") }) as HTMLInputElement;
   const status = h("span", { class: "find-status" });
 
   const toggles = {
@@ -42,23 +43,23 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     });
     return b;
   };
-  const tCase = makeToggle("caseSensitive", "Aa", "Match case (Alt+C)");
-  const tWord = makeToggle("wholeWord", "ab", "Whole word (Alt+W)");
-  const tRegex = makeToggle("regex", ".*", "Regular expression (Alt+R)");
-  const tSel = makeToggle("inSelection", "≡", "In selection only");
+  const tCase = makeToggle("caseSensitive", "Aa", t("Match case (Alt+C)"));
+  const tWord = makeToggle("wholeWord", "ab", t("Whole word (Alt+W)"));
+  const tRegex = makeToggle("regex", ".*", t("Regular expression (Alt+R)"));
+  const tSel = makeToggle("inSelection", "≡", t("In selection only"));
 
-  const btnPrev = h("button", { class: "btn small", title: "Previous (Shift+F3)", tabindex: "-1", click: () => prev() }, "↑");
-  const btnNext = h("button", { class: "btn small", title: "Next (F3)", tabindex: "-1", click: () => next() }, "↓");
-  const btnCount = h("button", { class: "btn small", title: "Count matches", tabindex: "-1", click: () => void count() }, "Count");
-  const btnReplace = h("button", { class: "btn small", click: () => void replaceOne() }, "Replace");
-  const btnReplaceAll = h("button", { class: "btn small", click: () => void replaceAll() }, "Replace all");
-  const btnFiles = h("button", { class: "btn small", click: () => void searchFiles() }, "Search files");
-  const btnBrowse = h("button", { class: "btn small", title: "Choose folder", click: () => void browse() }, "…");
-  const btnClose = h("button", { class: "find-close", title: "Close (Esc)", tabindex: "-1", click: () => close() }, "×");
+  const btnPrev = h("button", { class: "btn small", title: t("Previous (Shift+F3)"), tabindex: "-1", click: () => prev() }, "↑");
+  const btnNext = h("button", { class: "btn small", title: t("Next (F3)"), tabindex: "-1", click: () => next() }, "↓");
+  const btnCount = h("button", { class: "btn small", title: t("Count matches"), tabindex: "-1", click: () => void count() }, t("Count"));
+  const btnReplace = h("button", { class: "btn small", click: () => void replaceOne() }, t("Replace"));
+  const btnReplaceAll = h("button", { class: "btn small", click: () => void replaceAll() }, t("Replace all"));
+  const btnFiles = h("button", { class: "btn small", click: () => void searchFiles() }, t("Search files"));
+  const btnBrowse = h("button", { class: "btn small", title: t("Choose folder"), click: () => void browse() }, "…");
+  const btnClose = h("button", { class: "find-close", title: t("Close (Esc)"), tabindex: "-1", click: () => close() }, "×");
   const modeBtn = (m: "find" | "replace" | "files", label: string) => h("button", { class: "find-mode", tabindex: "-1", click: () => open(m) }, label);
-  const mFind = modeBtn("find", "Find");
-  const mReplace = modeBtn("replace", "Replace");
-  const mFiles = modeBtn("files", "In Files");
+  const mFind = modeBtn("find", t("Find"));
+  const mReplace = modeBtn("replace", t("Replace"));
+  const mFiles = modeBtn("files", t("In Files"));
 
   const rowFind = h("div", { class: "find-row" }, h("div", { class: "find-modes" }, mFind, mReplace, mFiles), findInput, tCase, tWord, tRegex, tSel, btnPrev, btnNext, btnCount, status, btnClose);
   const rowReplace = h("div", { class: "find-row" }, h("span", { class: "find-spacer" }), replaceInput, btnReplace, btnReplaceAll);
@@ -68,7 +69,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   top.append(panel);
 
   const results = h("div", { class: "results-list" });
-  const resultsHeader = h("div", { class: "results-header" }, h("span", { class: "results-title" }, "Search results"), h("button", { class: "find-close", click: () => hideResults() }, "×"));
+  const resultsHeader = h("div", { class: "results-header" }, h("span", { class: "results-title" }, t("Search results")), h("button", { class: "find-close", click: () => hideResults() }, "×"));
   const resultsPanel = h("div", { class: "results-panel" }, resultsHeader, results);
   resultsPanel.style.display = "none";
   bottom.append(resultsPanel);
@@ -95,7 +96,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   const pushQuery = () => {
     const q = findInput.value ? query() : null;
     if (q && !q.valid) {
-      status.textContent = "Invalid regex";
+      status.textContent = t("Invalid regex");
       app.view.dispatch({ effects: setQuery.of(null) });
       return;
     }
@@ -127,17 +128,17 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
         r = c.next();
         if (!r.done) {
           hit = r.value;
-          toast("Wrapped to start");
+          toast(t("Wrapped to start"));
         }
       }
     } else {
       const c = q.getCursor(state, sc.from, sc.to);
       for (let r = c.next(); !r.done; r = c.next()) matches.push(r.value);
       const before = matches.filter((m) => m.from < sel.from);
-      hit = before.length ? before[before.length - 1] : matches.length ? (toast("Wrapped to end"), matches[matches.length - 1]) : null;
+      hit = before.length ? before[before.length - 1] : matches.length ? (toast(t("Wrapped to end")), matches[matches.length - 1]) : null;
     }
     if (!hit) {
-      status.textContent = "Not found";
+      status.textContent = t("Not found");
       return false;
     }
     app.view.dispatch({ selection: EditorSelection.range(hit.from, hit.to), scrollIntoView: true, effects: setQuery.of(q) });
@@ -146,11 +147,11 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   }
 
   async function findPaged(backwards: boolean): Promise<boolean> {
-    const t = app.active;
-    if (!t?.paged || !findInput.value) return false;
+    const tab = app.active;
+    if (!tab?.paged || !findInput.value) return false;
     try {
-      const m = await t.paged.find(opts(), backwards, true);
-      status.textContent = m ? "" : "Not found";
+      const m = await tab.paged.find(opts(), backwards, true);
+      status.textContent = m ? "" : t("Not found");
       app.view.dispatch({ effects: setQuery.of(query()) });
       return !!m;
     } catch (e) {
@@ -174,7 +175,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     if (!findInput.value) return;
     if (app.active?.kind === "paged") {
       const n = await backend.pagedCount(app.active.id, opts()).catch((e) => (status.textContent = String(e), 0));
-      status.textContent = `${n.toLocaleString()} match${n === 1 ? "" : "es"}`;
+      status.textContent = t("{n} matches", { n: n.toLocaleString() });
       return;
     }
     const q = query();
@@ -183,13 +184,13 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     let n = 0;
     const c = q.getCursor(app.view.state, sc.from, sc.to);
     for (let r = c.next(); !r.done; r = c.next()) n++;
-    status.textContent = `${n.toLocaleString()} match${n === 1 ? "" : "es"}`;
+    status.textContent = t("{n} matches", { n: n.toLocaleString() });
   }
 
   async function replaceOne(): Promise<void> {
-    const t = app.active;
-    if (!t || t.readOnly) return;
-    if (t.kind === "paged") {
+    const tab = app.active;
+    if (!tab || tab.readOnly) return;
+    if (tab.kind === "paged") {
       // replace the current selection if it matches, then find next
       const q = query();
       const sel = app.view.state.selection.main;
@@ -215,11 +216,11 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   }
 
   async function replaceAll(): Promise<void> {
-    const t = app.active;
-    if (!t || t.readOnly || !findInput.value) return;
-    if (t.kind === "paged" && t.paged) {
-      const n = await t.paged.replaceAll(opts(), replaceInput.value).catch((e) => (status.textContent = String(e), 0));
-      status.textContent = `Replaced ${n.toLocaleString()}`;
+    const tab = app.active;
+    if (!tab || tab.readOnly || !findInput.value) return;
+    if (tab.kind === "paged" && tab.paged) {
+      const n = await tab.paged.replaceAll(opts(), replaceInput.value).catch((e) => (status.textContent = String(e), 0));
+      status.textContent = t("Replaced {n}", { n: n.toLocaleString() });
       return;
     }
     const q = query();
@@ -229,11 +230,11 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     const c = q.getCursor(app.view.state, sc.from, sc.to);
     for (let r = c.next(); !r.done; r = c.next()) changes.push({ from: r.value.from, to: r.value.to, insert: replacementFor(q, app.view.state.sliceDoc(r.value.from, r.value.to)) });
     if (changes.length) app.view.dispatch({ changes, userEvent: "input.replace.all" });
-    status.textContent = `Replaced ${changes.length.toLocaleString()}`;
+    status.textContent = t("Replaced {n}", { n: changes.length.toLocaleString() });
   }
 
   async function browse(): Promise<void> {
-    const d = await openDialog({ directory: true, title: "Search in folder" });
+    const d = await openDialog({ directory: true, title: t("Search in folder") });
     if (typeof d === "string") dirInput.value = d;
   }
 
@@ -241,16 +242,16 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     if (!findInput.value) return;
     const root = dirInput.value.trim() || (app.active?.path ? dirname(app.active.path) : "");
     if (!root) {
-      toast("Choose a folder first");
+      toast(t("Choose a folder first"));
       return;
     }
     dirInput.value = root;
-    status.textContent = "Searching…";
+    status.textContent = t("Searching…");
     btnFiles.disabled = true;
     try {
       const hits = await backend.findInFiles(root, opts(), globInput.value.trim());
       showResults(hits, root);
-      status.textContent = `${hits.length.toLocaleString()} hit${hits.length === 1 ? "" : "s"}${hits.length >= 5000 ? " (limit)" : ""}`;
+      status.textContent = t("{n} hits", { n: hits.length.toLocaleString() }) + (hits.length >= 5000 ? t(" (limit)") : "");
     } catch (e) {
       status.textContent = String(e);
     } finally {
@@ -281,7 +282,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
       );
       results.append(row);
     }
-    if (!hits.length) results.append(h("div", { class: "result-empty" }, "No matches"));
+    if (!hits.length) results.append(h("div", { class: "result-empty" }, t("No matches")));
     resultsPanel.style.display = "";
   }
   function hideResults(): void {

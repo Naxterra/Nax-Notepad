@@ -15,6 +15,7 @@ export interface OpenResult {
   hadErrors: boolean;
   readOnly: boolean;
   mtime: number;
+  binary: boolean;
 }
 
 export interface SaveResult {
@@ -101,5 +102,7 @@ export const backend = {
   findInFiles: (root: string, opts: FindOpts, include: string, maxHits = 5000) =>
     invoke<FileHit[]>("find_in_files", { root, opts, include, maxHits }),
   pathExists: (path: string) => invoke<boolean>("path_exists", { path }),
+  readBytes: async (path: string, offset: number, len: number) => new Uint8Array(await invoke<ArrayBuffer>("read_bytes", { path, offset, len })),
+  fileSize: (path: string) => invoke<number>("file_size", { path }),
   revealInExplorer: (path: string) => invoke<void>("reveal_in_explorer", { path }),
 };
