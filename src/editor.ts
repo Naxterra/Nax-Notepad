@@ -24,6 +24,7 @@ import { Settings } from "./settings";
 import { cmHighlight, cmTheme } from "./theme";
 import { MARKDOWN_EXTENSIONS } from "./markdown";
 import { searchHighlight } from "./searchhl";
+import { codeLanguageFor, fenceLanguageCompletion } from "./codefence";
 
 export const compartments = {
   language: new Compartment(),
@@ -77,6 +78,7 @@ export function createState(o: StateOptions): EditorState {
       cmHighlight,
       compartments.bracketMatching.of(s.bracketMatching ? bracketMatching() : []),
       compartments.closeBrackets.of(s.autoCloseBrackets ? closeBrackets() : []),
+      fenceLanguageCompletion,
       rectangularSelection(),
       crosshairCursor(),
       compartments.activeLine.of(s.highlightActiveLine ? highlightActiveLine() : []),
@@ -125,7 +127,7 @@ export function loadLanguage(desc: LanguageDescription): Promise<LanguageSupport
   if (!p) {
     // Markdown: use the GFM dialect (tables, task lists, strikethrough, autolinks) and
     // highlight fenced code blocks with the matching language.
-    p = desc.name === "Markdown" ? Promise.resolve(markdown({ base: markdownLanguage, codeLanguages: languages })) : desc.load();
+    p = desc.name === "Markdown" ? Promise.resolve(markdown({ base: markdownLanguage, codeLanguages: codeLanguageFor })) : desc.load();
     cache.set(desc.name, p);
   }
   return p;
