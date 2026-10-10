@@ -46,6 +46,7 @@ const de: Record<string, string> = {
   Cut: "Ausschneiden",
   Copy: "Kopieren",
   Paste: "Einfügen",
+  Delete: "Löschen",
   "Select All": "Alles auswählen",
   "Select Line": "Zeile auswählen",
   "Duplicate Line": "Zeile duplizieren",

@@ -21,6 +21,8 @@
     "core:webview:allow-internal-toggle-devtools",
     "opener:default",
     "opener:allow-open-url",
-    "dialog:default"
+    "dialog:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
   ]
 }

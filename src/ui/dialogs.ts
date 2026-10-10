@@ -257,6 +257,7 @@ export function toast(text: string, ms = 2500): void {
 export function contextMenu(x: number, y: number, items: ({ label: string; run: () => void; disabled?: boolean } | "-")[]): void {
   closeContextMenu();
   const menu = h("div", { class: "ctx-menu" });
+  menu.addEventListener("mousedown", (e) => e.preventDefault());
   for (const it of items) {
     if (it === "-") {
       menu.append(h("div", { class: "ctx-sep" }));
