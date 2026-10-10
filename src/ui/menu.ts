@@ -92,6 +92,8 @@ export function mountMenuBar(root: HTMLElement, cmds: Command[]): void {
   const buildDrop = (items: MenuItem[], left: number, top: number, level: number) => {
     closeFrom(level);
     const drop = h("div", { class: "menu-drop" });
+    // Keep focus where it was (editor or find box) so Cut/Copy/Paste act on it.
+    drop.addEventListener("mousedown", (e) => e.preventDefault());
     for (const it of items) {
       if (it === "-") {
         drop.append(h("div", { class: "ctx-sep" }));

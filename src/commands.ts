@@ -8,7 +8,6 @@ import {
   moveLineDown,
   moveLineUp,
   redo,
-  selectAll,
   selectLine,
   toggleComment,
   undo,
@@ -22,6 +21,7 @@ import { checkForUpdates, ISSUES_URL, REPO_URL } from "./update";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { insertCodeBlock, insertHorizontalRule, insertLink, insertTable, setHeading, toggleInline, toggleLinePrefix } from "./markdown";
 import { settings, updateSettings } from "./settings";
+import { copySelection, pasteClipboard, selectAllIn } from "./clipboard";
 import { THEMES } from "./theme";
 import { pickList, prompt, toast } from "./ui/dialogs";
 import { FindPanel } from "./ui/find";
@@ -33,6 +33,8 @@ export interface Command {
   key?: string;
   category: string;
   run: () => void | Promise<unknown>;
+  /** The key is handled natively by the editor/inputs; it is only shown in menus. */
+  native?: boolean;
 }
 
 export function buildCommands(app: App, find: FindPanel, extras: { toggleMenuBar: () => void; about: () => void; hexGoto?: () => boolean }): Command[] {
@@ -67,12 +69,12 @@ export function buildCommands(app: App, find: FindPanel, extras: { toggleMenuBar
     { id: "file.closeOthers", title: t("Close Other Tabs"), category: t("File"), run: () => app.active && app.closeOthers(app.active) },
     { id: "file.exit", title: t("Exit"), key: "Alt+F4", category: t("File"), run: () => getCurrentWindow().close() },
     // Edit
-    { id: "edit.undo", title: t("Undo"), key: "Ctrl+Z", category: t("Edit"), run: () => undo(v()) },
-    { id: "edit.redo", title: t("Redo"), key: "Ctrl+Y", category: t("Edit"), run: () => redo(v()) },
-    { id: "edit.cut", title: t("Cut"), key: "Ctrl+X", category: t("Edit"), run: () => document.execCommand("cut") },
-    { id: "edit.copy", title: t("Copy"), key: "Ctrl+C", category: t("Edit"), run: () => document.execCommand("copy") },
-    { id: "edit.paste", title: t("Paste"), key: "Ctrl+V", category: t("Edit"), run: () => document.execCommand("paste") },
-    { id: "edit.selectAll", title: t("Select All"), key: "Ctrl+A", category: t("Edit"), run: () => selectAll(v()) },
+    { id: "edit.undo", title: t("Undo"), key: "Ctrl+Z", native: true, category: t("Edit"), run: () => undo(v()) },
+    { id: "edit.redo", title: t("Redo"), key: "Ctrl+Y", native: true, category: t("Edit"), run: () => redo(v()) },
+    { id: "edit.cut", title: t("Cut"), key: "Ctrl+X", native: true, category: t("Edit"), run: () => copySelection(v(), true) },
+    { id: "edit.copy", title: t("Copy"), key: "Ctrl+C", native: true, category: t("Edit"), run: () => copySelection(v()) },
+    { id: "edit.paste", title: t("Paste"), key: "Ctrl+V", native: true, category: t("Edit"), run: () => pasteClipboard(v()) },
+    { id: "edit.selectAll", title: t("Select All"), key: "Ctrl+A", native: true, category: t("Edit"), run: () => selectAllIn(v()) },
     { id: "edit.selectLine", title: t("Select Line"), key: "Ctrl+L", category: t("Edit"), run: () => selectLine(v()) },
     { id: "edit.duplicateLine", title: t("Duplicate Line"), key: "Ctrl+D", category: t("Edit"), run: () => copyLineDown(v()) },
     { id: "edit.deleteLine", title: t("Delete Line"), key: "Ctrl+Shift+K", category: t("Edit"), run: () => deleteLine(v()) },
@@ -251,7 +253,7 @@ export function installKeybindings(cmds: Command[], isBlocked: () => boolean): v
   const single: { p: ParsedKey; c: Command }[] = [];
   const chords: { first: ParsedKey; second: ParsedKey; c: Command }[] = [];
   for (const c of cmds) {
-    if (!c.key) continue;
+    if (!c.key || c.native) continue;
     const seq = c.key.split(" ");
     if (seq.length === 2) chords.push({ first: parseChord(seq[0]), second: parseChord(seq[1]), c });
     else single.push({ p: parseChord(c.key), c });
@@ -291,8 +293,8 @@ export function installKeybindings(cmds: Command[], isBlocked: () => boolean): v
       }
       for (const { p, c } of single) {
         if (!matches(p, e)) continue;
-        // Let text inputs keep their native clipboard/undo behaviour.
-        if (inInput && /^(edit\.(cut|copy|paste|undo|redo|selectAll)|file\.exit)$/.test(c.id)) return;
+        // Let text inputs keep native Alt+F4 handling.
+        if (inInput && c.id === "file.exit") return;
         e.preventDefault();
         e.stopPropagation();
         void c.run();

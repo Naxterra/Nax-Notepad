@@ -12,7 +12,10 @@ import { buildCommands, installKeybindings } from "./commands";
 import { compartments, indentExt, lineNumbersExt } from "./editor";
 import { loadSettings, onSettingsChange, settings, updateSettings } from "./settings";
 import { applyTheme, onSystemThemeChange } from "./theme";
-import { h, isModalOpen } from "./ui/dialogs";
+import { contextMenu, h, isModalOpen } from "./ui/dialogs";
+import { copySelection, deleteSelection, pasteClipboard, selectAllIn } from "./clipboard";
+import { redo, undo } from "@codemirror/commands";
+import { t } from "./i18n";
 import { initLanguage } from "./i18n";
 import { openAboutDialog } from "./ui/about";
 import { scheduleStartupCheck } from "./update";
@@ -109,6 +112,26 @@ async function main(): Promise<void> {
   });
   onSystemThemeChange(() => {
     if (settings.theme === "system") applyTheme("system");
+  });
+
+  // Editor context menu (replaces the WebView2 default, which has no working Paste)
+  editorEl.addEventListener("contextmenu", (e) => {
+    if (hex.visible) return;
+    e.preventDefault();
+    const v = app.view;
+    const ro = v.state.readOnly;
+    const hasSel = v.state.selection.ranges.some((r) => !r.empty);
+    contextMenu(e.clientX, e.clientY, [
+      { label: t("Undo"), run: () => undo(v), disabled: ro },
+      { label: t("Redo"), run: () => redo(v), disabled: ro },
+      "-",
+      { label: t("Cut"), run: () => void copySelection(v, true), disabled: ro },
+      { label: t("Copy"), run: () => void copySelection(v) },
+      { label: t("Paste"), run: () => void pasteClipboard(v), disabled: ro },
+      { label: t("Delete"), run: () => deleteSelection(v), disabled: ro || !hasSel },
+      "-",
+      { label: t("Select All"), run: () => selectAllIn(v) },
+    ]);
   });
 
   // Ctrl+wheel zoom

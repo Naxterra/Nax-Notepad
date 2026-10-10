@@ -1,6 +1,6 @@
 [package]
 name = "nax-notepad"
-version = "0.2.1"
+version = "0.2.2"
 description = "Nax-Notepad - fast tabbed text editor with Markdown live preview and large-file support"
 authors = ["Naxterra"]
 edition = "2021"
@@ -29,6 +29,7 @@ parking_lot = "0.12"
 log = "0.4"
 env_logger = "0.11"
 walkdir = "2"
+tauri-plugin-clipboard-manager = "2"
 
 [dev-dependencies]
 tempfile = "3"

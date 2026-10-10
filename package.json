@@ -1,7 +1,7 @@
 {
   "name": "nax-notepad",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -23,6 +23,7 @@
     "@lezer/markdown": "^1",
     "@replit/codemirror-indentation-markers": "^6",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-clipboard-manager": "^2.4.1",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2"
   },
