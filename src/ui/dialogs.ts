@@ -1,4 +1,5 @@
 // Small in-app modal dialogs: confirm, prompt, list picker. All keyboard friendly.
+import { t } from "../i18n";
 
 export function h<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -46,12 +47,12 @@ export function isModalOpen(): boolean {
   return openModal !== null;
 }
 
-export function confirm3(title: string, text: string, labels: [string, string] = ["Save", "Don't save"]): Promise<"yes" | "no" | "cancel"> {
+export function confirm3(title: string, text: string, labels: [string, string] = [t("Save"), t("Don't save")]): Promise<"yes" | "no" | "cancel"> {
   return new Promise((resolve) => {
     let result: "yes" | "no" | "cancel" = "cancel";
     const btnYes = h("button", { class: "btn primary", click: () => done("yes") }, labels[0]);
     const btnNo = h("button", { class: "btn", click: () => done("no") }, labels[1]);
-    const btnCancel = h("button", { class: "btn", click: () => done("cancel") }, "Cancel");
+    const btnCancel = h("button", { class: "btn", click: () => done("cancel") }, t("Cancel"));
     const box = h(
       "div",
       { class: "modal" },
@@ -74,6 +75,50 @@ export function confirm3(title: string, text: string, labels: [string, string] =
   });
 }
 
+/** Two-button confirmation. Resolves true for the primary button. */
+export function confirmDialog(title: string, text: string, okLabel = t("OK"), cancelLabel = t("Cancel")): Promise<boolean> {
+  return new Promise((resolve) => {
+    let result = false;
+    const btnOk = h("button", { class: "btn primary", click: () => done(true) }, okLabel);
+    const box = h(
+      "div",
+      { class: "modal" },
+      h("div", { class: "modal-title" }, title),
+      h("div", { class: "modal-text" }, text),
+      h("div", { class: "modal-buttons" }, btnOk, h("button", { class: "btn", click: () => done(false) }, cancelLabel))
+    );
+    box.tabIndex = -1;
+    box.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" || e.key === "Enter") e.preventDefault();
+      if (e.key === "Escape") done(false);
+      if (e.key === "Enter") done(true);
+    });
+    const close = showModal(box, () => resolve(result));
+    const done = (r: boolean) => {
+      result = r;
+      close();
+    };
+    btnOk.focus();
+  });
+}
+
+/** Information box with a single Close button. */
+export function message(title: string, text: string): Promise<void> {
+  return new Promise((resolve) => {
+    const btn = h("button", { class: "btn primary", click: () => close() }, t("Close"));
+    const box = h("div", { class: "modal" }, h("div", { class: "modal-title" }, title), h("div", { class: "modal-text" }, text), h("div", { class: "modal-buttons" }, btn));
+    box.tabIndex = -1;
+    box.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" || e.key === "Enter") {
+        e.preventDefault();
+        close();
+      }
+    });
+    const close = showModal(box, () => resolve());
+    btn.focus();
+  });
+}
+
 export function prompt(title: string, label: string, initial = "", placeholder = ""): Promise<string | null> {
   return new Promise((resolve) => {
     let result: string | null = null;
@@ -86,8 +131,8 @@ export function prompt(title: string, label: string, initial = "", placeholder =
       h(
         "div",
         { class: "modal-buttons" },
-        h("button", { class: "btn primary", click: () => done(input.value) }, "OK"),
-        h("button", { class: "btn", click: () => done(null) }, "Cancel")
+        h("button", { class: "btn primary", click: () => done(input.value) }, t("OK")),
+        h("button", { class: "btn", click: () => done(null) }, t("Cancel"))
       )
     );
     box.addEventListener("keydown", (e) => {
@@ -118,7 +163,7 @@ export function pickList(title: string, items: PickItem[], opts: { placeholder?:
     let result: PickItem | null = null;
     let filtered = items;
     let index = 0;
-    const input = h("input", { class: "input", type: "text", placeholder: opts.placeholder ?? "Type to filter…" }) as HTMLInputElement;
+    const input = h("input", { class: "input", type: "text", placeholder: opts.placeholder ?? t("Type to filter…") }) as HTMLInputElement;
     const list = h("div", { class: "pick-list" });
     const render = () => {
       list.replaceChildren();

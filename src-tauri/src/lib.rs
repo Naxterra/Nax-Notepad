@@ -33,6 +33,8 @@ struct OpenResult {
     had_errors: bool,
     read_only: bool,
     mtime: u64,
+    /// True when the first 8 KB contain NUL bytes (opened in hex view by default).
+    binary: bool,
 }
 
 fn file_name(p: &Path) -> String {
@@ -64,6 +66,13 @@ async fn open_path(
     }
     let read_only = meta.permissions().readonly();
     let size = meta.len();
+    let binary = {
+        use std::io::Read;
+        let mut probe = vec![0u8; 8192];
+        let n = std::fs::File::open(&p).and_then(|mut f| f.read(&mut probe)).unwrap_or(0);
+        let (bom, _) = textfmt::detect_bom(&probe[..n]);
+        bom == textfmt::Bom::None && probe[..n].contains(&0)
+    };
     if size >= PAGED_THRESHOLD || force_paged.unwrap_or(false) {
         let doc = PagedDoc::open(&p)?;
         let res = OpenResult {
@@ -83,6 +92,7 @@ async fn open_path(
             had_errors: false,
             read_only,
             mtime: doc.file_mtime,
+            binary,
         };
         state.paged.lock().insert(id, doc);
         return Ok(res);
@@ -101,6 +111,7 @@ async fn open_path(
         had_errors: dec.had_errors,
         read_only,
         mtime: mtime_of(&p),
+        binary,
     })
 }
 
@@ -506,6 +517,30 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 
 // ---- misc -----------------------------------------------------------------------------------
 
+/// Raw bytes for the hex view. Uses a seek + read so it works for any file size.
+#[tauri::command]
+async fn read_bytes(path: String, offset: u64, len: u64) -> Result<tauri::ipc::Response, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&path).map_err(|e| format!("Cannot open {path}: {e}"))?;
+    f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; len.min(4 * 1024 * 1024) as usize];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = f.read(&mut buf[filled..]).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(tauri::ipc::Response::new(buf))
+}
+
+#[tauri::command]
+fn file_size(path: String) -> Result<u64, String> {
+    std::fs::metadata(&path).map(|m| m.len()).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn path_exists(path: String) -> bool {
     Path::new(&path).exists()
@@ -582,6 +617,8 @@ pub fn run() {
             startup_files,
             find_in_files,
             path_exists,
+            read_bytes,
+            file_size,
             reveal_in_explorer,
         ])
         .run(tauri::generate_context!())

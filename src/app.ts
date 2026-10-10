@@ -11,6 +11,7 @@ import { livePreview, LivePreviewConfig } from "./livepreview";
 import { PagedController, pagedLoad } from "./paged";
 import { settings } from "./settings";
 import { confirm3 } from "./ui/dialogs";
+import { t } from "./i18n";
 
 export type TabKind = "memory" | "paged";
 
@@ -34,6 +35,7 @@ export interface Tab {
   scrollTop: number;
   bufferTimer?: number;
   pendingCursor?: { line: number; col: number };
+  hexView: boolean;
 }
 
 type Listener = () => void;
@@ -176,6 +178,7 @@ export class App {
       untitled: partial.untitled ?? null,
       paged: partial.paged ?? null,
       scrollTop: partial.scrollTop ?? 0,
+      hexView: false,
     };
     return tab;
   }
@@ -221,7 +224,7 @@ export class App {
     return last;
   }
 
-  private async openOne(path: string, id?: string, restoreOpts?: { livePreview?: boolean; languageName?: string | null; paged?: boolean }): Promise<Tab> {
+  private async openOne(path: string, id?: string, restoreOpts?: { livePreview?: boolean; languageName?: string | null; paged?: boolean; hexView?: boolean }): Promise<Tab> {
     const tabId = id ?? newId();
     const res = restoreOpts?.paged ? await backend.pagedRestore(tabId, path).catch(() => backend.openPath(tabId, path)) : await backend.openPath(tabId, path);
     const tab = this.makeTab({
@@ -236,6 +239,7 @@ export class App {
       readOnly: res.readOnly,
       livePreview: restoreOpts?.livePreview ?? settings.livePreviewDefault,
     });
+    tab.hexView = restoreOpts?.hexView ?? res.binary;
     const desc = restoreOpts?.languageName ? languageByName(restoreOpts.languageName) : languageForFile(res.name);
     tab.languageName = desc?.name ?? null;
     const langExt: Extension = desc ? await loadLanguage(desc) : [];
@@ -321,7 +325,7 @@ export class App {
   async closeTab(tab: Tab, force = false): Promise<boolean> {
     if (!force && tab.dirty) {
       this.activate(tab);
-      const r = await confirm3("Save changes?", `Save changes to "${tab.name}" before closing?`);
+      const r = await confirm3(t("Save changes?"), t('Save changes to "{name}" before closing?', { name: tab.name }));
       if (r === "cancel") return false;
       if (r === "yes") {
         const ok = await this.save(tab);
@@ -385,7 +389,7 @@ export class App {
       this.scheduleSessionSave();
       return true;
     } catch (e) {
-      await message(String(e), { title: "Save failed", kind: "error" });
+      await message(String(e), { title: t("Save failed"), kind: "error" });
       return false;
     }
   }
@@ -410,7 +414,7 @@ export class App {
   async saveAs(tab: Tab): Promise<boolean> {
     const target = await saveDialog({
       defaultPath: tab.path ?? `${tab.name}${tab.untitled !== null ? ".txt" : ""}`,
-      title: "Save As",
+      title: t("Save As"),
     });
     if (!target) return false;
     try {
@@ -439,7 +443,7 @@ export class App {
       this.scheduleSessionSave();
       return true;
     } catch (e) {
-      await message(String(e), { title: "Save failed", kind: "error" });
+      await message(String(e), { title: t("Save failed"), kind: "error" });
       return false;
     }
   }
@@ -449,7 +453,7 @@ export class App {
   }
 
   async openDialog(): Promise<void> {
-    const sel = await openDialog({ multiple: true, title: "Open" });
+    const sel = await openDialog({ multiple: true, title: t("Open") });
     if (!sel) return;
     await this.openFiles(Array.isArray(sel) ? sel : [sel]);
   }
@@ -499,7 +503,7 @@ export class App {
         return;
       }
       tab.mtime = mtime; // ask once per change
-      const r = await confirm3("File changed on disk", `"${tab.name}" was modified outside Nax-Notepad.\nReload it and lose your unsaved changes?`, ["Reload", "Keep mine"]);
+      const r = await confirm3(t("File changed on disk"), t('"{name}" was modified outside Nax-Notepad.\nReload it and lose your unsaved changes?', { name: tab.name }), [t("Reload"), t("Keep mine")]);
       if (r === "yes") await this.reload(tab);
     } catch {
       /* ignore */
@@ -542,6 +546,12 @@ export class App {
     });
     this.emit("status");
     this.scheduleSessionSave();
+  }
+
+  toggleHexView(tab: Tab): void {
+    tab.hexView = !tab.hexView;
+    this.emit("active");
+    this.emit("status");
   }
 
   setReadOnly(tab: Tab, ro: boolean): void {
@@ -641,6 +651,7 @@ export class App {
       languageName: tab.languageName,
       dirty: tab.dirty,
       livePreview: tab.livePreview,
+      hexView: tab.hexView,
       pinned: tab.pinned,
       untitled: tab.untitled,
       readOnly: tab.readOnly,
@@ -709,6 +720,7 @@ export class App {
       languageName?: string | null;
       dirty?: boolean;
       livePreview?: boolean;
+      hexView?: boolean;
       pinned?: boolean;
       untitled?: number | null;
       readOnly?: boolean;
@@ -719,7 +731,7 @@ export class App {
     let tab: Tab | null = null;
     if (meta.kind === "paged" && meta.path) {
       if (!(await backend.pathExists(meta.path))) return null;
-      tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true });
+      tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView });
     } else {
       const buffer = await backend.sessionLoadBuffer(meta.id);
       if (buffer !== null) {
@@ -744,7 +756,7 @@ export class App {
         this.insertTab(tab);
       } else if (meta.path) {
         if (!(await backend.pathExists(meta.path))) return null;
-        tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName });
+        tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, hexView: m.hexView });
       } else {
         // untitled with no stored buffer: empty tab
         tab = this.makeTab({ id: meta.id, name: m.name ?? "new", kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview });

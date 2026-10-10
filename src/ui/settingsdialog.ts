@@ -1,6 +1,7 @@
 import { DEFAULTS, Settings, settings, updateSettings } from "../settings";
 import { THEMES } from "../theme";
 import { closeModal, h, showModal } from "./dialogs";
+import { t } from "../i18n";
 
 type Field =
   | { key: keyof Settings; label: string; type: "bool" }
@@ -17,6 +18,7 @@ const sections: { title: string; fields: Field[] }[] = [
       { key: "fontSize", label: "Font size", type: "number", min: 6, max: 72 },
       { key: "previewFontFamily", label: "Live Preview font", type: "text" },
       { key: "showMenuBar", label: "Show menu bar (Alt toggles)", type: "bool" },
+      { key: "language", label: "Language (restarts the window)", type: "select", options: [{ value: "system", label: "System language" }, { value: "en", label: "English" }, { value: "de", label: "German" }] },
     ],
   },
   {
@@ -51,12 +53,16 @@ const sections: { title: string; fields: Field[] }[] = [
       { key: "previewMaxWidth", label: "Readable line width in px (0 = full width)", type: "number", min: 0, max: 5000 },
     ],
   },
+  {
+    title: "Updates",
+    fields: [{ key: "checkUpdates", label: "Check for updates on start (once a day)", type: "bool" }],
+  },
 ];
 
 export function openSettingsDialog(): void {
   const body = h("div", { class: "settings-body" });
   for (const sec of sections) {
-    body.append(h("h3", {}, sec.title));
+    body.append(h("h3", {}, t(sec.title)));
     for (const f of sec.fields) {
       let control: HTMLElement;
       const cur = settings[f.key];
@@ -81,18 +87,21 @@ export function openSettingsDialog(): void {
         control = inp;
       } else {
         const sel = h("select", { class: "input" }) as HTMLSelectElement;
-        for (const o of f.options) sel.append(h("option", { value: o.value }, o.label));
+        for (const o of f.options) sel.append(h("option", { value: o.value }, t(o.label)));
         sel.value = String(cur);
-        sel.addEventListener("change", () => updateSettings({ [f.key]: sel.value } as Partial<Settings>));
+        sel.addEventListener("change", () => {
+          updateSettings({ [f.key]: sel.value } as Partial<Settings>);
+          if (f.key === "language") window.dispatchEvent(new CustomEvent("nax:reload"));
+        });
         control = sel;
       }
-      body.append(h("label", { class: "settings-row" }, h("span", { class: "settings-label" }, f.label), control));
+      body.append(h("label", { class: "settings-row" }, h("span", { class: "settings-label" }, t(f.label)), control));
     }
   }
   const box = h(
     "div",
     { class: "modal settings" },
-    h("div", { class: "modal-title" }, "Settings"),
+    h("div", { class: "modal-title" }, t("Settings")),
     body,
     h(
       "div",
@@ -107,9 +116,9 @@ export function openSettingsDialog(): void {
             openSettingsDialog();
           },
         },
-        "Reset to defaults"
+        t("Reset to defaults")
       ),
-      h("button", { class: "btn primary", click: () => closeModal() }, "Close")
+      h("button", { class: "btn primary", click: () => closeModal() }, t("Close"))
     )
   );
   box.addEventListener("keydown", (e) => {

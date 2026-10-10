@@ -22,6 +22,7 @@ import { indentationMarkers } from "@replit/codemirror-indentation-markers";
 import { livePreview, LivePreviewConfig } from "./livepreview";
 import { Settings } from "./settings";
 import { cmHighlight, cmTheme } from "./theme";
+import { MARKDOWN_EXTENSIONS } from "./markdown";
 import { searchHighlight } from "./searchhl";
 
 export const compartments = {
@@ -105,6 +106,8 @@ export const allLanguages: LanguageInfo[] = languages
 
 export function languageForFile(name: string): LanguageDescription | null {
   const lower = name.toLowerCase();
+  const ext = lower.includes(".") ? lower.slice(lower.lastIndexOf(".") + 1) : "";
+  if (MARKDOWN_EXTENSIONS.includes(ext)) return LanguageDescription.matchLanguageName(languages, "markdown", true);
   if (/\.(txt|log|ini|cfg|conf)$/.test(lower) || !/\./.test(lower)) {
     if (/\.(ini|cfg|conf)$/.test(lower)) return LanguageDescription.matchFilename(languages, "x.ini") ?? LanguageDescription.matchLanguageName(languages, "ini", true);
     return null;

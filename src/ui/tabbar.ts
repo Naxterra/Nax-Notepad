@@ -1,10 +1,11 @@
 import { App, Tab } from "../app";
 import { backend } from "../backend";
 import { contextMenu, h, toast } from "./dialogs";
+import { t } from "../i18n";
 
 export function mountTabBar(app: App, root: HTMLElement): void {
   const strip = h("div", { class: "tab-strip" });
-  const addBtn = h("button", { class: "tab-add", title: "New tab (Ctrl+N)", click: () => app.newTab() }, "+");
+  const addBtn = h("button", { class: "tab-add", title: t("New tab (Ctrl+N)"), click: () => app.newTab() }, "+");
   root.append(strip, addBtn);
 
   let dragging: Tab | null = null;
@@ -25,7 +26,7 @@ export function mountTabBar(app: App, root: HTMLElement): void {
           "button",
           {
             class: "tab-close",
-            title: "Close (Ctrl+W)",
+            title: t("Close (Ctrl+W)"),
             click: (e) => {
               e.stopPropagation();
               void app.closeTab(tab);
@@ -44,31 +45,31 @@ export function mountTabBar(app: App, root: HTMLElement): void {
       el.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         contextMenu(e.clientX, e.clientY, [
-          { label: "Close", run: () => void app.closeTab(tab) },
-          { label: "Close others", run: () => void app.closeOthers(tab) },
-          { label: "Close all", run: () => void app.closeAll() },
-          { label: "Close to the right", run: () => void app.closeToRight(tab) },
+          { label: t("Close"), run: () => void app.closeTab(tab) },
+          { label: t("Close others"), run: () => void app.closeOthers(tab) },
+          { label: t("Close all"), run: () => void app.closeAll() },
+          { label: t("Close to the right"), run: () => void app.closeToRight(tab) },
           "-",
-          { label: tab.pinned ? "Unpin tab" : "Pin tab", run: () => app.togglePinned(tab) },
-          { label: tab.readOnly ? "Clear read-only" : "Set read-only", run: () => app.setReadOnly(tab, !tab.readOnly) },
+          { label: tab.pinned ? t("Unpin tab") : t("Pin tab"), run: () => app.togglePinned(tab) },
+          { label: tab.readOnly ? t("Clear read-only") : t("Set read-only"), run: () => app.setReadOnly(tab, !tab.readOnly) },
           "-",
           {
-            label: "Copy full path",
+            label: t("Copy full path"),
             disabled: !tab.path,
             run: () => {
               void navigator.clipboard.writeText(tab.path ?? "");
-              toast("Path copied");
+              toast(t("Path copied"));
             },
           },
           {
-            label: "Copy file name",
+            label: t("Copy file name"),
             run: () => {
               void navigator.clipboard.writeText(tab.name);
-              toast("Name copied");
+              toast(t("Name copied"));
             },
           },
-          { label: "Reveal in Explorer", disabled: !tab.path, run: () => void backend.revealInExplorer(tab.path!) },
-          { label: "Reload from disk", disabled: !tab.path, run: () => void app.reload(tab) },
+          { label: t("Reveal in Explorer"), disabled: !tab.path, run: () => void backend.revealInExplorer(tab.path!) },
+          { label: t("Reload from disk"), disabled: !tab.path, run: () => void app.reload(tab) },
         ]);
       });
       el.addEventListener("dragstart", (e) => {
