@@ -1,6 +1,7 @@
 // Markdown formatting commands: wrap/unwrap inline marks, toggle line prefixes, insert blocks.
 import { EditorSelection, SelectionRange } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { openFenceLanguagePicker } from "./codefence";
 
 function wordAt(view: EditorView, pos: number): SelectionRange {
   const line = view.state.doc.lineAt(pos);
@@ -123,8 +124,11 @@ export function insertCodeBlock(view: EditorView): boolean {
   const from = view.state.doc.lineAt(r.from).from;
   const to = view.state.doc.lineAt(r.to).to;
   const body = view.state.sliceDoc(from, to);
-  const insert = "```\n" + body + "\n```";
-  view.dispatch({ changes: { from, to, insert }, selection: EditorSelection.cursor(from + 3), userEvent: "input.format" });
+  const indent = /^\s*/.exec(body)?.[0] ?? "";
+  const insert = indent + "```\n" + body + "\n" + indent + "```";
+  view.dispatch({ changes: { from, to, insert }, selection: EditorSelection.cursor(from + indent.length + 3), userEvent: "input.format" });
+  // Offer the language list right at the opening fence.
+  openFenceLanguagePicker(view);
   return true;
 }
 

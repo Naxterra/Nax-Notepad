@@ -23,7 +23,8 @@ for **multi-gigabyte files**. Built with Tauri 2 (Rust shell, WebView2) and Code
   indentation guides, word wrap, zoom, sort/dedupe/case-change line tools.
 - Single instance: opening another file from Explorer adds a tab to the running window.
 - Markdown formatting menu with shortcuts (bold `Ctrl+B`, italic `Ctrl+I`, headings `Ctrl+Alt+1..6`,
-  lists `Ctrl+Shift+7/8/9`, link `Ctrl+K`, code block `Ctrl+Alt+C`, table, rule). All common Markdown
+  lists `Ctrl+Shift+7/8/9`, link `Ctrl+K`, code block `Ctrl+Alt+C`, table, rule). Typing ``` opens
+  a language picker (bash, sql, python, powershell, ...) that also adds the closing fence. All common Markdown
   extensions (.md, .markdown, .mdown, .mkd, .mdx, .rmd, ...) open as Markdown.
 - **Hex view** (`Ctrl+Shift+H`) for any tab, including multi-gigabyte files, with go to offset.
 - English and German UI, following the Windows language by default.

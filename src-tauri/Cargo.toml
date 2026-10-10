@@ -1,6 +1,6 @@
 [package]
 name = "nax-notepad"
-version = "0.2.0"
+version = "0.2.1"
 description = "Nax-Notepad - fast tabbed text editor with Markdown live preview and large-file support"
 authors = ["Naxterra"]
 edition = "2021"
