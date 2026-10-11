@@ -189,7 +189,10 @@ export class App {
   }
 
   newTab(text = "", activate = true): Tab {
-    const n = this.nextUntitled++;
+    // Use the lowest number not taken by an open "new N" tab, like Notepad++.
+    const used = new Set(this.tabs.map((t) => t.untitled).filter((u): u is number => u !== null));
+    let n = 1;
+    while (used.has(n)) n++;
     const tab = this.makeTab({ name: `new ${n}`, kind: "memory", untitled: n });
     tab.state = this.buildState(tab, text, []);
     this.insertTab(tab);
