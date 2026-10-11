@@ -55,7 +55,7 @@ async function main(): Promise<void> {
         hex.show({ name: tab.name, size: tab.size, read: (o, l) => backend.readBytes(path, o, l) });
       } else {
         const bytes = new TextEncoder().encode(app.docText(tab));
-        hex.show({ name: tab.name + " (" + (tab.dirty ? "unsaved, UTF-8" : "UTF-8") + ")", size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
+        hex.show({ name: tab.name + " (" + (tab.dirty ? t("unsaved") + ", UTF-8" : "UTF-8") + ")", size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
       }
     } else if (hex.visible) {
       hex.hide();

@@ -116,6 +116,7 @@ const de: Record<string, string> = {
   "Line number (1 – {max}):": "Zeilennummer (1 – {max}):",
   "Path copied": "Pfad kopiert",
   "Name copied": "Name kopiert",
+  "new {n}": "neu {n}",
   // Dialog buttons
   OK: "OK",
   Cancel: "Abbrechen",

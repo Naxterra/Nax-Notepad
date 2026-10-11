@@ -60,6 +60,11 @@ function joinPath(dir: string, rel: string): string {
   return out.join(sep);
 }
 
+/** Display name of an untitled tab in the current UI language. */
+function untitledName(n: number): string {
+  return t("new {n}", { n });
+}
+
 let idCounter = 0;
 function newId(): string {
   return `t${Date.now().toString(36)}${(idCounter++).toString(36)}`;
@@ -193,7 +198,7 @@ export class App {
     const used = new Set(this.tabs.map((t) => t.untitled).filter((u): u is number => u !== null));
     let n = 1;
     while (used.has(n)) n++;
-    const tab = this.makeTab({ name: `new ${n}`, kind: "memory", untitled: n });
+    const tab = this.makeTab({ name: untitledName(n), kind: "memory", untitled: n });
     tab.state = this.buildState(tab, text, []);
     this.insertTab(tab);
     if (activate) this.activate(tab);
@@ -741,7 +746,8 @@ export class App {
         tab = this.makeTab({
           id: meta.id,
           path: meta.path,
-          name: m.name ?? (meta.path ? basename(meta.path) : "new"),
+          // Untitled names are rebuilt so they follow the current language ("new 1" / "neu 1").
+          name: m.untitled != null ? untitledName(m.untitled) : (m.name ?? (meta.path ? basename(meta.path) : untitledName(1))),
           kind: "memory",
           encoding: m.encoding,
           eol: m.eol,
@@ -762,7 +768,7 @@ export class App {
         tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, hexView: m.hexView });
       } else {
         // untitled with no stored buffer: empty tab
-        tab = this.makeTab({ id: meta.id, name: m.name ?? "new", kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview });
+        tab = this.makeTab({ id: meta.id, name: untitledName(m.untitled ?? 1), kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview });
         tab.state = this.buildState(tab, "", []);
         this.insertTab(tab);
       }
