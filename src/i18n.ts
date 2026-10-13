@@ -250,6 +250,12 @@ const de: Record<string, string> = {
   "Open download page": "Download-Seite öffnen",
   Later: "Später",
   "Could not check for updates: {error}": "Updateprüfung fehlgeschlagen: {error}",
+  "GitHub shows no public release. The repository is private or has no releases yet, so Nax-Notepad cannot read it without signing in.":
+    "GitHub zeigt kein öffentliches Release. Das Repository ist privat oder hat noch keine Releases, daher kann Nax-Notepad es ohne Anmeldung nicht lesen.",
+  "GitHub could not be reached ({error}).": "GitHub ist nicht erreichbar ({error}).",
+  "Installed version: {version}. You can compare it on the releases page in your browser.":
+    "Installierte Version: {version}. Sie können sie auf der Release-Seite im Browser vergleichen.",
+  "Open releases page": "Release-Seite öffnen",
   "Update check failed": "Updateprüfung fehlgeschlagen",
   "Nax-Notepad {version} is available": "Nax-Notepad {version} ist verfügbar",
   // Submenus

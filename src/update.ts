@@ -2,7 +2,13 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
 import { settings, updateSettings } from "./settings";
-import { confirmDialog, message, toast } from "./ui/dialogs";
+import { confirmDialog, toast } from "./ui/dialogs";
+
+class GitHubHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`GitHub ${status}`);
+  }
+}
 
 export const REPO = "Naxterra/Nax-Notepad";
 export const REPO_URL = `https://github.com/${REPO}`;
@@ -43,7 +49,7 @@ export async function fetchLatestRelease(): Promise<Release> {
       headers: { Accept: "application/vnd.github+json" },
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`GitHub ${res.status}`);
+    if (!res.ok) throw new GitHubHttpError(res.status);
     return (await res.json()) as Release;
   } finally {
     clearTimeout(timer);
@@ -60,7 +66,17 @@ export async function checkForUpdates(silent: boolean): Promise<void> {
   try {
     rel = await fetchLatestRelease();
   } catch (e) {
-    if (!silent) await message(t("Update check failed"), t("Could not check for updates: {error}", { error: String(e instanceof Error ? e.message : e) }));
+    if (!silent) {
+      // A private repository (or one without releases) answers anonymous API calls with 404.
+      // The releases page still works in the browser, where the user is signed in.
+      const reason =
+        e instanceof GitHubHttpError && e.status === 404
+          ? t("GitHub shows no public release. The repository is private or has no releases yet, so Nax-Notepad cannot read it without signing in.")
+          : t("GitHub could not be reached ({error}).", { error: String(e instanceof Error ? e.message : e) });
+      const text = reason + "\n\n" + t("Installed version: {version}. You can compare it on the releases page in your browser.", { version: APP_VERSION });
+      const go = await confirmDialog(t("Update check failed"), text, t("Open releases page"), t("Close"));
+      if (go) void openUrl(RELEASES_URL);
+    }
     return;
   } finally {
     updateSettings({ lastUpdateCheck: Date.now() });
