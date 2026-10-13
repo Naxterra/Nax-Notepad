@@ -27,3 +27,12 @@ dist-ssr
 artifacts
 src-tauri/target
 src-tauri/gen/schemas
+
+# Personal instruction documents (never commit)
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+.claude/
+.cursor/
+.github/copilot-instructions.md
