@@ -1,26 +1,41 @@
 import { App, Tab } from "../app";
 import { backend } from "../backend";
+import { writeClipboard } from "../clipboard";
 import { contextMenu, h, toast } from "./dialogs";
 import { t } from "../i18n";
 
-export function mountTabBar(app: App, root: HTMLElement): void {
-  const strip = h("div", { class: "tab-strip" });
-  const addBtn = h("button", { class: "tab-add", title: t("New tab (Ctrl+N)"), click: () => app.newTab() }, "+");
-  root.append(strip, addBtn);
+/** Tab bar of one pane. Tabs can be dragged within the bar or onto the other pane's bar. */
+let dragging: Tab | null = null;
 
-  let dragging: Tab | null = null;
+export function mountTabBar(app: App, root: HTMLElement, pane: 0 | 1): void {
+  const strip = h("div", { class: "tab-strip" });
+  const addBtn = h(
+    "button",
+    {
+      class: "tab-add",
+      title: t("New tab (Ctrl+N)"),
+      click: () => {
+        if (app.splitOn) app.focusPane(pane, false);
+        app.newTab();
+      },
+    },
+    "+"
+  );
+  root.append(strip, addBtn);
 
   const render = () => {
     strip.replaceChildren();
-    for (const tab of app.tabs) {
+    const shown = app.panes[pane]?.tab;
+    for (const tab of app.tabsIn(pane)) {
+      const own = app.owner(tab);
       const el = h(
         "div",
         {
-          class: "tab" + (tab === app.active ? " active" : "") + (tab.dirty ? " dirty" : "") + (tab.pinned ? " pinned" : ""),
-          title: tab.path ?? tab.name,
+          class: "tab" + (tab === shown ? " active" : "") + (own.dirty ? " dirty" : "") + (tab.pinned ? " pinned" : "") + (tab.cloneOf ? " clone" : "") + (own.tail ? " following" : ""),
+          title: (own.path ?? own.name) + (tab.cloneOf ? ` (${t("clone")})` : ""),
           draggable: "true",
         },
-        h("span", { class: "tab-name" }, tab.name),
+        h("span", { class: "tab-name" }, own.name),
         h("span", { class: "tab-dot" }, "●"),
         h(
           "button",
@@ -50,26 +65,30 @@ export function mountTabBar(app: App, root: HTMLElement): void {
           { label: t("Close all"), run: () => void app.closeAll() },
           { label: t("Close to the right"), run: () => void app.closeToRight(tab) },
           "-",
+          { label: t("Move to Other View"), run: () => app.moveToOtherView(tab) },
+          { label: t("Clone to Other View"), run: () => void app.cloneToOtherView(tab), disabled: own.kind === "paged" },
+          "-",
           { label: tab.pinned ? t("Unpin tab") : t("Pin tab"), run: () => app.togglePinned(tab) },
-          { label: tab.readOnly ? t("Clear read-only") : t("Set read-only"), run: () => app.setReadOnly(tab, !tab.readOnly) },
+          { label: own.readOnly ? t("Clear read-only") : t("Set read-only"), run: () => app.setReadOnly(tab, !own.readOnly) },
+          { label: own.tail ? t("Stop following") : t("Follow File Changes (tail -f)"), run: () => void app.toggleFollow(tab), disabled: !own.path },
           "-",
           {
             label: t("Copy full path"),
-            disabled: !tab.path,
+            disabled: !own.path,
             run: () => {
-              void navigator.clipboard.writeText(tab.path ?? "");
+              void writeClipboard(own.path ?? "");
               toast(t("Path copied"));
             },
           },
           {
             label: t("Copy file name"),
             run: () => {
-              void navigator.clipboard.writeText(tab.name);
+              void writeClipboard(own.name);
               toast(t("Name copied"));
             },
           },
-          { label: t("Reveal in Explorer"), disabled: !tab.path, run: () => void backend.revealInExplorer(tab.path!) },
-          { label: t("Reload from disk"), disabled: !tab.path, run: () => void app.reload(tab) },
+          { label: t("Reveal in Explorer"), disabled: !own.path, run: () => void backend.revealInExplorer(own.path!) },
+          { label: t("Reload from disk"), disabled: !own.path, run: () => void app.reload(tab) },
         ]);
       });
       el.addEventListener("dragstart", (e) => {
@@ -80,11 +99,12 @@ export function mountTabBar(app: App, root: HTMLElement): void {
       el.addEventListener("dragend", () => {
         dragging = null;
         el.classList.remove("dragging");
-        strip.querySelectorAll(".drop-before,.drop-after").forEach((x) => x.classList.remove("drop-before", "drop-after"));
+        document.querySelectorAll(".drop-before,.drop-after,.drop-target").forEach((x) => x.classList.remove("drop-before", "drop-after", "drop-target"));
       });
       el.addEventListener("dragover", (e) => {
         if (!dragging || dragging === tab) return;
         e.preventDefault();
+        e.stopPropagation();
         const r = el.getBoundingClientRect();
         const before = e.clientX < r.left + r.width / 2;
         el.classList.toggle("drop-before", before);
@@ -94,12 +114,16 @@ export function mountTabBar(app: App, root: HTMLElement): void {
       el.addEventListener("drop", (e) => {
         if (!dragging || dragging === tab) return;
         e.preventDefault();
+        e.stopPropagation();
+        const moving = dragging;
         const r = el.getBoundingClientRect();
         const before = e.clientX < r.left + r.width / 2;
+        if (app.paneIndex(moving) !== pane) app.moveToOtherView(moving);
         let idx = app.tabs.indexOf(tab);
-        const from = app.tabs.indexOf(dragging);
+        const from = app.tabs.indexOf(moving);
+        if (from < 0 || idx < 0) return;
         if (from < idx) idx -= 1;
-        app.moveTab(dragging, before ? idx : idx + 1);
+        app.moveTab(moving, before ? idx : idx + 1);
       });
       strip.append(el);
     }
@@ -107,16 +131,40 @@ export function mountTabBar(app: App, root: HTMLElement): void {
     active?.scrollIntoView({ inline: "nearest", block: "nearest" });
   };
 
-  strip.addEventListener("wheel", (e) => {
-    if (e.deltaY !== 0 && !e.shiftKey) {
-      strip.scrollLeft += e.deltaY;
-      e.preventDefault();
-    }
-  }, { passive: false });
+  // Dropping on the empty part of the bar moves the tab to the end of this pane.
+  root.addEventListener("dragover", (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    root.classList.add("drop-target");
+  });
+  root.addEventListener("dragleave", () => root.classList.remove("drop-target"));
+  root.addEventListener("drop", (e) => {
+    root.classList.remove("drop-target");
+    if (!dragging) return;
+    e.preventDefault();
+    const moving = dragging;
+    if (app.paneIndex(moving) !== pane) app.moveToOtherView(moving);
+    else app.moveTab(moving, app.tabs.length);
+  });
+
+  strip.addEventListener(
+    "wheel",
+    (e) => {
+      if (e.deltaY !== 0 && !e.shiftKey) {
+        strip.scrollLeft += e.deltaY;
+        e.preventDefault();
+      }
+    },
+    { passive: false }
+  );
   strip.addEventListener("dblclick", (e) => {
-    if (e.target === strip) app.newTab();
+    if (e.target !== strip) return;
+    if (app.splitOn) app.focusPane(pane, false);
+    app.newTab();
   });
 
   app.on("tabs", render);
+  app.on("active", render);
+  app.on("layout", render);
   render();
 }

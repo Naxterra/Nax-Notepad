@@ -126,6 +126,32 @@ pub fn decode(bytes: &[u8]) -> Decoded {
     }
 }
 
+/// Decode `bytes` as the encoding the user chose ("Reopen with encoding"), instead of
+/// detecting it. A matching byte order mark is skipped.
+pub fn decode_as(bytes: &[u8], label: &str) -> Result<Decoded, String> {
+    let (bom, _) = detect_bom(bytes);
+    let (enc, body, out_label): (&'static Encoding, &[u8], String) = match label {
+        "UTF-8" | "UTF-8-BOM" => {
+            if bom == Bom::Utf8 {
+                (encoding_rs::UTF_8, &bytes[3..], "UTF-8-BOM".into())
+            } else {
+                (encoding_rs::UTF_8, bytes, "UTF-8".into())
+            }
+        }
+        "UTF-16LE" => (encoding_rs::UTF_16LE, if bom == Bom::Utf16Le { &bytes[2..] } else { bytes }, "UTF-16LE".into()),
+        "UTF-16BE" => (encoding_rs::UTF_16BE, if bom == Bom::Utf16Be { &bytes[2..] } else { bytes }, "UTF-16BE".into()),
+        other => {
+            let enc = Encoding::for_label(other.as_bytes()).ok_or_else(|| format!("Unknown encoding: {other}"))?;
+            (enc, bytes, enc.name().to_string())
+        }
+    };
+    let (cow, had_errors) = enc.decode_without_bom_handling(body);
+    let text = cow.into_owned();
+    let sample_end = text.char_indices().map(|(i, _)| i).find(|&i| i >= 1 << 16).unwrap_or(text.len());
+    let eol = detect_eol(text[..sample_end].as_bytes());
+    Ok(Decoded { text, encoding: out_label, eol, had_errors })
+}
+
 /// Why an encode failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
@@ -153,6 +179,7 @@ impl EncodeError {
 
 /// Encode `text` (which uses "\n" line separators) into bytes using `encoding` and `eol`.
 /// Fails instead of silently altering characters the encoding cannot represent.
+#[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
 pub fn encode(text: &str, encoding: &str, eol: Eol) -> Result<Vec<u8>, String> {
     encode_with(text, encoding, eol, false).map_err(|e| e.to_message())
 }
@@ -288,6 +315,20 @@ mod tests {
         assert_eq!(bytes, b"Hello ?");
         // Representable text is unaffected.
         assert_eq!(encode("Grüße €", "windows-1252", Eol::Lf).unwrap(), b"Gr\xfc\xdfe \x80");
+    }
+
+    #[test]
+    fn reopen_with_chosen_encoding() {
+        let bytes = "Grüße".as_bytes(); // UTF-8
+        let as1252 = decode_as(bytes, "windows-1252").unwrap();
+        assert_eq!(as1252.text, "GrÃ¼ÃŸe");
+        assert_eq!(as1252.encoding, "windows-1252");
+        let back = decode_as(bytes, "UTF-8").unwrap();
+        assert_eq!((back.text.as_str(), back.encoding.as_str()), ("Grüße", "UTF-8"));
+        let le = encode("hi", "UTF-16LE", Eol::Lf).unwrap();
+        assert_eq!(decode_as(&le, "UTF-16LE").unwrap().text, "hi");
+        assert_eq!(decode_as(&le[2..], "UTF-16LE").unwrap().text, "hi");
+        assert!(decode_as(bytes, "no-such-encoding").is_err());
     }
 
     #[test]

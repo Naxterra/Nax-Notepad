@@ -1,5 +1,6 @@
 import { backend, Eol } from "./backend";
 import { LangSetting } from "./i18n";
+import type { Macro } from "./macros";
 
 export interface Settings {
   theme: string; // "system" | theme id
@@ -27,6 +28,22 @@ export interface Settings {
   language: LangSetting;
   checkUpdates: boolean;
   lastUpdateCheck: number;
+  /** "nax" or "npp" (Notepad++ keys). */
+  keymapPreset: string;
+  /** Command id -> chord ("" removes the key). */
+  keyOverrides: Record<string, string>;
+  findHistory: string[];
+  replaceHistory: string[];
+  recentFiles: string[];
+  macros: Macro[];
+  showWhitespace: boolean;
+  showEol: boolean;
+  detectIndent: boolean;
+  syncScroll: boolean;
+  workspaceFolders: string[];
+  sidebarVisible: boolean;
+  /** "folders" or "functions" */
+  sidebarTab: string;
 }
 
 export const DEFAULTS: Settings = {
@@ -55,7 +72,41 @@ export const DEFAULTS: Settings = {
   language: "system",
   checkUpdates: true,
   lastUpdateCheck: 0,
+  keymapPreset: "nax",
+  keyOverrides: {},
+  findHistory: [],
+  replaceHistory: [],
+  recentFiles: [],
+  macros: [],
+  showWhitespace: false,
+  showEol: false,
+  detectIndent: true,
+  syncScroll: false,
+  workspaceFolders: [],
+  sidebarVisible: false,
+  sidebarTab: "folders",
 };
+
+/**
+ * Keys that hold the user's data rather than preferences. "Reset to defaults" keeps them and
+ * they are not part of a settings export unless noted in `EXPORT_DATA_KEYS`.
+ */
+export const DATA_KEYS: (keyof Settings)[] = ["keymapPreset", "keyOverrides", "findHistory", "replaceHistory", "recentFiles", "macros", "workspaceFolders", "lastUpdateCheck"];
+
+/** Data keys that a settings export includes (shortcuts and macros, not history). */
+export const EXPORT_DATA_KEYS: (keyof Settings)[] = ["keymapPreset", "keyOverrides", "macros"];
+
+/** Keep only known keys whose value has the same type as the default. */
+export function validSettings(raw: Record<string, unknown>): Partial<Settings> {
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(DEFAULTS) as (keyof Settings)[]) {
+    const v = raw[k];
+    const d = DEFAULTS[k];
+    if (v === undefined || v === null || typeof v !== typeof d || Array.isArray(v) !== Array.isArray(d)) continue;
+    out[k] = v;
+  }
+  return out as Partial<Settings>;
+}
 
 export const settings: Settings = { ...DEFAULTS };
 
@@ -70,11 +121,7 @@ export function onSettingsChange(fn: Listener): () => void {
 export async function loadSettings(): Promise<Settings> {
   try {
     const raw = await backend.settingsLoad();
-    for (const k of Object.keys(DEFAULTS) as (keyof Settings)[]) {
-      if (raw[k] !== undefined && typeof raw[k] === typeof DEFAULTS[k]) {
-        (settings as unknown as Record<string, unknown>)[k] = raw[k];
-      }
-    }
+    Object.assign(settings, validSettings(raw));
   } catch (e) {
     console.warn("settings load failed", e);
   }
@@ -82,9 +129,10 @@ export async function loadSettings(): Promise<Settings> {
 }
 
 let saveTimer: number | undefined;
-export function updateSettings(patch: Partial<Settings>): void {
+/** Change settings and save them. `silent` skips the change listeners (for data keys). */
+export function updateSettings(patch: Partial<Settings>, opts: { silent?: boolean } = {}): void {
   Object.assign(settings, patch);
-  for (const fn of listeners) fn(settings);
+  if (!opts.silent) for (const fn of listeners) fn(settings);
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
     backend.settingsSave({ ...settings } as unknown as Record<string, unknown>).catch((e) => console.warn("settings save failed", e));

@@ -1,19 +1,40 @@
-// Application state: tabs, the single EditorView, file I/O, session persistence.
-import { EditorSelection, EditorState, Extension, Transaction, TransactionSpec } from "@codemirror/state";
+// Application state: tabs, the editor panes (one, or two side by side), file I/O and session
+// persistence.
+//
+// Each pane has its own EditorView. A tab is shown in at most one pane; its live state is that
+// pane's view state, otherwise `tab.state`. `view` and `active` always refer to the focused pane.
+// A clone is a second tab showing the same document in the other pane: edits are mirrored
+// between the two, and saving, dirty state and recovery belong to the original tab.
+import { Annotation, EditorSelection, EditorState, Extension, Transaction, TransactionSpec } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { LanguageDescription } from "@codemirror/language";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog, message } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { backend, E_EXTERNAL_CHANGE, E_READ_ONLY_ENCODING, E_UNREPRESENTABLE, Eol, errorText, SaveResult, SessionData, TabMeta } from "./backend";
-import { compartments, createState, languageByName, languageForFile, loadLanguage, systemChange } from "./editor";
+import { bookmarkLines, setBookmarks } from "./bookmarks";
+import { compartments, createState, indentExt, languageByName, languageForFile, loadLanguage, systemChange } from "./editor";
+import { detectIndent, IndentInfo } from "./indentdetect";
 import { livePreview, LivePreviewConfig } from "./livepreview";
 import { PagedController, PagedHost } from "./paged";
-import { settings } from "./settings";
-import { confirm3, toast } from "./ui/dialogs";
+import { settings, updateSettings } from "./settings";
+import { whitespaceExt } from "./whitespace";
+import { confirm3, confirmDialog, toast } from "./ui/dialogs";
 import { t } from "./i18n";
 
 export type TabKind = "memory" | "paged";
+
+/** State of "follow" (tail -f) mode for a tab. */
+export interface TailState {
+  paused: boolean;
+  /** Bytes of the file already shown (small files). */
+  offset: number;
+  headHash: number;
+  headLen: number;
+  /** The file is currently missing (deleted or being rotated). */
+  missing: boolean;
+  busy: boolean;
+}
 
 export interface Tab {
   id: string;
@@ -48,6 +69,27 @@ export interface Tab {
   externalAck?: number;
   /** Last time a background persistence error was shown for this tab. */
   lastErrorToast?: number;
+  /** Pane the tab belongs to (0 = left/main, 1 = right/second view). */
+  pane: 0 | 1;
+  /** Set on a clone: the tab whose document this tab mirrors. */
+  cloneOf?: Tab;
+  /** Indentation of this document; null uses the settings. */
+  indent: IndentInfo | null;
+  /** Follow mode (tail -f). */
+  tail?: TailState;
+}
+
+interface Pane {
+  host: HTMLElement;
+  view: EditorView;
+  tab: Tab | null;
+}
+
+interface ClosedTab {
+  path: string | null;
+  name: string;
+  text?: string;
+  line: number;
 }
 
 /** Same file time, also accepting legacy session values stored in whole seconds. */
@@ -55,6 +97,10 @@ function sameMtime(disk: number, known: number): boolean {
   return disk === known || (known > 0 && known < 1e11 && Math.floor(disk / 1000) === known);
 }
 
+/** Marks an edit copied from a tab to its clone (or back), so it is not mirrored again. */
+const mirrored = Annotation.define<boolean>();
+
+type AppEvent = "tabs" | "status" | "active" | "layout" | "doc";
 type Listener = () => void;
 
 function dirname(p: string): string {
@@ -87,44 +133,319 @@ function newId(): string {
   return `t${Date.now().toString(36)}${(idCounter++).toString(36)}`;
 }
 
+const MAX_RECENT = 20;
+const MAX_CLOSED = 20;
+
 export class App {
   tabs: Tab[] = [];
+  /** Tab of the focused pane. */
   active: Tab | null = null;
+  /** View of the focused pane. */
   view: EditorView;
+  panes: Pane[] = [];
+  focused = 0;
+  /** Whether the second pane is shown. */
+  splitOn = false;
   nextUntitled = 1;
-  private listeners = new Map<string, Set<Listener>>();
+  closedTabs: ClosedTab[] = [];
+  private listeners = new Map<AppEvent, Set<Listener>>();
   private sessionTimer: number | undefined;
   private restoring = false;
   private cursorSaveTimer: number | undefined;
+  private scrollSyncing = false;
+  private syncOffset = 0;
 
-  constructor(parent: HTMLElement) {
-    this.view = new EditorView({ parent, state: EditorState.create({ doc: "" }) });
+  constructor(hosts: HTMLElement[]) {
+    this.panes = hosts.map((host, i) => {
+      const view = new EditorView({
+        parent: host,
+        state: EditorState.create({ doc: "" }),
+        dispatchTransactions: (trs, v) => this.onDispatch(trs, v),
+      });
+      host.addEventListener("focusin", () => {
+        if (this.focused !== i && this.panes[i].tab) this.focusPane(i, false);
+      });
+      view.scrollDOM.addEventListener("scroll", () => this.onPaneScroll(i), { passive: true });
+      return { host, view, tab: null };
+    });
+    this.view = this.panes[0].view;
     window.addEventListener("focus", () => void this.checkExternalChange());
+    window.setInterval(() => this.pollFollowed(), 1000);
   }
 
   // ---- events ----------------------------------------------------------------------------
-  on(event: "tabs" | "status" | "active", fn: Listener): void {
+  on(event: AppEvent, fn: Listener): void {
     if (!this.listeners.has(event)) this.listeners.set(event, new Set());
     this.listeners.get(event)!.add(fn);
   }
-  emit(event: "tabs" | "status" | "active"): void {
+  emit(event: AppEvent): void {
     for (const fn of this.listeners.get(event) ?? []) fn();
   }
 
+  // ---- panes ------------------------------------------------------------------------------
+  /** The tab that owns the document (the original for a clone). */
+  owner(tab: Tab): Tab {
+    return tab.cloneOf ?? tab;
+  }
+
+  clonesOf(tab: Tab): Tab[] {
+    return this.tabs.filter((x) => x.cloneOf === tab);
+  }
+
+  /** Pane index a tab is displayed in. */
+  paneIndex(tab: Tab): 0 | 1 {
+    return this.splitOn ? tab.pane : 0;
+  }
+
+  tabsIn(pane: number): Tab[] {
+    return this.tabs.filter((x) => this.paneIndex(x) === pane);
+  }
+
+  private paneOf(tab: Tab): Pane | null {
+    for (const p of this.panes) if (p.tab === tab) return p;
+    return null;
+  }
+
+  /** The view showing `tab`, or null when the tab is in the background. */
+  viewOf(tab: Tab): EditorView | null {
+    return this.paneOf(tab)?.view ?? null;
+  }
+
+  /** Current editor state of a tab, whether or not it is visible. */
+  stateOf(tab: Tab): EditorState {
+    return this.viewOf(tab)?.state ?? tab.state;
+  }
+
+  private onDispatch(trs: readonly Transaction[], view: EditorView): void {
+    view.update(trs);
+    const pane = this.panes.find((p) => p.view === view);
+    if (pane?.tab) this.mirror(pane.tab, trs);
+  }
+
+  /** Copy document changes of `tab` to its clone or original. */
+  private mirror(tab: Tab, trs: readonly Transaction[]): void {
+    const own = this.owner(tab);
+    const partners = [own, ...this.clonesOf(own)].filter((x) => x !== tab);
+    if (!partners.length) return;
+    for (const tr of trs) {
+      if (!tr.docChanged || tr.annotation(mirrored)) continue;
+      for (const p of partners) {
+        this.dispatchTo(p, { changes: tr.changes, annotations: [mirrored.of(true), systemChange.of(true), Transaction.addToHistory.of(false)] });
+      }
+    }
+  }
+
+  /** Make pane `i` the focused one. */
+  focusPane(i: number, focusView = true): void {
+    if (!this.panes[i]) return;
+    this.focused = i;
+    this.view = this.panes[i].view;
+    this.active = this.panes[i].tab;
+    this.panes.forEach((p, k) => p.host.parentElement?.classList.toggle("focused", k === i));
+    if (focusView) this.view.focus();
+    this.emit("active");
+    this.emit("tabs");
+    this.emit("status");
+  }
+
+  /** Remember the view state of a tab that leaves its pane. */
+  private stash(tab: Tab): void {
+    const v = this.viewOf(tab);
+    if (!v) return;
+    tab.state = v.state;
+    tab.scrollTop = v.scrollDOM.scrollTop;
+    tab.paged?.detach();
+  }
+
+  /** Put `tab` into its pane (without changing focus). */
+  private show(tab: Tab): Pane {
+    const pane = this.panes[this.paneIndex(tab)];
+    if (pane.tab === tab) return pane;
+    const old = this.paneOf(tab);
+    if (old) {
+      this.stash(tab);
+      old.tab = null;
+    }
+    if (pane.tab) this.stash(pane.tab);
+    pane.tab = tab;
+    pane.view.setState(tab.state);
+    tab.paged?.attach(pane.view);
+    const st = tab.scrollTop;
+    pane.view.requestMeasure({
+      read: () => null,
+      write: () => {
+        pane.view.scrollDOM.scrollTop = st;
+      },
+    });
+    return pane;
+  }
+
+  setSplit(on: boolean): void {
+    if (this.splitOn === on) return;
+    this.splitOn = on;
+    this.panes[1].host.parentElement!.style.display = on ? "" : "none";
+    this.emit("layout");
+  }
+
+  /** Move a tab to the other pane, opening the split view if needed. */
+  moveToOtherView(tab: Tab): void {
+    const from = this.paneIndex(tab);
+    const to: 0 | 1 = from === 0 ? 1 : 0;
+    const own = this.owner(tab);
+    const twin = [own, ...this.clonesOf(own)].find((x) => x !== tab && this.splitOn && x.pane === to);
+    if (twin) {
+      // The document is already shown in the other pane.
+      if (tab.cloneOf) {
+        this.removeTab(tab);
+        this.activate(twin);
+        return;
+      }
+      this.removeTab(twin); // keep the original, drop its clone
+    }
+    this.setSplit(true);
+    const src = this.paneOf(tab);
+    if (src) {
+      this.stash(tab);
+      src.tab = null;
+    }
+    tab.pane = to;
+    this.refillPane(from);
+    this.activate(tab);
+    this.emit("tabs");
+    this.scheduleSessionSave();
+  }
+
+  /** Show the same document in the other pane (small files only). */
+  async cloneToOtherView(tab: Tab): Promise<void> {
+    const own = this.owner(tab);
+    if (own.kind === "paged") {
+      toast(t("Large files cannot be shown twice."));
+      return;
+    }
+    const to: 0 | 1 = this.paneIndex(tab) === 0 ? 1 : 0;
+    const existing = [own, ...this.clonesOf(own)].find((x) => x !== tab && this.splitOn && x.pane === to);
+    if (existing) {
+      this.activate(existing);
+      return;
+    }
+    const clone = this.makeTab({
+      name: own.name,
+      kind: "memory",
+      path: own.path,
+      encoding: own.encoding,
+      eol: own.eol,
+      readOnly: own.readOnly,
+      livePreview: own.livePreview,
+      untitled: own.untitled,
+    });
+    clone.cloneOf = own;
+    clone.pane = to;
+    clone.indent = own.indent;
+    clone.languageName = own.languageName;
+    const desc = own.languageName ? languageByName(own.languageName) : null;
+    const langExt: Extension = desc ? await loadLanguage(desc) : [];
+    const st = this.stateOf(own);
+    clone.state = this.buildState(clone, st.doc.toString(), langExt);
+    clone.state = clone.state.update({ selection: EditorSelection.cursor(Math.min(st.selection.main.head, clone.state.doc.length)) }).state;
+    this.tabs.splice(this.tabs.indexOf(own) + 1, 0, clone);
+    this.setSplit(true);
+    this.activate(clone);
+    this.emit("tabs");
+  }
+
+  /** Close the second pane: its tabs move to the first, clones are closed. */
+  closeSplit(): void {
+    if (!this.splitOn) return;
+    const p1 = this.panes[1];
+    if (p1.tab) {
+      this.stash(p1.tab);
+      p1.tab = null;
+    }
+    for (const tab of [...this.tabs]) {
+      if (tab.cloneOf) this.removeTab(tab, false);
+      else tab.pane = 0;
+    }
+    this.setSplit(false);
+    if (!this.panes[0].tab) {
+      if (this.tabs.length) this.show(this.tabs[0]);
+      else this.newTab("", false);
+    }
+    this.focusPane(0);
+    this.emit("tabs");
+    this.scheduleSessionSave();
+  }
+
+  /** After a pane lost its tab: show a neighbour, or close an empty second pane. */
+  private refillPane(pane: number, nearIndex = 0): void {
+    if (this.panes[pane].tab && this.tabs.includes(this.panes[pane].tab!)) return;
+    this.panes[pane].tab = null;
+    const same = this.tabsIn(pane);
+    if (same.length) {
+      const next = same.find((x) => this.tabs.indexOf(x) >= nearIndex) ?? same[same.length - 1];
+      this.show(next);
+      if (this.focused === pane) this.focusPane(pane, false);
+      return;
+    }
+    if (pane === 1) {
+      this.setSplit(false);
+      if (this.focused === 1) this.focusPane(0);
+      return;
+    }
+    if (this.splitOn && this.tabsIn(1).length) {
+      // The main pane became empty: give it a new tab, like Notepad++.
+      const tab = this.newTab("", false);
+      tab.pane = 0;
+      this.show(tab);
+      if (this.focused === 0) this.focusPane(0, false);
+      return;
+    }
+    this.newTab();
+  }
+
+  private onPaneScroll(i: number): void {
+    if (!this.splitOn || !settings.syncScroll || this.scrollSyncing) return;
+    const src = this.panes[i].view;
+    const dst = this.panes[1 - i].view;
+    if (!this.panes[1 - i].tab) return;
+    this.scrollSyncing = true;
+    try {
+      const top = src.scrollDOM.scrollTop;
+      const blk = src.lineBlockAtHeight(top);
+      const line = src.state.doc.lineAt(blk.from).number + (i === 0 ? this.syncOffset : -this.syncOffset);
+      const frac = blk.height ? (top - blk.top) / blk.height : 0;
+      const n = Math.max(1, Math.min(dst.state.doc.lines, line));
+      const dblk = dst.lineBlockAt(dst.state.doc.line(n).from);
+      dst.scrollDOM.scrollTop = dblk.top + frac * dblk.height;
+      dst.scrollDOM.scrollLeft = src.scrollDOM.scrollLeft;
+    } finally {
+      requestAnimationFrame(() => (this.scrollSyncing = false));
+    }
+  }
+
+  /** Turn synchronized scrolling on or off, keeping the current line offset between panes. */
+  setSyncScroll(on: boolean): void {
+    if (on && this.splitOn) {
+      const top = (v: EditorView) => v.state.doc.lineAt(v.lineBlockAtHeight(v.scrollDOM.scrollTop).from).number;
+      this.syncOffset = top(this.panes[1].view) - top(this.panes[0].view);
+    } else this.syncOffset = 0;
+    updateSettings({ syncScroll: on }, { silent: true });
+    this.emit("status");
+  }
+
   // ---- editor state helpers -------------------------------------------------------------
-  private listenerExt(): Extension {
+  private listenerExt(tab: Tab): Extension {
     return EditorView.updateListener.of((u) => {
-      const tab = this.active;
-      if (!tab) return;
       if (u.docChanged) {
         const userEdit = u.transactions.some((tr) => tr.docChanged && !tr.annotation(systemChange));
         if (userEdit) {
-          this.noteUserEdit(tab);
-          if (tab.kind === "paged") tab.paged?.noteChange();
-          else this.scheduleBufferStore(tab);
+          const own = this.owner(tab);
+          this.noteUserEdit(own);
+          if (own.kind === "paged") own.paged?.noteChange();
+          else this.scheduleBufferStore(own);
         }
+        this.emit("doc");
       }
-      if (u.docChanged || u.selectionSet) {
+      if ((u.docChanged || u.selectionSet) && tab === this.active) {
         this.emit("status");
         this.scheduleCursorSave();
       }
@@ -135,13 +456,15 @@ export class App {
     return {
       resolveImage: (src) => {
         if (/^(https?:|data:|file:|asset:)/i.test(src)) return src;
-        const base = tab.path ? dirname(tab.path) : "";
+        const path = this.owner(tab).path;
+        const base = path ? dirname(path) : "";
         const abs = base ? joinPath(base, decodeURIComponent(src)) : src;
         return convertFileSrc(abs);
       },
       openLink: (href) => {
+        const path = this.owner(tab).path;
         if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) void openUrl(href);
-        else if (tab.path) void this.openFiles([joinPath(dirname(tab.path), decodeURIComponent(href.split("#")[0]))]);
+        else if (path) void this.openFiles([joinPath(dirname(path), decodeURIComponent(href.split("#")[0]))]);
       },
     };
   }
@@ -161,7 +484,10 @@ export class App {
   }
 
   private applyReadOnly(tab: Tab): void {
-    this.dispatchTo(tab, { effects: compartments.readOnly.reconfigure(EditorState.readOnly.of(this.effectiveReadOnly(tab))) });
+    for (const x of [tab, ...this.clonesOf(tab)]) {
+      x.readOnly = tab.readOnly;
+      this.dispatchTo(x, { effects: compartments.readOnly.reconfigure(EditorState.readOnly.of(this.effectiveReadOnly(x))) });
+    }
     this.emit("status");
   }
 
@@ -176,9 +502,9 @@ export class App {
 
   private pagedHost(tab: Tab): PagedHost {
     return {
-      state: () => (this.active === tab ? this.view.state : tab.state),
+      state: () => this.stateOf(tab),
       dispatch: (spec) => this.dispatchTo(tab, spec),
-      view: () => (this.active === tab ? this.view : null),
+      view: () => this.viewOf(tab),
       onWindowChanged: () => this.emit("status"),
       onBackendEdit: () => this.noteUserEdit(tab),
       onWindowFlags: (f) => {
@@ -190,6 +516,15 @@ export class App {
     };
   }
 
+  /** Indentation extension of a tab. */
+  indentExtFor(tab: Tab): Extension {
+    return indentExt(settings, this.owner(tab).indent);
+  }
+
+  whitespaceExtFor(tab: Tab): Extension {
+    return whitespaceExt(settings.showWhitespace, settings.showEol, () => this.owner(tab).eol);
+  }
+
   private buildState(tab: Tab, text: string, language: Extension, firstLineOffset = 0): EditorState {
     return createState({
       text,
@@ -199,7 +534,9 @@ export class App {
       lpConfig: this.lpConfig(tab),
       language,
       firstLineOffset,
-      extra: [this.listenerExt()],
+      indent: tab.indent ?? undefined,
+      eol: () => this.owner(tab).eol,
+      extra: [this.listenerExt(tab)],
     });
   }
 
@@ -215,10 +552,15 @@ export class App {
     this.scheduleSessionSave();
   }
 
-  /** Dispatch to a tab whether or not it is active. */
+  /** Dispatch to a tab whether or not it is visible. */
   dispatchTo(tab: Tab, spec: TransactionSpec): void {
-    if (tab === this.active) this.view.dispatch(spec);
-    else tab.state = tab.state.update(spec).state;
+    const v = this.viewOf(tab);
+    if (v) v.dispatch(spec);
+    else {
+      const tr = tab.state.update(spec);
+      tab.state = tr.state;
+      this.mirror(tab, [tr]);
+    }
   }
 
   // ---- tab lifecycle --------------------------------------------------------------------
@@ -244,6 +586,8 @@ export class App {
       hexView: false,
       revision: partial.dirty ? 1 : 0,
       savedRevision: 0,
+      pane: partial.pane ?? (this.splitOn ? (this.focused as 0 | 1) : 0),
+      indent: partial.indent ?? null,
     };
     return tab;
   }
@@ -255,12 +599,17 @@ export class App {
 
   newTab(text = "", activate = true): Tab {
     // Use the lowest number not taken by an open "new N" tab, like Notepad++.
-    const used = new Set(this.tabs.map((t) => t.untitled).filter((u): u is number => u !== null));
+    const used = new Set(this.tabs.filter((x) => !x.cloneOf).map((x) => x.untitled).filter((u): u is number => u !== null));
     let n = 1;
     while (used.has(n)) n++;
     const tab = this.makeTab({ name: untitledName(n), kind: "memory", untitled: n });
     tab.state = this.buildState(tab, text, []);
     this.insertTab(tab);
+    if (text) {
+      tab.dirty = true;
+      tab.revision = 1;
+      this.scheduleBufferStore(tab);
+    }
     if (activate) this.activate(tab);
     this.emit("tabs");
     this.scheduleSessionSave();
@@ -269,7 +618,7 @@ export class App {
 
   findByPath(path: string): Tab | undefined {
     const norm = path.toLowerCase();
-    return this.tabs.find((t) => t.path && t.path.toLowerCase() === norm);
+    return this.tabs.find((x) => !x.cloneOf && x.path && x.path.toLowerCase() === norm);
   }
 
   async openFiles(paths: string[], activate = true): Promise<Tab | null> {
@@ -292,7 +641,18 @@ export class App {
     return last;
   }
 
-  private async openOne(path: string, id?: string, restoreOpts?: { livePreview?: boolean; languageName?: string | null; paged?: boolean; hexView?: boolean }): Promise<Tab> {
+  /** Remember a file in the Recent Files list. */
+  addRecent(path: string): void {
+    const norm = path.toLowerCase();
+    const list = [path, ...settings.recentFiles.filter((p) => p.toLowerCase() !== norm)].slice(0, MAX_RECENT);
+    updateSettings({ recentFiles: list }, { silent: true });
+  }
+
+  clearRecent(): void {
+    updateSettings({ recentFiles: [] }, { silent: true });
+  }
+
+  private async openOne(path: string, id?: string, restoreOpts?: { livePreview?: boolean; languageName?: string | null; paged?: boolean; hexView?: boolean; pane?: 0 | 1 }): Promise<Tab> {
     const tabId = id ?? newId();
     const res = restoreOpts?.paged ? await backend.pagedRestore(tabId, path).catch(() => backend.openPath(tabId, path)) : await backend.openPath(tabId, path);
     const tab = this.makeTab({
@@ -306,6 +666,7 @@ export class App {
       size: res.size,
       readOnly: res.readOnly,
       livePreview: restoreOpts?.livePreview ?? settings.livePreviewDefault,
+      pane: restoreOpts?.pane,
     });
     tab.hexView = restoreOpts?.hexView ?? res.binary;
     if (res.readOnlyReason === "encoding") {
@@ -332,53 +693,47 @@ export class App {
       }
       tab.state = this.buildState(tab, w.text, langExt, 0);
     } else {
-      tab.state = this.buildState(tab, res.text ?? "", langExt);
+      const text = res.text ?? "";
+      if (settings.detectIndent) {
+        const info = detectIndent(text);
+        if (info) tab.indent = { spaces: info.spaces, size: info.size || settings.tabSize };
+      }
+      tab.state = this.buildState(tab, text, langExt);
     }
     // Replace an empty, untouched untitled tab if it is the only one.
-    const placeholder = this.tabs.length === 1 && this.tabs[0].untitled !== null && !this.tabs[0].dirty && this.tabs[0].state.doc.length === 0 ? this.tabs[0] : null;
+    const placeholder = this.tabs.length === 1 && this.tabs[0].untitled !== null && !this.tabs[0].dirty && this.stateOf(this.tabs[0]).doc.length === 0 ? this.tabs[0] : null;
     this.insertTab(tab);
     if (placeholder) await this.closeTab(placeholder, true);
+    if (!this.restoring) this.addRecent(res.path);
     return tab;
   }
 
   activate(tab: Tab): void {
-    if (this.active === tab) return;
-    if (this.active) {
-      this.active.state = this.view.state;
-      this.active.scrollTop = this.view.scrollDOM.scrollTop;
-      this.active.paged?.detach();
-    }
-    this.active = tab;
-    this.view.setState(tab.state);
-    tab.paged?.attach(this.view);
-    const st = tab.scrollTop;
-    this.view.requestMeasure({
-      read: () => null,
-      write: () => {
-        this.view.scrollDOM.scrollTop = st;
-      },
-    });
+    if (!this.tabs.includes(tab)) return;
+    const idx = this.paneIndex(tab);
+    const same = this.panes[idx].tab === tab && this.focused === idx && this.active === tab;
+    if (same) return;
+    this.show(tab);
+    this.focusPane(idx, true);
     if (tab.pendingCursor) {
       const pc = tab.pendingCursor;
       tab.pendingCursor = undefined;
       void this.gotoLine(pc.line, pc.col);
     }
-    this.view.focus();
-    this.emit("active");
-    this.emit("tabs");
-    this.emit("status");
     this.scheduleSessionSave();
     void this.checkExternalChange();
   }
 
   activateIndex(i: number): void {
-    if (i >= 0 && i < this.tabs.length) this.activate(this.tabs[i]);
+    const list = this.tabsIn(this.focused);
+    if (i >= 0 && i < list.length) this.activate(list[i]);
   }
 
   nextTab(delta: number): void {
-    if (!this.active || this.tabs.length < 2) return;
-    const i = this.tabs.indexOf(this.active);
-    this.activateIndex((i + delta + this.tabs.length) % this.tabs.length);
+    const list = this.tabsIn(this.focused);
+    if (!this.active || list.length < 2) return;
+    const i = list.indexOf(this.active);
+    this.activate(list[(i + delta + list.length) % list.length]);
   }
 
   moveTab(tab: Tab, toIndex: number): void {
@@ -390,8 +745,29 @@ export class App {
     this.scheduleSessionSave();
   }
 
+  /** Take a tab out of the tab list and its pane, without prompting. */
+  private removeTab(tab: Tab, refill = true): void {
+    const i = this.tabs.indexOf(tab);
+    if (i < 0) return;
+    const paneIdx = this.paneIndex(tab);
+    const pane = this.paneOf(tab);
+    if (pane) {
+      tab.paged?.detach();
+      pane.tab = null;
+    }
+    this.tabs.splice(i, 1);
+    if (this.active === tab) this.active = null;
+    if (pane && refill) this.refillPane(paneIdx, i);
+    this.emit("tabs");
+  }
+
   /** Close a tab. Returns false if the user cancelled. */
   async closeTab(tab: Tab, force = false): Promise<boolean> {
+    if (tab.cloneOf) {
+      this.removeTab(tab);
+      this.scheduleSessionSave();
+      return true;
+    }
     if (!force && tab.dirty) {
       this.activate(tab);
       const r = await confirm3(t("Save changes?"), t('Save changes to "{name}" before closing?', { name: tab.name }));
@@ -401,38 +777,66 @@ export class App {
         if (!ok) return false;
       }
     }
-    const i = this.tabs.indexOf(tab);
-    if (i < 0) return true;
-    this.tabs.splice(i, 1);
+    if (!this.tabs.includes(tab)) return true;
+    this.rememberClosed(tab);
+    for (const c of this.clonesOf(tab)) this.removeTab(c);
     if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
+    tab.tail = undefined;
     tab.paged?.dispose();
     if (tab.kind === "paged") void backend.pagedClose(tab.id);
     void backend.sessionDropBuffer(tab.id);
-    if (this.active === tab) {
-      this.active = null;
-      if (this.tabs.length === 0) this.newTab();
-      else this.activate(this.tabs[Math.min(i, this.tabs.length - 1)]);
-    }
-    this.emit("tabs");
+    this.removeTab(tab);
+    if (this.tabs.length === 0) this.newTab();
     this.scheduleSessionSave();
     return true;
   }
 
+  private rememberClosed(tab: Tab): void {
+    const state = this.stateOf(tab);
+    const line = state.doc.lineAt(state.selection.main.head).number + (tab.paged?.firstLine ?? 0);
+    let entry: ClosedTab | null = null;
+    if (tab.path) entry = { path: tab.path, name: tab.name, line };
+    else if (state.doc.length > 0 && state.doc.length < 8 * 1024 * 1024) entry = { path: null, name: tab.name, text: state.doc.toString(), line };
+    if (!entry) return;
+    this.closedTabs.push(entry);
+    if (this.closedTabs.length > MAX_CLOSED) this.closedTabs.shift();
+  }
+
+  /** Reopen the most recently closed tab (Ctrl+Shift+T). */
+  async reopenClosed(): Promise<void> {
+    for (;;) {
+      const c = this.closedTabs.pop();
+      if (!c) {
+        toast(t("No closed tabs to reopen."));
+        return;
+      }
+      if (c.path) {
+        if (!(await backend.pathExists(c.path))) continue;
+        const tab = await this.openFiles([c.path]);
+        if (tab) await this.gotoLine(c.line);
+      } else {
+        this.newTab(c.text ?? "");
+        await this.gotoLine(c.line);
+      }
+      return;
+    }
+  }
+
   async closeOthers(keep: Tab): Promise<void> {
-    for (const t of [...this.tabs]) if (t !== keep && !t.pinned) if (!(await this.closeTab(t))) return;
+    for (const x of [...this.tabs]) if (x !== keep && !x.pinned && x.cloneOf !== this.owner(keep) && x !== keep.cloneOf) if (!(await this.closeTab(x))) return;
   }
   async closeAll(): Promise<void> {
-    for (const t of [...this.tabs]) if (!t.pinned) if (!(await this.closeTab(t))) return;
+    for (const x of [...this.tabs]) if (!x.pinned && this.tabs.includes(x)) if (!(await this.closeTab(x))) return;
   }
   async closeToRight(tab: Tab): Promise<void> {
-    const i = this.tabs.indexOf(tab);
-    for (const t of this.tabs.slice(i + 1)) if (!t.pinned) if (!(await this.closeTab(t))) return;
+    const list = this.tabsIn(this.paneIndex(tab));
+    const i = list.indexOf(tab);
+    for (const x of list.slice(i + 1)) if (!x.pinned && this.tabs.includes(x)) if (!(await this.closeTab(x))) return;
   }
 
   // ---- saving -------------------------------------------------------------------------
   docText(tab: Tab): string {
-    const state = tab === this.active ? this.view.state : tab.state;
-    return state.doc.toString();
+    return this.stateOf(tab).doc.toString();
   }
 
   /** Run the save operations of one tab one after another. */
@@ -443,6 +847,7 @@ export class App {
   }
 
   save(tab: Tab): Promise<boolean> {
+    tab = this.owner(tab);
     if (!tab.path) return this.saveAs(tab);
     const path = tab.path;
     return this.serial(tab, () => this.writeTab(tab, path, false));
@@ -471,9 +876,18 @@ export class App {
       tab.size = r.size;
       tab.externalAck = undefined;
       if (isSaveAs) tab.untitled = null;
+      for (const c of this.clonesOf(tab)) {
+        c.path = tab.path;
+        c.name = tab.name;
+        c.untitled = tab.untitled;
+      }
       if (tab.kind === "paged" && tab.paged) await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
       this.markSaved(tab, rev);
-      if (isSaveAs) await this.applyLanguage(tab, languageForFile(tab.name));
+      if (isSaveAs) {
+        await this.applyLanguage(tab, languageForFile(tab.name));
+        this.addRecent(tab.path);
+      }
+      if (tab.tail) await this.restartFollow(tab);
       this.emit("tabs");
       this.emit("status");
       this.scheduleSessionSave();
@@ -542,7 +956,7 @@ export class App {
 
   private applySaveTransforms(tab: Tab): void {
     if (!settings.trimTrailingOnSave && !settings.ensureFinalNewline) return;
-    const state = tab === this.active ? this.view.state : tab.state;
+    const state = this.stateOf(tab);
     const changes: { from: number; to: number; insert?: string }[] = [];
     if (settings.trimTrailingOnSave) {
       for (let i = 1; i <= state.doc.lines; i++) {
@@ -551,13 +965,14 @@ export class App {
         if (m) changes.push({ from: line.from + m.index, to: line.to });
       }
     }
-    if (settings.ensureFinalNewline && state.doc.length > 0 && !state.doc.sliceString(state.doc.length - 1) .endsWith("\n")) {
+    if (settings.ensureFinalNewline && state.doc.length > 0 && !state.doc.sliceString(state.doc.length - 1).endsWith("\n")) {
       changes.push({ from: state.doc.length, to: state.doc.length, insert: "\n" });
     }
     if (changes.length) this.dispatchTo(tab, { changes });
   }
 
   async saveAs(tab: Tab): Promise<boolean> {
+    tab = this.owner(tab);
     const target = await saveDialog({
       defaultPath: tab.path ?? `${tab.name}${tab.untitled !== null ? ".txt" : ""}`,
       title: t("Save As"),
@@ -567,7 +982,7 @@ export class App {
   }
 
   async saveAll(): Promise<void> {
-    for (const t of [...this.tabs]) if (t.dirty) if (!(await this.save(t))) return;
+    for (const x of [...this.tabs]) if (x.dirty && !x.cloneOf) if (!(await this.save(x))) return;
   }
 
   async openDialog(): Promise<void> {
@@ -576,22 +991,30 @@ export class App {
     await this.openFiles(Array.isArray(sel) ? sel : [sel]);
   }
 
-  async reload(tab: Tab): Promise<void> {
+  /**
+   * Re-read the file from disk. With `encoding` the bytes are decoded with that encoding
+   * ("Reopen with Encoding") instead of the detected one.
+   */
+  async reload(tab: Tab, encoding: string | null = null): Promise<void> {
+    tab = this.owner(tab);
     if (!tab.path) return;
     if (tab.kind === "paged" && tab.paged) {
       tab.paged.resetRevisions();
       await backend.pagedClose(tab.id);
-      const res = await backend.openPath(tab.id, tab.path, true);
+      const res = await backend.openPath(tab.id, tab.path, true, encoding);
       tab.paged.totalLines = res.lineCount ?? 1;
       tab.mtime = res.mtime;
       tab.size = res.size;
       tab.encoding = res.encoding;
       tab.eol = res.eol;
       tab.paged.scopeActive = false;
+      tab.lockedReadOnly = res.readOnlyReason === "encoding" ? t("Large files in {encoding} can be viewed but not edited yet.", { encoding: res.encoding }) : undefined;
+      if (tab.lockedReadOnly) tab.readOnly = true;
       await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
+      this.applyReadOnly(tab);
     } else {
-      const res = await backend.openPath(tab.id, tab.path);
-      const state = tab === this.active ? this.view.state : tab.state;
+      const res = await backend.openPath(tab.id, tab.path, false, encoding);
+      const state = this.stateOf(tab);
       const head = state.selection.main.head;
       this.dispatchTo(tab, {
         changes: { from: 0, to: state.doc.length, insert: res.text ?? "" },
@@ -602,19 +1025,44 @@ export class App {
       tab.eol = res.eol;
       tab.mtime = res.mtime;
       tab.size = res.size;
+      if (res.hadErrors && !tab.readOnly) {
+        tab.readOnly = true;
+        this.applyReadOnly(tab);
+        toast(t('"{name}" contains bytes that are not valid {encoding}. It was opened read-only so saving cannot change them. Use the tab menu to allow editing.', { name: tab.name, encoding: res.encoding }), 8000);
+      }
     }
     tab.savedRevision = tab.revision;
     tab.dirty = false;
     tab.externalAck = undefined;
     void backend.sessionDropBuffer(tab.id);
+    if (tab.tail) await this.restartFollow(tab);
     this.emit("tabs");
     this.emit("status");
   }
 
+  /** "Reopen with Encoding": decode the file again with `encoding`, discarding edits after asking. */
+  async reopenWithEncoding(tab: Tab, encoding: string): Promise<void> {
+    tab = this.owner(tab);
+    if (!tab.path) {
+      toast(t("This document has no file to reopen."));
+      return;
+    }
+    if (tab.dirty) {
+      const ok = await confirmDialog(t("Reopen with Encoding"), t('Discard the unsaved changes to "{name}" and reopen it as {encoding}?', { name: tab.name, encoding }), t("Reopen"));
+      if (!ok) return;
+    }
+    try {
+      await this.reload(tab, encoding);
+    } catch (e) {
+      toast(errorText(e), 6000);
+    }
+    this.scheduleSessionSave();
+  }
+
   private checking = false;
   async checkExternalChange(): Promise<void> {
-    const tab = this.active;
-    if (!tab || !tab.path || this.checking) return;
+    const tab = this.active ? this.owner(this.active) : null;
+    if (!tab || !tab.path || this.checking || (tab.tail && !tab.tail.paused)) return;
     this.checking = true;
     try {
       let changed: boolean;
@@ -643,14 +1091,156 @@ export class App {
     }
   }
 
+  // ---- follow mode (tail -f) ------------------------------------------------------------
+  /** Start or stop following a file that another program appends to. */
+  async toggleFollow(tab: Tab): Promise<void> {
+    tab = this.owner(tab);
+    if (tab.tail) {
+      tab.tail = undefined;
+      this.emit("status");
+      return;
+    }
+    if (!tab.path) {
+      toast(t("Save the document to a file first."));
+      return;
+    }
+    if (tab.dirty) {
+      toast(t("Following needs a document without unsaved changes. Save or reload it first."), 5000);
+      return;
+    }
+    const tail: TailState = { paused: false, offset: tab.size, headHash: 0, headLen: 0, missing: false, busy: true };
+    tab.tail = tail;
+    try {
+      await this.restartFollow(tab);
+    } finally {
+      tail.busy = false;
+    }
+    this.scrollToEnd(tab);
+    this.emit("status");
+  }
+
+  pauseFollow(tab: Tab, paused: boolean): void {
+    tab = this.owner(tab);
+    if (!tab.tail) return;
+    if (!paused && tab.dirty) {
+      toast(t("Following needs a document without unsaved changes. Save or reload it first."), 5000);
+      return;
+    }
+    tab.tail.paused = paused;
+    this.emit("status");
+  }
+
+  /**
+   * Take the loaded file as the new starting point (after loading or saving it): new data is
+   * read from the size that was loaded, and the current beginning of the file is remembered to
+   * detect replacement (log rotation).
+   */
+  private async restartFollow(tab: Tab): Promise<void> {
+    const tail = tab.tail;
+    if (!tail || !tab.path) return;
+    tail.offset = tab.size;
+    tail.missing = false;
+    if (tab.kind !== "memory") return;
+    try {
+      const st = await backend.tailStart(tab.path);
+      tail.headHash = st.headHash;
+      tail.headLen = st.headLen;
+    } catch {
+      tail.missing = true;
+    }
+  }
+
+  private scrollToEnd(tab: Tab): void {
+    const st = this.stateOf(tab);
+    if (tab.kind === "paged" && tab.paged) {
+      void tab.paged.gotoLine(tab.paged.totalLines - 1);
+      return;
+    }
+    this.dispatchTo(tab, { selection: { anchor: st.doc.length }, scrollIntoView: true, annotations: systemChange.of(true) });
+  }
+
+  private pollFollowed(): void {
+    for (const tab of this.tabs) if (tab.tail && !tab.tail.paused && !tab.tail.busy) void this.pollTail(tab);
+  }
+
+  private async pollTail(tab: Tab): Promise<void> {
+    const tail = tab.tail;
+    if (!tail || !tab.path) return;
+    if (tab.dirty) {
+      tail.paused = true;
+      toast(t('Following "{name}" is paused because it has unsaved changes.', { name: tab.name }), 5000);
+      this.emit("status");
+      return;
+    }
+    tail.busy = true;
+    try {
+      if (tab.kind === "memory") {
+        const r = await backend.tailCheck(tab.path, tail.offset, tail.headHash, tail.headLen, tab.encoding);
+        if (tab.tail !== tail || tab.dirty) return;
+        const wasMissing = tail.missing;
+        tail.missing = r.status === "missing";
+        if (r.status === "appended") {
+          if (r.text) this.appendFollowed(tab, r.text);
+          tail.offset = r.offset;
+          tab.size = r.offset;
+          tab.mtime = r.mtime;
+        } else if (r.status === "rotated") {
+          await this.reload(tab);
+          toast(t('"{name}" was replaced on disk and has been reloaded.', { name: tab.name }));
+          this.scrollToEnd(tab);
+        }
+        if (wasMissing !== tail.missing) this.emit("status");
+      } else if (tab.paged) {
+        const r = await backend.pagedTailCheck(tab.id);
+        if (tab.tail !== tail) return;
+        tail.missing = r.status === "missing";
+        if (r.status === "dirty") {
+          tail.paused = true;
+          this.emit("status");
+        } else if (r.status === "appended") {
+          const p = tab.paged;
+          const atEnd = p.cursorLine() >= p.totalLines - 1;
+          const windowAtEnd = p.firstLine + p.count >= p.totalLines - 1;
+          p.totalLines = r.totalLines;
+          tab.size = r.size ?? tab.size;
+          tab.mtime = r.mtime ?? tab.mtime;
+          if (atEnd) await p.gotoLine(r.totalLines - 1);
+          else if (windowAtEnd) await p.load(p.firstLine, p.cursorLine());
+          this.emit("status");
+          this.emit("doc");
+        } else if (r.status === "rotated") {
+          await this.reload(tab);
+          this.scrollToEnd(tab);
+        }
+      }
+    } catch (e) {
+      this.reportBackgroundError(tab, e);
+    } finally {
+      tail.busy = false;
+    }
+  }
+
+  private appendFollowed(tab: Tab, text: string): void {
+    const st = this.stateOf(tab);
+    const end = st.doc.length;
+    const atEnd = st.selection.main.empty && st.selection.main.head === end;
+    this.dispatchTo(tab, { changes: { from: end, insert: text }, annotations: [systemChange.of(true), Transaction.addToHistory.of(false)] });
+    if (atEnd) this.dispatchTo(tab, { selection: { anchor: this.stateOf(tab).doc.length }, scrollIntoView: true, annotations: systemChange.of(true) });
+  }
+
   // ---- per-tab properties ---------------------------------------------------------------
   async setLanguage(tab: Tab, name: string | null): Promise<void> {
     const desc = name ? languageByName(name) : null;
     await this.applyLanguage(tab, desc);
   }
 
+  /** "Convert to Encoding": the text is written in `enc` on the next save. */
   setEncoding(tab: Tab, enc: string): void {
-    if (tab.kind !== "memory") return;
+    tab = this.owner(tab);
+    if (tab.kind !== "memory") {
+      toast(t("Converting large files to another encoding is not supported yet."));
+      return;
+    }
     tab.encoding = enc;
     this.noteUserEdit(tab);
     this.scheduleBufferStore(tab);
@@ -660,6 +1250,7 @@ export class App {
   }
 
   async setEol(tab: Tab, eol: Eol): Promise<void> {
+    tab = this.owner(tab);
     if (tab.lockedReadOnly) {
       toast(tab.lockedReadOnly);
       return;
@@ -675,9 +1266,28 @@ export class App {
     tab.eol = eol;
     this.noteUserEdit(tab);
     if (tab.kind === "memory") this.scheduleBufferStore(tab);
+    for (const x of [tab, ...this.clonesOf(tab)]) this.dispatchTo(x, { effects: compartments.whitespace.reconfigure(this.whitespaceExtFor(x)) });
     this.emit("tabs");
     this.emit("status");
     this.scheduleSessionSave();
+  }
+
+  /** Set the indentation of one document (null = use the settings). */
+  setIndent(tab: Tab, info: IndentInfo | null): void {
+    tab = this.owner(tab);
+    tab.indent = info;
+    for (const x of [tab, ...this.clonesOf(tab)]) {
+      x.indent = info;
+      this.dispatchTo(x, { effects: compartments.indent.reconfigure(this.indentExtFor(x)) });
+    }
+    this.emit("status");
+    this.scheduleSessionSave();
+  }
+
+  /** Effective indentation of a tab. */
+  indentOf(tab: Tab): IndentInfo {
+    const i = this.owner(tab).indent;
+    return { spaces: i ? i.spaces : settings.insertSpaces, size: i && i.size > 0 ? i.size : settings.tabSize };
   }
 
   toggleLivePreview(tab: Tab): void {
@@ -696,6 +1306,7 @@ export class App {
   }
 
   setReadOnly(tab: Tab, ro: boolean): void {
+    tab = this.owner(tab);
     if (!ro && tab.lockedReadOnly) {
       toast(tab.lockedReadOnly);
       return;
@@ -712,8 +1323,8 @@ export class App {
 
   /** Re-apply settings-dependent compartments to every tab. */
   applySettingsToAll(effectsFor: (tab: Tab) => import("@codemirror/state").StateEffect<unknown>[]): void {
-    for (const t of this.tabs) this.dispatchTo(t, { effects: effectsFor(t) });
-    this.view.requestMeasure();
+    for (const x of this.tabs) this.dispatchTo(x, { effects: effectsFor(x) });
+    for (const p of this.panes) p.view.requestMeasure();
   }
 
   // ---- navigation -----------------------------------------------------------------------
@@ -782,9 +1393,10 @@ export class App {
   }
 
   private tabMeta(tab: Tab): TabMeta {
-    const state = tab === this.active ? this.view.state : tab.state;
+    const state = this.stateOf(tab);
     const head = state.selection.main.head;
     const line = state.doc.lineAt(head);
+    const view = this.viewOf(tab);
     return {
       id: tab.id,
       path: tab.path,
@@ -801,8 +1413,12 @@ export class App {
       readOnly: tab.readOnly,
       cursorLine: line.number + (tab.paged?.firstLine ?? 0),
       cursorCol: head - line.from,
-      scrollTop: tab === this.active ? this.view.scrollDOM.scrollTop : tab.scrollTop,
+      scrollTop: view ? view.scrollDOM.scrollTop : tab.scrollTop,
       mtime: tab.mtime,
+      pane: this.paneIndex(tab),
+      shown: !!this.paneOf(tab),
+      indent: tab.indent,
+      bookmarks: tab.kind === "memory" ? bookmarkLines(state) : [],
     };
   }
 
@@ -812,9 +1428,11 @@ export class App {
       clearTimeout(this.sessionTimer);
       this.sessionTimer = undefined;
     }
+    const owners = this.tabs.filter((x) => !x.cloneOf);
+    const active = this.active ? this.owner(this.active) : null;
     const data: SessionData = {
-      tabs: this.tabs.map((t) => this.tabMeta(t)),
-      active: this.active?.id ?? null,
+      tabs: owners.map((x) => this.tabMeta(x)),
+      active: active?.id ?? null,
       next_untitled: this.nextUntitled,
     };
     try {
@@ -832,6 +1450,7 @@ export class App {
   async flushAll(): Promise<void> {
     const errors: string[] = [];
     for (const tab of this.tabs) {
+      if (tab.cloneOf) continue;
       if (tab.bufferTimer) {
         clearTimeout(tab.bufferTimer);
         tab.bufferTimer = undefined;
@@ -860,17 +1479,31 @@ export class App {
       const s = await backend.sessionLoad();
       this.nextUntitled = Math.max(1, s.next_untitled || 1);
       let activeTab: Tab | null = null;
+      let shownOther: Tab | null = null;
+      if (s.tabs.some((m) => (m as { pane?: number }).pane === 1)) this.setSplit(true);
       for (const meta of s.tabs) {
         try {
           const tab = await this.restoreTab(meta);
           if (!tab) continue;
           if (meta.id === s.active) activeTab = tab;
+          else if ((meta as { shown?: boolean }).shown) shownOther = tab;
         } catch (e) {
           console.warn("restore failed for", meta.path, e);
         }
       }
       if (this.tabs.length === 0) return false;
-      this.activate(activeTab ?? this.tabs[0]);
+      if (this.splitOn && !this.tabsIn(1).length) this.setSplit(false);
+      if (this.splitOn && !this.tabsIn(0).length) {
+        for (const x of this.tabs) x.pane = 0;
+        this.setSplit(false);
+      }
+      const first = activeTab ?? this.tabs[0];
+      if (this.splitOn) {
+        const otherPane = this.paneIndex(first) === 0 ? 1 : 0;
+        const other = shownOther && this.paneIndex(shownOther) === otherPane ? shownOther : this.tabsIn(otherPane)[0];
+        if (other) this.show(other);
+      }
+      this.activate(first);
       return true;
     } finally {
       this.restoring = false;
@@ -893,11 +1526,15 @@ export class App {
       cursorLine?: number;
       cursorCol?: number;
       scrollTop?: number;
+      pane?: number;
+      indent?: IndentInfo | null;
+      bookmarks?: number[];
     };
+    const pane: 0 | 1 = m.pane === 1 && this.splitOn ? 1 : 0;
     let tab: Tab | null = null;
     if (meta.kind === "paged" && meta.path) {
       if (!(await backend.pathExists(meta.path))) return null;
-      tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView });
+      tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView, pane });
     } else {
       const buffer = await backend.sessionLoadBuffer(meta.id);
       if (buffer !== null) {
@@ -915,6 +1552,8 @@ export class App {
           untitled: m.untitled ?? null,
           readOnly: m.readOnly,
           mtime: (m as { mtime?: number }).mtime ?? 0,
+          pane,
+          indent: m.indent ?? null,
         });
         const desc = m.languageName ? languageByName(m.languageName) : tab.path ? languageForFile(tab.name) : null;
         tab.languageName = desc?.name ?? null;
@@ -923,10 +1562,10 @@ export class App {
         this.insertTab(tab);
       } else if (meta.path) {
         if (!(await backend.pathExists(meta.path))) return null;
-        tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, hexView: m.hexView });
+        tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, hexView: m.hexView, pane });
       } else {
         // untitled with no stored buffer: empty tab
-        tab = this.makeTab({ id: meta.id, name: untitledName(m.untitled ?? 1), kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview });
+        tab = this.makeTab({ id: meta.id, name: untitledName(m.untitled ?? 1), kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview, pane });
         tab.state = this.buildState(tab, "", []);
         this.insertTab(tab);
       }
@@ -936,6 +1575,11 @@ export class App {
     if (m.encoding && tab.kind === "memory") tab.encoding = m.encoding;
     if (m.eol) tab.eol = m.eol;
     if (m.readOnly) tab.readOnly = true;
+    if (m.indent !== undefined && tab.kind === "memory") {
+      tab.indent = m.indent;
+      tab.state = tab.state.update({ effects: compartments.indent.reconfigure(this.indentExtFor(tab)) }).state;
+    }
+    if (m.bookmarks?.length && tab.kind === "memory") tab.state = tab.state.update({ effects: setBookmarks.of(m.bookmarks) }).state;
     tab.scrollTop = m.scrollTop ?? 0;
     if (m.cursorLine) tab.pendingCursor = { line: m.cursorLine, col: m.cursorCol ?? 0 };
     return tab;

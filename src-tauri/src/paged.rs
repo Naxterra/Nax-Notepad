@@ -43,6 +43,27 @@ pub const E_EXTERNAL_CHANGE: &str = "E_EXTERNAL_CHANGE:";
 pub const E_READ_ONLY_ENCODING: &str = "E_READ_ONLY_ENCODING:";
 /// Error prefix for scoped operations without a scope.
 pub const E_NO_SCOPE: &str = "E_NO_SCOPE:";
+/// Error prefix for operations stopped by the user.
+pub const E_CANCELLED: &str = "E_CANCELLED:";
+
+/// One match of "find all": 0-based line, byte column, byte length and the line's text.
+#[derive(Serialize, Clone, Debug)]
+pub struct FoundLine {
+    pub line: usize,
+    pub col: usize,
+    pub len: usize,
+    pub text: String,
+}
+
+/// Result of checking a followed file for new data.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TailStatus {
+    Same,
+    Appended,
+    Rotated,
+    Missing,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Src {
@@ -205,29 +226,59 @@ impl EolConverter {
 
 impl PagedDoc {
     pub fn open(path: &Path) -> Result<PagedDoc, String> {
+        Self::open_with(path, None)
+    }
+
+    /// Open `path`; `forced` is an encoding label chosen by the user ("Reopen with encoding")
+    /// instead of detection.
+    pub fn open_with(path: &Path, forced: Option<&str>) -> Result<PagedDoc, String> {
         let file = File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
         let disk = DiskState::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         // SAFETY: the mapping is read-only. Changes made by other programs while the file is
         // open are detected through `disk` before saving (see `disk_changed`).
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap failed: {e}"))?;
         let bytes: &[u8] = &mmap;
-        let (bom, skip) = detect_bom(bytes);
-        let sample = &bytes[skip..bytes.len().min(skip + ENCODING_SAMPLE)];
-        let (unit, encoding, label, editable): (Unit, &'static Encoding, String, bool) = match bom {
-            Bom::Utf16Le => (Unit::U16Le, encoding_rs::UTF_16LE, "UTF-16LE".into(), false),
-            Bom::Utf16Be => (Unit::U16Be, encoding_rs::UTF_16BE, "UTF-16BE".into(), false),
-            Bom::Utf8 => (Unit::Byte, encoding_rs::UTF_8, "UTF-8-BOM".into(), true),
-            Bom::None => match std::str::from_utf8(sample) {
-                Ok(_) => (Unit::Byte, encoding_rs::UTF_8, "UTF-8".into(), true),
-                // Only an incomplete character at the end of the sample: still UTF-8.
-                Err(e) if e.error_len().is_none() => (Unit::Byte, encoding_rs::UTF_8, "UTF-8".into(), true),
-                Err(_) => {
-                    let mut det = chardetng::EncodingDetector::new();
-                    det.feed(sample, sample.len() == bytes.len() - skip);
-                    let enc = det.guess(None, true);
-                    (Unit::Byte, enc, enc.name().to_string(), false)
+        let (detected_bom, detected_skip) = detect_bom(bytes);
+        let (bom, skip, unit, encoding, label, editable): (Bom, usize, Unit, &'static Encoding, String, bool) = match forced {
+            Some("UTF-8") | Some("UTF-8-BOM") => {
+                if detected_bom == Bom::Utf8 {
+                    (Bom::Utf8, 3, Unit::Byte, encoding_rs::UTF_8, "UTF-8-BOM".into(), true)
+                } else {
+                    (Bom::None, 0, Unit::Byte, encoding_rs::UTF_8, "UTF-8".into(), true)
                 }
-            },
+            }
+            Some("UTF-16LE") => {
+                let skip = if detected_bom == Bom::Utf16Le { 2 } else { 0 };
+                (Bom::Utf16Le, skip, Unit::U16Le, encoding_rs::UTF_16LE, "UTF-16LE".into(), false)
+            }
+            Some("UTF-16BE") => {
+                let skip = if detected_bom == Bom::Utf16Be { 2 } else { 0 };
+                (Bom::Utf16Be, skip, Unit::U16Be, encoding_rs::UTF_16BE, "UTF-16BE".into(), false)
+            }
+            Some(other) => {
+                let enc = Encoding::for_label(other.as_bytes()).ok_or_else(|| format!("Unknown encoding: {other}"))?;
+                (Bom::None, 0, Unit::Byte, enc, enc.name().to_string(), false)
+            }
+            None => {
+                let sample = &bytes[detected_skip..bytes.len().min(detected_skip + ENCODING_SAMPLE)];
+                let (unit, encoding, label, editable): (Unit, &'static Encoding, String, bool) = match detected_bom {
+                    Bom::Utf16Le => (Unit::U16Le, encoding_rs::UTF_16LE, "UTF-16LE".into(), false),
+                    Bom::Utf16Be => (Unit::U16Be, encoding_rs::UTF_16BE, "UTF-16BE".into(), false),
+                    Bom::Utf8 => (Unit::Byte, encoding_rs::UTF_8, "UTF-8-BOM".into(), true),
+                    Bom::None => match std::str::from_utf8(sample) {
+                        Ok(_) => (Unit::Byte, encoding_rs::UTF_8, "UTF-8".into(), true),
+                        // Only an incomplete character at the end of the sample: still UTF-8.
+                        Err(e) if e.error_len().is_none() => (Unit::Byte, encoding_rs::UTF_8, "UTF-8".into(), true),
+                        Err(_) => {
+                            let mut det = chardetng::EncodingDetector::new();
+                            det.feed(sample, sample.len() == bytes.len() - detected_skip);
+                            let enc = det.guess(None, true);
+                            (Unit::Byte, enc, enc.name().to_string(), false)
+                        }
+                    },
+                };
+                (detected_bom, detected_skip, unit, encoding, label, editable)
+            }
         };
         let eol_sample = &bytes[skip..bytes.len().min(skip + (1 << 16))];
         let eol = if unit == Unit::Byte {
@@ -271,11 +322,22 @@ impl PagedDoc {
     }
 
     fn build_index(&mut self) {
+        self.build_index_from(0);
+    }
+
+    /// (Re)build the line index from chunk `chunk` onwards; earlier entries are kept. Used when
+    /// a followed file grows, so only the new part is scanned.
+    fn build_index_from(&mut self, chunk: usize) {
         let len = self.mmap.len();
-        let mut lines_before = Vec::with_capacity(len / CHUNK + 2);
-        lines_before.push(0usize);
-        let mut acc = 0usize;
-        let mut pos = 0usize;
+        let chunk = chunk.min(self.lines_before.len().saturating_sub(1));
+        let mut lines_before = std::mem::take(&mut self.lines_before);
+        lines_before.truncate(chunk + 1);
+        if lines_before.is_empty() {
+            lines_before.push(0usize);
+        }
+        lines_before.reserve(len / CHUNK + 2);
+        let mut acc = *lines_before.last().unwrap();
+        let mut pos = (lines_before.len() - 1) * CHUNK;
         while pos < len {
             let end = (pos + CHUNK).min(len);
             acc += self.count_keys(pos, end);
@@ -559,6 +621,7 @@ impl PagedDoc {
 
     /// Text of lines [first, first+count) without the trailing line break of the last line.
     /// Returns the text, the first line and the number of lines actually returned.
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
     pub fn read_lines(&self, first: usize, count: usize) -> (String, usize, usize) {
         let w = self.read_window(first, count, usize::MAX);
         (w.text, w.first, w.count)
@@ -789,6 +852,7 @@ impl PagedDoc {
     }
 
     /// Write the current content to `target`, then re-open it as the backing file.
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
     pub fn save_to(&mut self, target: &Path) -> Result<(), String> {
         self.save_to_opts(target, false)
     }
@@ -910,15 +974,19 @@ impl PagedDoc {
     /// [start_lo, start_hi) and ends at or before `end_limit`, in document order. The document
     /// is read in blocks with context and look-ahead, so matches may span piece boundaries;
     /// look-ahead grows (up to 64 MiB) when a match reaches the end of the buffer. Stops when
-    /// `f` returns false.
-    fn for_each_match<F>(&self, re: &Regex, start_lo: usize, start_hi: usize, end_limit: usize, mut f: F)
+    /// `f` returns false. Fails with `E_CANCELLED` when `cancel` returns true.
+    fn for_each_match<F>(&self, re: &Regex, start_lo: usize, start_hi: usize, end_limit: usize, cancel: &dyn Fn() -> bool, mut f: F) -> Result<(), String>
     where
         F: FnMut(usize, usize, &Captures<'_>) -> bool,
     {
         let start_hi = start_hi.min(self.total_len);
         let end_limit = end_limit.min(self.total_len);
         let mut cursor = start_lo;
+        let mut seen = 0usize;
         while cursor < start_hi {
+            if cancel() {
+                return Err(format!("{E_CANCELLED}search cancelled"));
+            }
             let block_hi = self.block_end(cursor, start_hi);
             let mut last_end = cursor;
             let mut lookahead = SEARCH_LOOKAHEAD;
@@ -952,16 +1020,21 @@ impl PagedDoc {
                     let (ms, me) = (ctx + m.start(), ctx + m.end());
                     if me <= end_limit {
                         if !f(ms, me, &caps) {
-                            return;
+                            return Ok(());
                         }
                         last_end = me;
                     }
                     pos = m.end();
+                    seen += 1;
+                    if seen % 4096 == 0 && cancel() {
+                        return Err(format!("{E_CANCELLED}search cancelled"));
+                    }
                 }
                 break;
             }
             cursor = block_hi.max(last_end);
         }
+        Ok(())
     }
 
     fn search_bounds(&self, scoped: bool) -> Result<(usize, usize), String> {
@@ -981,31 +1054,38 @@ impl PagedDoc {
         self.scope = None;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
+
     pub fn scope(&self) -> Option<(usize, usize)> {
         self.scope
     }
 
     /// First match at or after `from` (forward), or last match ending at or before `from`
     /// (backwards), inside the scope when `scoped`.
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
     pub fn find_in(&self, re: &Regex, from: usize, backwards: bool, scoped: bool) -> Result<Option<Match>, String> {
+        self.find_in_c(re, from, backwards, scoped, &|| false)
+    }
+
+    pub fn find_in_c(&self, re: &Regex, from: usize, backwards: bool, scoped: bool, cancel: &dyn Fn() -> bool) -> Result<Option<Match>, String> {
         let (lo, hi) = self.search_bounds(scoped)?;
         let from = from.clamp(lo, hi);
         if !backwards {
             let mut found = None;
-            self.for_each_match(re, from, hi, hi, |ms, me, _| {
+            self.for_each_match(re, from, hi, hi, cancel, |ms, me, _| {
                 found = Some((ms, me));
                 false
-            });
+            })?;
             return Ok(found.map(|(s, e)| self.match_at(s, e - s)));
         }
         let mut e = from;
         while e > lo {
             let s = self.block_start_before(e, lo);
             let mut last = None;
-            self.for_each_match(re, s, e, from, |ms, me, _| {
+            self.for_each_match(re, s, e, from, cancel, |ms, me, _| {
                 last = Some((ms, me));
                 true
-            });
+            })?;
             if let Some((ms, me)) = last {
                 return Ok(Some(self.match_at(ms, me - ms)));
             }
@@ -1013,6 +1093,8 @@ impl PagedDoc {
         }
         Ok(None)
     }
+
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
 
     pub fn find(&self, re: &Regex, from: usize, backwards: bool) -> Option<Match> {
         self.find_in(re, from, backwards, false).ok().flatten()
@@ -1024,18 +1106,60 @@ impl PagedDoc {
         Match { line, col, len, offset: off }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
+
     pub fn count_in(&self, re: &Regex, limit: usize, scoped: bool) -> Result<usize, String> {
+        self.count_in_c(re, limit, scoped, &|| false)
+    }
+
+    pub fn count_in_c(&self, re: &Regex, limit: usize, scoped: bool, cancel: &dyn Fn() -> bool) -> Result<usize, String> {
         let (lo, hi) = self.search_bounds(scoped)?;
         let mut n = 0usize;
-        self.for_each_match(re, lo, hi, hi, |_, _, _| {
+        self.for_each_match(re, lo, hi, hi, cancel, |_, _, _| {
             n += 1;
             n < limit
-        });
+        })?;
         Ok(n)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
+
     pub fn count_matches(&self, re: &Regex, limit: usize) -> usize {
         self.count_in(re, limit, false).unwrap_or(0)
+    }
+
+    /// Every match with its line (0-based), byte column and line text (at most 400 characters),
+    /// up to `max` matches. Returns the matches and whether the list was cut at `max`.
+    pub fn find_all_c(&self, re: &Regex, scoped: bool, max: usize, cancel: &dyn Fn() -> bool) -> Result<(Vec<FoundLine>, bool), String> {
+        let (lo, hi) = self.search_bounds(scoped)?;
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        let mut truncated = false;
+        self.for_each_match(re, lo, hi, hi, cancel, |ms, me, _| {
+            if hits.len() >= max {
+                truncated = true;
+                return false;
+            }
+            hits.push((ms, me));
+            true
+        })?;
+        let mut out = Vec::with_capacity(hits.len());
+        let mut cached: Option<(usize, usize, String)> = None; // line, start, text
+        for (ms, me) in hits {
+            let line = self.offset_to_line(ms);
+            let (start, text) = match &cached {
+                Some((l, s, t)) if *l == line => (*s, t.clone()),
+                _ => {
+                    let s = self.line_start(line);
+                    let e = self.line_end(line).min(s + 4096);
+                    let (t, _) = self.decode(&self.read(s, e));
+                    let t: String = t.chars().take(400).collect();
+                    cached = Some((line, s, t.clone()));
+                    (s, t)
+                }
+            };
+            out.push(FoundLine { line, col: ms - start, len: me - ms, text });
+        }
+        Ok((out, truncated))
     }
 
     /// Pieces describing document range [a, b) without copying any text.
@@ -1061,16 +1185,22 @@ impl PagedDoc {
 
     /// Replace every match (inside the scope when `scoped`); returns the number replaced.
     /// `replacement` uses the regex crate's expansion syntax (`$1`, `${name}`, `$$`).
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
     pub fn replace_all_in(&mut self, re: &Regex, replacement: &[u8], scoped: bool) -> Result<usize, String> {
+        self.replace_all_in_c(re, replacement, scoped, &|| false)
+    }
+
+    /// Like `replace_all_in`; a cancelled run changes nothing.
+    pub fn replace_all_in_c(&mut self, re: &Regex, replacement: &[u8], scoped: bool, cancel: &dyn Fn() -> bool) -> Result<usize, String> {
         self.ensure_editable()?;
         let (lo, hi) = self.search_bounds(scoped)?;
         let mut hits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-        self.for_each_match(re, lo, hi, hi, |ms, me, caps| {
+        self.for_each_match(re, lo, hi, hi, cancel, |ms, me, caps| {
             let mut out = Vec::new();
             caps.expand(replacement, &mut out);
             hits.push((ms, me, out));
             true
-        });
+        })?;
         if hits.is_empty() {
             return Ok(0);
         }
@@ -1103,8 +1233,65 @@ impl PagedDoc {
         Ok(hits.len())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
+
     pub fn replace_all(&mut self, re: &Regex, replacement: &[u8]) -> usize {
         self.replace_all_in(re, replacement, false).unwrap_or(0)
+    }
+
+    // ---- following a growing file (tail -f) ----------------------------------------------
+
+    /// Check the file on disk for appended data and make it part of the document. Data
+    /// appended to an unmodified file is mapped and indexed incrementally; a file that
+    /// shrank or whose beginning changed is reported as rotated (the caller reopens it).
+    pub fn refresh_append(&mut self) -> Result<TailStatus, String> {
+        let now = match DiskState::read(&self.path) {
+            Ok(n) => n,
+            Err(_) => return Ok(TailStatus::Missing),
+        };
+        if now == self.disk {
+            return Ok(TailStatus::Same);
+        }
+        let old_len = self.disk.len;
+        if now.len < old_len {
+            return Ok(TailStatus::Rotated);
+        }
+        // The first bytes the old fingerprint covered must be unchanged.
+        let head_len = FINGERPRINT_BYTES.min(old_len) as usize;
+        let mut head = vec![0u8; head_len];
+        File::open(&self.path)
+            .and_then(|mut f| f.read_exact(&mut head))
+            .map_err(|e| format!("Cannot read {}: {e}", self.path.display()))?;
+        if hash_bytes(&head) != self.disk.head || now.len == old_len {
+            return Ok(TailStatus::Rotated);
+        }
+        if self.backing_temp.is_some() {
+            return Ok(TailStatus::Rotated);
+        }
+        let file = File::open(&self.path).map_err(|e| format!("Cannot open {}: {e}", self.path.display()))?;
+        // SAFETY: as in `open_with`.
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap failed: {e}"))?;
+        let old_mapped = self.mmap.len();
+        if mmap.len() < old_mapped || mmap[..old_mapped.min(4096)] != self.mmap[..old_mapped.min(4096)] {
+            return Ok(TailStatus::Rotated);
+        }
+        self.mmap = mmap;
+        let old_newlines = self.orig_newlines;
+        self.build_index_from(old_mapped / CHUNK);
+        let new_bytes = self.mmap.len() - old_mapped;
+        let new_lines = self.orig_newlines - old_newlines;
+        // Extend the last piece when it already ends at the old end of the file.
+        match self.pieces.last_mut() {
+            Some(p) if p.src == Src::Orig && p.start + p.len == old_mapped => {
+                p.len += new_bytes;
+                p.newlines += new_lines;
+            }
+            _ => self.pieces.push(Piece { src: Src::Orig, start: old_mapped, len: new_bytes, newlines: new_lines }),
+        }
+        self.total_len += new_bytes;
+        self.total_newlines += new_lines;
+        self.disk = now;
+        Ok(TailStatus::Appended)
     }
 
     // ---- session persistence -------------------------------------------------------------
@@ -1427,5 +1614,73 @@ mod tests {
         // A multi-byte character is never cut.
         let w = doc.read_window(0, 1, 5001);
         assert!(w.text.chars().all(|c| c == 'x'));
+    }
+
+    // ---- Notepad++ workflow features ----------------------------------------------------
+
+    #[test]
+    fn find_all_reports_lines_and_text() {
+        let (_d, mut doc) = make(b"alpha beta\ngamma\nbeta beta\n");
+        doc.replace(0, 0, b">").unwrap();
+        let re = Regex::new("beta").unwrap();
+        let (hits, truncated) = doc.find_all_c(&re, false, 100, &|| false).unwrap();
+        assert!(!truncated);
+        let got: Vec<(usize, usize, &str)> = hits.iter().map(|h| (h.line, h.col, h.text.as_str())).collect();
+        assert_eq!(got, vec![(0, 7, ">alpha beta"), (2, 0, "beta beta"), (2, 5, "beta beta")]);
+        let (hits, truncated) = doc.find_all_c(&re, false, 2, &|| false).unwrap();
+        assert_eq!((hits.len(), truncated), (2, true));
+    }
+
+    #[test]
+    fn cancelled_operations_change_nothing() {
+        let (_d, mut doc) = make(b"a a a a\n");
+        let re = Regex::new("a").unwrap();
+        let err = doc.replace_all_in_c(&re, b"b", false, &|| true).unwrap_err();
+        assert!(err.starts_with(E_CANCELLED));
+        assert_eq!(doc.read_lines(0, 1).0, "a a a a");
+        assert!(doc.count_in_c(&re, 10, false, &|| true).is_err());
+    }
+
+    #[test]
+    fn following_appended_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("app.log");
+        std::fs::write(&p, b"line 1\nline 2\n").unwrap();
+        let mut doc = PagedDoc::open(&p).unwrap();
+        assert_eq!(doc.refresh_append().unwrap(), TailStatus::Same);
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"line 3\nline 4\n").unwrap();
+        assert_eq!(doc.refresh_append().unwrap(), TailStatus::Appended);
+        assert_eq!(doc.line_count(), 5);
+        assert_eq!(doc.read_lines(2, 2).0, "line 3\nline 4");
+        assert!(!doc.is_dirty(), "appended data is part of the file, not an edit");
+        // Large appends across index chunks.
+        let big: String = (5..200_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(big.as_bytes()).unwrap();
+        assert_eq!(doc.refresh_append().unwrap(), TailStatus::Appended);
+        assert_eq!(doc.line_count(), 200_000);
+        assert_eq!(doc.read_lines(199_998, 1).0, "line 199999");
+        // Rotation as loggers do it on Windows (a mapped file cannot be truncated): the old
+        // file is renamed and a new, shorter one takes its place.
+        std::fs::rename(&p, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&p, b"new log\n").unwrap();
+        assert_eq!(doc.refresh_append().unwrap(), TailStatus::Rotated);
+    }
+
+    #[test]
+    fn reopen_with_forced_encoding() {
+        let (_d, doc) = make("Grüße\n".as_bytes());
+        assert!(doc.is_editable());
+        let p = doc.path.clone();
+        drop(doc);
+        let forced = PagedDoc::open_with(&p, Some("windows-1252")).unwrap();
+        assert!(!forced.is_editable());
+        assert_eq!(forced.encoding_label(), "windows-1252");
+        assert_eq!(forced.read_lines(0, 1).0, "GrÃ¼ÃŸe");
+        drop(forced);
+        let utf16 = crate::textfmt::encode("hi\nyo", "UTF-16LE", Eol::Lf).unwrap();
+        std::fs::write(&p, &utf16[2..]).unwrap(); // no BOM: only the forced encoding helps
+        let doc = PagedDoc::open_with(&p, Some("UTF-16LE")).unwrap();
+        assert_eq!(doc.read_lines(0, 2).0, "hi\nyo");
     }
 }

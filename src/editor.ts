@@ -27,6 +27,11 @@ import { cmHighlight, cmTheme } from "./theme";
 import { MARKDOWN_EXTENSIONS } from "./markdown";
 import { searchHighlight } from "./searchhl";
 import { codeLanguageFor, fenceLanguageCompletion } from "./codefence";
+import { bookmarks } from "./bookmarks";
+import { columnBlock } from "./columnselect";
+import { compareField } from "./compare";
+import { IndentInfo } from "./indentdetect";
+import { whitespaceExt } from "./whitespace";
 
 export const compartments = {
   language: new Compartment(),
@@ -40,6 +45,7 @@ export const compartments = {
   closeBrackets: new Compartment(),
   bracketMatching: new Compartment(),
   appKeymap: new Compartment(),
+  whitespace: new Compartment(),
 };
 
 export interface StateOptions {
@@ -50,6 +56,10 @@ export interface StateOptions {
   lpConfig: LivePreviewConfig;
   language: Extension;
   firstLineOffset?: number;
+  /** Indentation of this document (detected or chosen); defaults to the settings. */
+  indent?: IndentInfo;
+  /** Line ending label for "show line endings". */
+  eol?: () => string;
   extra?: Extension[];
 }
 
@@ -58,8 +68,10 @@ export function lineNumbersExt(enabled: boolean, offset = 0): Extension {
   return lineNumbers({ formatNumber: (n) => String(n + offset) });
 }
 
-export function indentExt(s: Settings): Extension {
-  return [EditorState.tabSize.of(s.tabSize), indentUnit.of(s.insertSpaces ? " ".repeat(s.tabSize) : "\t")];
+export function indentExt(s: Settings, info?: IndentInfo | null): Extension {
+  const spaces = info ? info.spaces : s.insertSpaces;
+  const size = info && info.size > 0 ? info.size : s.tabSize;
+  return [EditorState.tabSize.of(size), indentUnit.of(spaces ? " ".repeat(size) : "\t")];
 }
 
 export function createState(o: StateOptions): EditorState {
@@ -86,7 +98,7 @@ export function createState(o: StateOptions): EditorState {
       compartments.activeLine.of(s.highlightActiveLine ? highlightActiveLine() : []),
       highlightSelectionMatches(),
       searchHighlight,
-      compartments.indent.of(indentExt(s)),
+      compartments.indent.of(indentExt(s, o.indent)),
       compartments.wrap.of(s.wordWrap ? EditorView.lineWrapping : []),
       compartments.readOnly.of(EditorState.readOnly.of(o.readOnly)),
       readOnlyGuard,
@@ -94,6 +106,10 @@ export function createState(o: StateOptions): EditorState {
       compartments.language.of(o.language),
       compartments.livePreview.of(o.livePreview ? livePreview(o.lpConfig) : []),
       compartments.appKeymap.of([]),
+      compartments.whitespace.of(whitespaceExt(s.showWhitespace, s.showEol, o.eol ?? (() => "LF"))),
+      bookmarks,
+      columnBlock,
+      compareField,
       keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...foldKeymap, indentWithTab]),
       ...(o.extra ?? []),
     ],

@@ -1,27 +1,8 @@
 import { App } from "../app";
-import { Eol } from "../backend";
 import { allLanguages } from "../editor";
 import { settings, updateSettings } from "../settings";
 import { h, pickList } from "./dialogs";
 import { t } from "../i18n";
-
-const ENCODINGS = [
-  "UTF-8",
-  "UTF-8-BOM",
-  "UTF-16LE",
-  "UTF-16BE",
-  "windows-1252",
-  "windows-1250",
-  "windows-1251",
-  "ISO-8859-1",
-  "ISO-8859-2",
-  "ISO-8859-15",
-  "Shift_JIS",
-  "GBK",
-  "EUC-KR",
-  "KOI8-R",
-  "macintosh",
-];
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -30,7 +11,13 @@ function fmtSize(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-export function mountStatusBar(app: App, root: HTMLElement, actions: { gotoLine: () => void }): void {
+export interface StatusActions {
+  gotoLine: () => void;
+  run: (commandId: string) => void;
+  isRecording: () => boolean;
+}
+
+export function mountStatusBar(app: App, root: HTMLElement, actions: StatusActions): { render: () => void } {
   const pos = h("span", { class: "sb-item sb-pos", title: t("Go to line (Ctrl+G)"), click: actions.gotoLine });
   const sel = h("span", { class: "sb-item sb-sel" });
   const size = h("span", { class: "sb-item sb-size" });
@@ -38,40 +25,39 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: { gotoLine:
   const paged = h("span", { class: "sb-item sb-paged", title: t("Large file: edited in pages, saved as a whole") }, "PAGED");
   const ro = h("span", { class: "sb-item sb-ro" }, t("READ-ONLY"));
   const hexBadge = h("span", { class: "sb-item sb-paged", title: t("Hex view (Ctrl+Shift+H to leave)") }, "HEX");
+  const rec = h("span", { class: "sb-item sb-rec", title: t("Recording a macro (Ctrl+Shift+R stops)") }, "● REC");
+  const tail = h("span", { class: "sb-item sb-tail" });
   const lp = h("span", { class: "sb-item sb-lp", title: t("Toggle Markdown Live Preview (Ctrl+Shift+V)") });
-  const indent = h("span", { class: "sb-item sb-indent", title: t("Indentation") });
+  const indent = h("span", { class: "sb-item sb-indent", title: t("Indentation of this file") });
   const eol = h("span", { class: "sb-item", title: t("Line endings") });
-  const enc = h("span", { class: "sb-item", title: t("Encoding") });
+  const enc = h("span", { class: "sb-item", title: t("Encoding: reopen or convert") });
   const lang = h("span", { class: "sb-item", title: t("Language") });
   const zoom = h("span", { class: "sb-item", title: t("Zoom (Ctrl+Scroll / Ctrl+0 to reset)") });
 
-  const left = h("div", { class: "sb-left" }, pos, sel, size, paged, ro, hexBadge, slider);
+  const left = h("div", { class: "sb-left" }, pos, sel, size, paged, ro, hexBadge, rec, tail, slider);
   const right = h("div", { class: "sb-right" }, lp, indent, eol, enc, lang, zoom);
   root.append(left, right);
 
   lp.addEventListener("click", () => app.active && app.toggleLivePreview(app.active));
   hexBadge.addEventListener("click", () => app.active && app.toggleHexView(app.active));
+  rec.addEventListener("click", () => actions.run("macro.record"));
+  tail.addEventListener("click", () => actions.run("view.followPause"));
   zoom.addEventListener("click", () => updateSettings({ fontSize: 14 }));
-  indent.addEventListener("click", async () => {
-    const it = await pickList(t("Indentation"), [
-      ...[2, 4, 8].map((n) => ({ label: t("Spaces: {n}", { n }), value: `s${n}` })),
-      ...[2, 4, 8].map((n) => ({ label: t("Tabs (width {n})", { n }), value: `t${n}` })),
-    ]);
-    if (!it) return;
-    updateSettings({ insertSpaces: it.value[0] === "s", tabSize: Number(it.value.slice(1)) });
-  });
+  indent.addEventListener("click", () => actions.run("edit.indentation"));
   eol.addEventListener("click", async () => {
     const it = await pickList(t("Line endings"), [
-      { label: t("Windows (CRLF)"), value: "CRLF" },
-      { label: t("Unix (LF)"), value: "LF" },
-      { label: t("Classic Mac (CR)"), value: "CR" },
+      { label: t("Windows (CRLF)"), value: "eol.crlf" },
+      { label: t("Unix (LF)"), value: "eol.lf" },
+      { label: t("Classic Mac (CR)"), value: "eol.cr" },
     ]);
-    if (it && app.active) app.setEol(app.active, it.value as Eol);
+    if (it) actions.run(it.value);
   });
   enc.addEventListener("click", async () => {
-    if (app.active?.kind === "paged") return;
-    const it = await pickList(t("Encoding (applied on save)"), ENCODINGS.map((e) => ({ label: e, value: e })));
-    if (it && app.active) app.setEncoding(app.active, it.value);
+    const it = await pickList(t("Encoding"), [
+      { label: t("Reopen with Encoding…"), value: "encoding.reopen", detail: t("read the file again with another encoding") },
+      { label: t("Convert to Encoding…"), value: "encoding.convert", detail: t("save the text in another encoding") },
+    ]);
+    if (it) actions.run(it.value);
   });
   lang.addEventListener("click", async () => {
     const it = await pickList(t("Language"), [{ label: t("Plain text"), value: "" }, ...allLanguages.map((l) => ({ label: l.name, value: l.name, detail: l.desc.extensions.slice(0, 6).map((x) => "." + x).join(" ") }))]);
@@ -88,25 +74,35 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: { gotoLine:
 
   const render = () => {
     const tab = app.active;
+    rec.style.display = actions.isRecording() ? "" : "none";
     if (!tab) return;
+    const own = app.owner(tab);
     const c = app.cursorInfo();
     pos.textContent = t("Ln {line}, Col {col}", { line: c.line.toLocaleString(), col: c.col });
     sel.textContent = c.selLen ? t("({n} selected", { n: c.selLen.toLocaleString() }) + (c.selLines > 1 ? t(", {n} lines", { n: c.selLines }) : "") + ")" : "";
-    size.textContent = t("{n} lines", { n: c.totalLines.toLocaleString() }) + (tab.path ? ` · ${fmtSize(tab.size)}` : "");
+    size.textContent = t("{n} lines", { n: c.totalLines.toLocaleString() }) + (own.path ? ` · ${fmtSize(own.size)}` : "");
     paged.style.display = tab.kind === "paged" ? "" : "none";
     slider.style.display = tab.kind === "paged" ? "" : "none";
     if (tab.paged && document.activeElement !== slider) {
       slider.value = String(Math.round(((c.line - 1) / Math.max(1, tab.paged.totalLines - 1)) * 1000));
     }
-    ro.style.display = tab.readOnly ? "" : "none";
+    ro.style.display = own.readOnly ? "" : "none";
     hexBadge.style.display = tab.hexView ? "" : "none";
+    if (own.tail) {
+      tail.style.display = "";
+      tail.textContent = own.tail.missing ? t("FOLLOW: waiting for file") : own.tail.paused ? t("FOLLOW paused") : t("FOLLOW");
+      tail.title = own.tail.paused ? t("Following is paused. Click to resume.") : t("New lines appended to the file are shown automatically. Click to pause.");
+      tail.classList.toggle("paused", own.tail.paused);
+    } else tail.style.display = "none";
     const isMd = tab.languageName === "Markdown";
     lp.style.display = isMd ? "" : "none";
     lp.textContent = tab.livePreview ? t("Live Preview") : t("Source");
     lp.classList.toggle("on", tab.livePreview);
-    indent.textContent = settings.insertSpaces ? t("Spaces: {n}", { n: settings.tabSize }) : t("Tabs: {n}", { n: settings.tabSize });
-    eol.textContent = tab.eol;
-    enc.textContent = tab.encoding;
+    const ind = app.indentOf(tab);
+    indent.textContent = (ind.spaces ? t("Spaces: {n}", { n: ind.size }) : t("Tabs: {n}", { n: ind.size })) + (own.indent ? "" : "*");
+    indent.title = own.indent ? t("Indentation of this file") : t("Indentation of this file (* = default from Settings)");
+    eol.textContent = own.eol;
+    enc.textContent = own.encoding;
     lang.textContent = tab.languageName ?? t("Plain text");
     zoom.textContent = settings.fontSize === 14 ? "" : `${Math.round((settings.fontSize / 14) * 100)}%`;
   };
@@ -115,4 +111,5 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: { gotoLine:
   app.on("active", render);
   app.on("tabs", render);
   render();
+  return { render };
 }

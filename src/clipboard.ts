@@ -91,3 +91,8 @@ export function selectAllIn(view: EditorView): void {
   view.dispatch({ selection: EditorSelection.single(0, view.state.doc.length) });
   view.focus();
 }
+
+/** Put text on the clipboard. */
+export function writeClipboard(text: string): Promise<void> {
+  return writeText(text);
+}

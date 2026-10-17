@@ -1,6 +1,8 @@
-import { DEFAULTS, Settings, settings, updateSettings } from "../settings";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { backend, errorText } from "../backend";
+import { DATA_KEYS, DEFAULTS, EXPORT_DATA_KEYS, Settings, settings, updateSettings, validSettings } from "../settings";
 import { THEMES } from "../theme";
-import { closeModal, h, showModal } from "./dialogs";
+import { closeModal, h, message, showModal, toast } from "./dialogs";
 import { t } from "../i18n";
 
 type Field =
@@ -26,12 +28,16 @@ const sections: { title: string; fields: Field[] }[] = [
     fields: [
       { key: "tabSize", label: "Tab size", type: "number", min: 1, max: 16 },
       { key: "insertSpaces", label: "Insert spaces instead of tabs", type: "bool" },
+      { key: "detectIndent", label: "Detect indentation from file content", type: "bool" },
       { key: "wordWrap", label: "Word wrap", type: "bool" },
       { key: "lineNumbers", label: "Line numbers", type: "bool" },
       { key: "highlightActiveLine", label: "Highlight current line", type: "bool" },
       { key: "indentationMarkers", label: "Indentation guides", type: "bool" },
+      { key: "showWhitespace", label: "Show whitespace", type: "bool" },
+      { key: "showEol", label: "Show line endings", type: "bool" },
       { key: "bracketMatching", label: "Highlight matching brackets", type: "bool" },
       { key: "autoCloseBrackets", label: "Auto-close brackets and quotes", type: "bool" },
+      { key: "keymapPreset", label: "Keyboard preset", type: "select", options: [{ value: "nax", label: "Nax-Notepad" }, { value: "npp", label: "Notepad++" }] },
     ],
   },
   {
@@ -59,7 +65,16 @@ const sections: { title: string; fields: Field[] }[] = [
   },
 ];
 
-export function openSettingsDialog(): void {
+export interface SettingsDialogActions {
+  openShortcuts?: () => void;
+  nppImport?: () => void;
+  exportSettings?: () => void;
+  importSettings?: () => void;
+  /** Called after the keyboard preset changed. */
+  keymapChanged?: () => void;
+}
+
+export function openSettingsDialog(actions: SettingsDialogActions = {}): void {
   const body = h("div", { class: "settings-body" });
   for (const sec of sections) {
     body.append(h("h3", {}, t(sec.title)));
@@ -92,12 +107,38 @@ export function openSettingsDialog(): void {
         sel.addEventListener("change", () => {
           updateSettings({ [f.key]: sel.value } as Partial<Settings>);
           if (f.key === "language") window.dispatchEvent(new CustomEvent("nax:reload"));
+          if (f.key === "keymapPreset") actions.keymapChanged?.();
         });
         control = sel;
       }
       body.append(h("label", { class: "settings-row" }, h("span", { class: "settings-label" }, t(f.label)), control));
     }
   }
+  const linkBtn = (label: string, fn?: () => void) =>
+    fn
+      ? h(
+          "button",
+          {
+            class: "btn small",
+            click: () => {
+              closeModal();
+              fn();
+            },
+          },
+          label
+        )
+      : null;
+  body.append(
+    h("h3", {}, t("More")),
+    h(
+      "div",
+      { class: "settings-actions" },
+      linkBtn(t("Keyboard Shortcuts…"), actions.openShortcuts),
+      linkBtn(t("Import from Notepad++…"), actions.nppImport),
+      linkBtn(t("Export Settings…"), actions.exportSettings),
+      linkBtn(t("Import Settings…"), actions.importSettings)
+    )
+  );
   const box = h(
     "div",
     { class: "modal settings" },
@@ -110,10 +151,13 @@ export function openSettingsDialog(): void {
         "button",
         {
           class: "btn",
+          title: t("Shortcuts, macros, recent files and search history are kept."),
           click: () => {
-            updateSettings({ ...DEFAULTS });
+            const defaults: Partial<Settings> = { ...DEFAULTS };
+            for (const k of DATA_KEYS) delete defaults[k];
+            updateSettings(defaults);
             closeModal();
-            openSettingsDialog();
+            openSettingsDialog(actions);
           },
         },
         t("Reset to defaults")
@@ -129,4 +173,46 @@ export function openSettingsDialog(): void {
   });
   showModal(box);
   (box.querySelector("input,select") as HTMLElement | null)?.focus();
+}
+
+/** Write the preferences, shortcuts and macros to a JSON file. */
+export async function exportSettings(): Promise<void> {
+  const target = await saveDialog({ defaultPath: "nax-notepad-settings.json", title: t("Export Settings"), filters: [{ name: "JSON", extensions: ["json"] }] });
+  if (!target) return;
+  const out: Record<string, unknown> = { app: "Nax-Notepad", kind: "settings", version: 1 };
+  for (const k of Object.keys(DEFAULTS) as (keyof Settings)[]) {
+    if (DATA_KEYS.includes(k) && !EXPORT_DATA_KEYS.includes(k)) continue;
+    out[k] = settings[k];
+  }
+  try {
+    await backend.writeTextFile(target, JSON.stringify(out, null, 2));
+    toast(t("Settings exported."));
+  } catch (e) {
+    await message(t("Export Settings"), errorText(e));
+  }
+}
+
+/** Read settings from a JSON file written by Export Settings. Returns true if anything changed. */
+export async function importSettings(onApplied: () => void): Promise<void> {
+  const sel = await openDialog({ title: t("Import Settings"), filters: [{ name: "JSON", extensions: ["json"] }] });
+  if (typeof sel !== "string") return;
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(await backend.readTextFile(sel, 4 << 20));
+  } catch (e) {
+    await message(t("Import Settings"), t("The file is not a valid settings file: {error}", { error: errorText(e) }));
+    return;
+  }
+  const valid = validSettings(raw);
+  for (const k of DATA_KEYS) if (!EXPORT_DATA_KEYS.includes(k)) delete valid[k];
+  const n = Object.keys(valid).length;
+  if (!n) {
+    await message(t("Import Settings"), t("The file contains no settings for Nax-Notepad."));
+    return;
+  }
+  const langChanged = valid.language !== undefined && valid.language !== settings.language;
+  updateSettings(valid);
+  onApplied();
+  toast(t("{n} settings imported.", { n }));
+  if (langChanged) window.dispatchEvent(new CustomEvent("nax:reload"));
 }

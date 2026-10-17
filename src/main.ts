@@ -8,8 +8,9 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { App } from "./app";
 import { backend, errorText } from "./backend";
-import { buildCommands, installKeybindings } from "./commands";
-import { compartments, indentExt, lineNumbersExt } from "./editor";
+import { addMacroCommands, buildCommands, Command, installKeybindings, recorder, runCommand } from "./commands";
+import { compartments, lineNumbersExt } from "./editor";
+import { applyKeymap } from "./keymap";
 import { loadSettings, onSettingsChange, settings, updateSettings } from "./settings";
 import { applyTheme, onSystemThemeChange } from "./theme";
 import { confirm3, contextMenu, h, isModalOpen, message } from "./ui/dialogs";
@@ -21,67 +22,136 @@ import { openAboutDialog } from "./ui/about";
 import { scheduleStartupCheck } from "./update";
 import { HexView } from "./ui/hexview";
 import { mountFind } from "./ui/find";
-import { mountMenuBar } from "./ui/menu";
+import { DynamicItem, mountMenuBar } from "./ui/menu";
+import { openNppImport } from "./ui/nppdialog";
+import { exportSettings, importSettings } from "./ui/settingsdialog";
+import { openShortcutDialog } from "./ui/shortcuts";
+import { mountSidebar } from "./ui/sidebar";
 import { mountStatusBar } from "./ui/statusbar";
 import { mountTabBar } from "./ui/tabbar";
 import "./styles.css";
+
+function shortPath(p: string, max = 90): string {
+  return p.length <= max ? p : p.slice(0, 20) + "…" + p.slice(p.length - (max - 21));
+}
 
 async function main(): Promise<void> {
   await loadSettings();
   initLanguage(settings.language);
   applyTheme(settings.theme);
 
+  // Layout: menu bar, find bar, [sidebar | pane 1 | pane 2], results, status bar.
   const root = document.getElementById("app")!;
   const menubar = h("div", { class: "menubar" });
-  const tabbar = h("div", { class: "tabbar" });
   const findTop = h("div", { class: "find-top" });
-  const editorEl = h("div", { class: "editor" });
+  const sidebarEl = h("div", { class: "sidebar" });
+  const editorHosts = [h("div", { class: "editor" }), h("div", { class: "editor" })];
+  const tabbars = [h("div", { class: "tabbar" }), h("div", { class: "tabbar" })];
+  const paneEls = [h("div", { class: "pane" }, tabbars[0], editorHosts[0]), h("div", { class: "pane" }, tabbars[1], editorHosts[1])];
+  paneEls[1].style.display = "none";
+  const panesEl = h("div", { class: "panes" }, paneEls[0], paneEls[1]);
+  const work = h("div", { class: "work" }, sidebarEl, panesEl);
   const resultsBottom = h("div", { class: "results-bottom" });
   const statusbar = h("div", { class: "statusbar" });
-  root.append(menubar, tabbar, findTop, editorEl, resultsBottom, statusbar);
+  root.append(menubar, findTop, work, resultsBottom, statusbar);
 
-  const app = new App(editorEl);
-  (window as unknown as { __nax: unknown }).__nax = { app, settings, syntaxTree, updateSettings };
+  const app = new App(editorHosts);
   const find = mountFind(app, findTop, resultsBottom);
-  const hex = new HexView(editorEl);
+
+  // Hex view per pane, shown instead of the editor for tabs in hex mode.
+  const hexes = editorHosts.map((host) => new HexView(host));
+  const hexShown: (string | null)[] = [null, null];
   const syncHex = () => {
-    const tab = app.active;
-    const want = !!tab?.hexView;
-    if (want && tab) {
-      const editorDom = app.view.dom;
-      editorDom.style.display = "none";
-      if (tab.path && !tab.dirty) {
-        const path = tab.path;
-        hex.show({ name: tab.name, size: tab.size, read: (o, l) => backend.readBytes(path, o, l) });
-      } else {
-        const bytes = new TextEncoder().encode(app.docText(tab));
-        hex.show({ name: tab.name + " (" + (tab.dirty ? t("unsaved") + ", UTF-8" : "UTF-8") + ")", size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
+    app.panes.forEach((pane, i) => {
+      const tab = pane.tab;
+      const hex = hexes[i];
+      if (tab?.hexView) {
+        pane.view.dom.style.display = "none";
+        const own = app.owner(tab);
+        const key = `${tab.id}:${own.dirty}:${own.size}:${own.mtime}`;
+        if (hexShown[i] === key && hex.visible) return;
+        hexShown[i] = key;
+        if (own.path && !own.dirty) {
+          const path = own.path;
+          hex.show({ name: own.name, size: own.size, read: (o, l) => backend.readBytes(path, o, l) });
+        } else {
+          const bytes = new TextEncoder().encode(app.docText(tab));
+          hex.show({ name: own.name + " (" + (own.dirty ? t("unsaved") + ", UTF-8" : "UTF-8") + ")", size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
+        }
+      } else if (hex.visible) {
+        hexShown[i] = null;
+        hex.hide();
+        pane.view.dom.style.display = "";
+        if (i === app.focused) pane.view.focus();
       }
-    } else if (hex.visible) {
-      hex.hide();
-      app.view.dom.style.display = "";
-      app.view.focus();
-    }
+    });
   };
   app.on("active", syncHex);
-  mountTabBar(app, tabbar);
-  mountStatusBar(app, statusbar, { gotoLine: () => (hex.visible ? hex.gotoOffset() : cmds.find((c) => c.id === "search.goto")?.run()) });
+  app.on("layout", syncHex);
+  mountTabBar(app, tabbars[0], 0);
+  mountTabBar(app, tabbars[1], 1);
+  const sidebar = mountSidebar(app, sidebarEl);
 
+  let keys: { rebuild(): void } | null = null;
+  const refreshKeys = () => {
+    applyKeymap(cmds, settings.keymapPreset, settings.keyOverrides);
+    keys?.rebuild();
+  };
+  const macrosChanged = () => {
+    addMacroCommands(cmds);
+    refreshKeys();
+  };
   const toggleMenuBar = () => {
     updateSettings({ showMenuBar: !settings.showMenuBar });
   };
-  const about = () => openAboutDialog();
-  const cmds = buildCommands(app, find, {
+  const extras = {
     toggleMenuBar,
-    about,
+    about: () => openAboutDialog(),
     hexGoto: () => {
+      const hex = hexes[app.focused];
       if (!hex.visible) return false;
       void hex.gotoOffset();
       return true;
     },
+    showSidebar: (tab: "folders" | "functions" | null) => sidebar.show(tab),
+    sidebarShown: () => sidebar.shown(),
+    openShortcuts: () => openShortcutDialog(cmds, refreshKeys),
+    nppImport: () => void openNppImport(app, cmds, refreshKeys, macrosChanged),
+    exportSettings: () => void exportSettings(),
+    importSettings: () => void importSettings(macrosChanged),
+    macrosChanged,
+    keymapChanged: refreshKeys,
+  };
+  const cmds: Command[] = buildCommands(app, find, extras);
+  const run = (id: string) => {
+    const c = cmds.find((x) => x.id === id);
+    if (c) void runCommand(c);
+  };
+  const status = mountStatusBar(app, statusbar, {
+    gotoLine: () => (hexes[app.focused].visible ? void hexes[app.focused].gotoOffset() : run("search.goto")),
+    run,
+    isRecording: () => recorder.recording,
   });
-  mountMenuBar(menubar, cmds);
-  installKeybindings(cmds, () => isModalOpen());
+  recorder.onChange(() => status.render());
+  (window as unknown as { __nax: unknown }).__nax = { app, settings, syntaxTree, updateSettings, cmds, recorder, run };
+
+  const dynamicMenus: Record<string, () => DynamicItem[]> = {
+    recent: () => {
+      const items: DynamicItem[] = settings.recentFiles.map((p) => ({ label: shortPath(p), detail: p, run: () => void app.openFiles([p]) }));
+      if (items.length) items.push("-", { label: t("Clear Recent Files"), run: () => app.clearRecent() });
+      return items;
+    },
+    macros: () =>
+      settings.macros.map((m) => ({
+        label: m.name,
+        run: () => run(`macro.user.${m.name}`),
+      })),
+  };
+  mountMenuBar(menubar, () => cmds, dynamicMenus);
+  keys = installKeybindings(() => cmds, {
+    isBlocked: () => isModalOpen(),
+    isEditorTarget: (target) => !!(target as HTMLElement | null)?.closest?.(".cm-content"),
+  });
 
   const applyMenuBar = () => {
     menubar.style.display = settings.showMenuBar ? "" : "none";
@@ -102,11 +172,12 @@ async function main(): Promise<void> {
     app.applySettingsToAll((tab) => [
       compartments.wrap.reconfigure(s.wordWrap ? EditorView.lineWrapping : []),
       compartments.lineNumbers.reconfigure(lineNumbersExt(s.lineNumbers, tab.paged?.firstLine ?? 0)),
-      compartments.indent.reconfigure(indentExt(s)),
+      compartments.indent.reconfigure(app.indentExtFor(tab)),
       compartments.activeLine.reconfigure(s.highlightActiveLine ? highlightActiveLine() : []),
       compartments.indentMarkers.reconfigure(s.indentationMarkers ? indentationMarkers({ hideFirstIndent: true }) : []),
       compartments.closeBrackets.reconfigure(s.autoCloseBrackets ? closeBrackets() : []),
       compartments.bracketMatching.reconfigure(s.bracketMatching ? bracketMatching() : []),
+      compartments.whitespace.reconfigure(app.whitespaceExtFor(tab)),
     ] as StateEffect<unknown>[]);
     app.emit("status");
   });
@@ -114,10 +185,15 @@ async function main(): Promise<void> {
     if (settings.theme === "system") applyTheme("system");
   });
 
+  window.addEventListener("nax:findInFolder", (e) => find.searchIn((e as CustomEvent<string>).detail));
+
   // Editor context menu (replaces the WebView2 default, which has no working Paste)
-  editorEl.addEventListener("contextmenu", (e) => {
-    if (hex.visible) return;
+  panesEl.addEventListener("contextmenu", (e) => {
+    const host = (e.target as HTMLElement).closest(".editor");
+    if (!host || hexes.some((x) => x.visible && x.root.contains(e.target as Node))) return;
     e.preventDefault();
+    const i = editorHosts.indexOf(host as HTMLDivElement);
+    if (i >= 0 && i !== app.focused && app.panes[i].tab) app.focusPane(i);
     const v = app.view;
     const ro = v.state.readOnly;
     const hasSel = v.state.selection.ranges.some((r) => !r.empty);
@@ -131,11 +207,13 @@ async function main(): Promise<void> {
       { label: t("Delete"), run: () => deleteSelection(v), disabled: ro || !hasSel },
       "-",
       { label: t("Select All"), run: () => selectAllIn(v) },
+      "-",
+      { label: t("Toggle Bookmark"), run: () => run("bookmark.toggle") },
     ]);
   });
 
   // Ctrl+wheel zoom
-  editorEl.addEventListener(
+  panesEl.addEventListener(
     "wheel",
     (e) => {
       if (!e.ctrlKey) return;
@@ -214,8 +292,8 @@ async function main(): Promise<void> {
 
   // Keep the window title in sync
   const updateTitle = () => {
-    const t = app.active;
-    void win.setTitle(t ? `${t.dirty ? "● " : ""}${t.name}${t.path ? ` (${t.path})` : ""} - Nax-Notepad` : "Nax-Notepad");
+    const tab = app.active ? app.owner(app.active) : null;
+    void win.setTitle(tab ? `${tab.dirty ? "● " : ""}${tab.name}${tab.path ? ` (${tab.path})` : ""} - Nax-Notepad` : "Nax-Notepad");
   };
   app.on("tabs", updateTitle);
   app.on("active", updateTitle);

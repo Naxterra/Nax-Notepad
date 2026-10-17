@@ -11,7 +11,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Portable mode: when a file named `portable.txt` sits next to the program, everything is
+/// stored in the `data` folder beside it instead of %APPDATA%.
+pub fn portable_dir() -> Option<PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        dir.join("portable.txt").is_file().then(|| dir.join("data"))
+    })
+    .clone()
+}
+
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = portable_dir() {
+        return dir;
+    }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir());

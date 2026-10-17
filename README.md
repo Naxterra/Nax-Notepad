@@ -19,6 +19,10 @@ for **multi-gigabyte files**. Built with Tauri 2 (Rust shell, WebView2) and Code
 - **Find / Replace** with regex, whole word, case, in-selection, count, and **Find in Files**.
   "In selection only" captures the selection once and keeps that range through every replace.
   Replacement syntax is JavaScript's (`$&`, `$1`, `$<name>`, `$$`) for files of any size.
+  **Find All** in the current document or in all open tabs, a **live line filter**
+  (`Ctrl+Alt+L`) that keeps updating while a log grows, search and replace history, and a
+  Cancel button for long searches. Find in Files searches files of any size (large UTF-8 files
+  through a memory map) and lists every file it skipped, with the reason.
 - **Safe saving**: every save writes a uniquely named temporary file and replaces the target
   only when that succeeded. Typing during a save keeps the tab dirty. Saving in a code page
   that cannot represent some characters asks first. A large file changed by another program
@@ -32,6 +36,32 @@ for **multi-gigabyte files**. Built with Tauri 2 (Rust shell, WebView2) and Code
 - Command palette (`Ctrl+Shift+P`), go to line, multi-cursor, code folding, bracket matching,
   indentation guides, word wrap, zoom, sort/dedupe/case-change line tools.
 - Single instance: opening another file from Explorer adds a tab to the running window.
+
+### Notepad++ workflow
+
+- **Keyboard**: an optional Notepad++ key preset (`Ctrl+L` cut line, `Ctrl+Shift+L` delete
+  line, `Ctrl+Q` comment, `Ctrl+B` matching brace, `Ctrl+Shift+Up/Down` move line, ...) and a
+  shortcut editor that shows conflicts. Column selection with `Alt+Shift+Arrows` or Alt+drag.
+- **Bookmarks** (`Ctrl+F2`, `F2`, `Shift+F2`) that follow edits and are kept in the session;
+  copy or remove the bookmarked lines.
+- **Recent files**, and **Reopen Closed Tab** (`Ctrl+Shift+T`), also for unsaved new tabs.
+- **Split view**: move or clone a tab to a second view; a clone shows the same document and
+  edits appear in both. Synchronized scrolling and a **Compare** of the two views with next /
+  previous difference.
+- **Macros**: record (`Ctrl+Shift+R`), run, run N times or to the end of the file, save under a
+  name and give it a key. Replays go through the editor's own key handling, so undo and
+  read-only mode apply.
+- **Navigation**: folder workspace sidebar (`Ctrl+Shift+E`), function list (functions, classes,
+  Markdown headings), indentation detected per file, show whitespace and line endings.
+- **Logs**: **Follow (tail -f)** a file with pause/resume. Appended lines are read
+  incrementally, rotated or replaced files are reloaded, and following pauses while the tab has
+  unsaved edits. Works for multi-gigabyte files too.
+- **Encoding**: "Reopen with Encoding" (decode the file again) is separate from "Convert to
+  Encoding" (write the text in another encoding on the next save).
+- **Migration**: import a reviewed subset of Notepad++ settings, shortcuts, macros and the
+  session (including unsaved "new" documents); only ticked items are applied and everything that
+  cannot be mapped is listed. Settings export/import, and a **portable** package (settings in a
+  `data` folder next to the program).
 - Markdown formatting menu with shortcuts (bold `Ctrl+B`, italic `Ctrl+I`, headings `Ctrl+Alt+1..6`,
   lists `Ctrl+Shift+7/8/9`, link `Ctrl+K`, code block `Ctrl+Alt+C`, table, rule). Typing ``` opens
   a language picker (bash, sql, python, powershell, ...) that also adds the closing fence. All common Markdown
@@ -55,7 +85,7 @@ npm install
 npm run tauri dev          # run in development mode
 npm test                   # frontend regression tests
 npm run test:rust          # backend tests (piece table, encodings, saving)
-powershell -File build.ps1 # release build + installer in .\artifacts
+powershell -File build.ps1 # release build, portable zip + installer in .\artifacts
 ```
 
 ## Layout
@@ -64,7 +94,11 @@ powershell -File build.ps1 # release build + installer in .\artifacts
 - `src-tauri/src/textfmt.rs` – encoding / BOM / line-ending detection and conversion.
 - `src-tauri/src/session.rs` – session, buffers and settings under `%APPDATA%\Nax-Notepad`.
 - `src-tauri/src/lib.rs` – Tauri commands and app setup.
-- `src/app.ts` – tabs, open/save, session restore.
+- `src/app.ts` – tabs, the two editor panes, open/save, follow mode, session restore.
+- `src/commands.ts`, `src/keymap.ts` – commands, key presets, key dispatch, macro recorder.
+- `src/macros.ts`, `src/bookmarks.ts`, `src/columnselect.ts`, `src/diff.ts`, `src/compare.ts`,
+  `src/symbols.ts`, `src/indentdetect.ts`, `src/whitespace.ts` – editor features.
+- `src/nppimport.ts` – Notepad++ config, session and shortcut parser.
 - `src/livepreview.ts` – the Markdown Live Preview extension.
 - `src/paged.ts` – windowed editing of paged documents.
 - `src/ui/*` – tab bar, status bar, find panel, menus, dialogs, settings.

@@ -51,6 +51,7 @@ export const E_EXTERNAL_CHANGE = "E_EXTERNAL_CHANGE:";
 export const E_READ_ONLY_ENCODING = "E_READ_ONLY_ENCODING:";
 export const E_SEARCH_ENCODING = "E_SEARCH_ENCODING:";
 export const E_NO_SCOPE = "E_NO_SCOPE:";
+export const E_CANCELLED = "E_CANCELLED:";
 
 export function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -77,6 +78,54 @@ export interface FileHit {
   text: string;
 }
 
+export interface FoundLine {
+  line: number;
+  col: number;
+  len: number;
+  text: string;
+}
+
+export interface SkippedFile {
+  path: string;
+  /** "binary", "encoding" or "unreadable" */
+  reason: string;
+}
+
+export interface FindInFilesResult {
+  hits: FileHit[];
+  skipped: SkippedFile[];
+  skippedCount: number;
+  filesSearched: number;
+  truncated: boolean;
+  cancelled: boolean;
+}
+
+export interface DirEntryInfo {
+  name: string;
+  path: string;
+  isDir: boolean;
+}
+
+export interface TailStart {
+  size: number;
+  headHash: number;
+  headLen: number;
+}
+
+export interface TailCheck {
+  status: "same" | "appended" | "rotated" | "missing";
+  text: string;
+  offset: number;
+  mtime: number;
+}
+
+export interface PagedTailCheck {
+  status: "same" | "appended" | "rotated" | "missing" | "dirty";
+  totalLines: number;
+  size?: number;
+  mtime?: number;
+}
+
 export interface TabMeta {
   id: string;
   path: string | null;
@@ -91,8 +140,8 @@ export interface SessionData {
 }
 
 export const backend = {
-  openPath: (id: string, path: string, forcePaged = false) =>
-    invoke<OpenResult>("open_path", { id, path, forcePaged }),
+  openPath: (id: string, path: string, forcePaged = false, encoding: string | null = null) =>
+    invoke<OpenResult>("open_path", { id, path, forcePaged, encoding }),
   saveText: (path: string, text: string, encoding: string, eol: Eol, lossy = false) =>
     invoke<SaveResult>("save_text", { path, text, encoding, eol, lossy }),
   fileMtime: (path: string) => invoke<number>("file_mtime", { path }),
@@ -128,7 +177,19 @@ export const backend = {
   startupFiles: () => invoke<string[]>("startup_files"),
 
   findInFiles: (root: string, opts: FindOpts, include: string, maxHits = 5000) =>
-    invoke<FileHit[]>("find_in_files", { root, opts, include, maxHits }),
+    invoke<FindInFilesResult>("find_in_files", { root, opts, include, maxHits }),
+  cancelSearch: () => invoke<void>("cancel_search"),
+  pagedFindAll: (id: string, opts: FindOpts, scoped = false, max = 10000) =>
+    invoke<{ hits: FoundLine[]; truncated: boolean }>("paged_find_all", { id, opts, scoped, max }),
+  pagedTailCheck: (id: string) => invoke<PagedTailCheck>("paged_tail_check", { id }),
+  tailStart: (path: string) => invoke<TailStart>("tail_start", { path }),
+  tailCheck: (path: string, offset: number, headHash: number, headLen: number, encoding: string) =>
+    invoke<TailCheck>("tail_check", { path, offset, headHashValue: headHash, headLen, encoding }),
+  listDir: (path: string) => invoke<DirEntryInfo[]>("list_dir", { path }),
+  readTextFile: (path: string, maxBytes?: number) => invoke<string>("read_text_file", { path, maxBytes: maxBytes ?? null }),
+  writeTextFile: (path: string, text: string) => invoke<void>("write_text_file", { path, text }),
+  appDataDir: () => invoke<string>("app_data_dir"),
+  nppConfigDir: () => invoke<string | null>("npp_config_dir"),
   pathExists: (path: string) => invoke<boolean>("path_exists", { path }),
   readBytes: async (path: string, offset: number, len: number) => new Uint8Array(await invoke<ArrayBuffer>("read_bytes", { path, offset, len })),
   fileSize: (path: string) => invoke<number>("file_size", { path }),

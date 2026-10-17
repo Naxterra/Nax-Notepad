@@ -1,9 +1,15 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { backend } from "../backend";
 import { t } from "../i18n";
 import { APP_VERSION, checkForUpdates, ISSUES_URL, REPO_URL } from "../update";
 import { h, showModal } from "./dialogs";
 
 export function openAboutDialog(): void {
+  const dataDir = h("code", {}, "%APPDATA%\\Nax-Notepad");
+  void backend
+    .appDataDir()
+    .then((d) => (dataDir.textContent = d))
+    .catch(() => undefined);
   const link = (href: string, label: string) =>
     h(
       "a",
@@ -31,7 +37,7 @@ export function openAboutDialog(): void {
       h("br"),
       t("Settings, session and unsaved text are stored in"),
       " ",
-      h("code", {}, "%APPDATA%\\Nax-Notepad"),
+      dataDir,
       h("br"),
       h("br"),
       link(REPO_URL, t("GitHub Repository")),

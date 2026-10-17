@@ -7,7 +7,22 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{Emitter, Manager, State};
+
+/// Bumped by `cancel_search`; long searches stop when it changes while they run.
+static SEARCH_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn cancel_token() -> impl Fn() -> bool {
+    let gen = SEARCH_GEN.load(Ordering::SeqCst);
+    move || SEARCH_GEN.load(Ordering::SeqCst) != gen
+}
+
+/// Stop the running Find in Files, Count, Find All or Replace All.
+#[tauri::command]
+fn cancel_search() {
+    SEARCH_GEN.fetch_add(1, Ordering::SeqCst);
+}
 use textfmt::Eol;
 
 /// Files larger than this are opened in paged (memory-mapped) mode.
@@ -62,6 +77,7 @@ async fn open_path(
     id: String,
     path: String,
     force_paged: Option<bool>,
+    encoding: Option<String>,
 ) -> Result<OpenResult, String> {
     let p = PathBuf::from(&path);
     let meta = std::fs::metadata(&p).map_err(|e| format!("Cannot open {}: {e}", p.display()))?;
@@ -78,7 +94,7 @@ async fn open_path(
         bom == textfmt::Bom::None && probe[..n].contains(&0)
     };
     if size >= PAGED_THRESHOLD || force_paged.unwrap_or(false) {
-        let doc = PagedDoc::open(&p)?;
+        let doc = PagedDoc::open_with(&p, encoding.as_deref())?;
         let editable = doc.is_editable();
         let res = OpenResult {
             kind: "paged".into(),
@@ -99,7 +115,10 @@ async fn open_path(
         return Ok(res);
     }
     let bytes = std::fs::read(&p).map_err(|e| format!("Cannot read {}: {e}", p.display()))?;
-    let dec = textfmt::decode(&bytes);
+    let dec = match encoding.as_deref() {
+        Some(label) => textfmt::decode_as(&bytes, label)?,
+        None => textfmt::decode(&bytes),
+    };
     Ok(OpenResult {
         kind: "memory".into(),
         path: p.display().to_string(),
@@ -400,7 +419,7 @@ async fn paged_find(
     let doc = docs.get(&id).ok_or("document not open")?;
     ensure_searchable(doc)?;
     let from = doc.line_start(from_line).saturating_add(from_col);
-    doc.find_in(&re, from, backwards, scoped.unwrap_or(false))
+    doc.find_in_c(&re, from, backwards, scoped.unwrap_or(false), &cancel_token())
 }
 
 #[tauri::command]
@@ -409,7 +428,47 @@ async fn paged_count(state: State<'_, AppState>, id: String, opts: FindOpts, sco
     let docs = state.paged.lock();
     let doc = docs.get(&id).ok_or("document not open")?;
     ensure_searchable(doc)?;
-    doc.count_in(&re, 1_000_000, scoped.unwrap_or(false))
+    doc.count_in_c(&re, 1_000_000, scoped.unwrap_or(false), &cancel_token())
+}
+
+#[derive(Serialize)]
+struct FindAllResult {
+    hits: Vec<paged::FoundLine>,
+    truncated: bool,
+}
+
+/// Every match in a large file (for "find all in open tabs" and line filters).
+#[tauri::command]
+async fn paged_find_all(
+    state: State<'_, AppState>,
+    id: String,
+    opts: FindOpts,
+    scoped: Option<bool>,
+    max: Option<usize>,
+) -> Result<FindAllResult, String> {
+    let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
+    let docs = state.paged.lock();
+    let doc = docs.get(&id).ok_or("document not open")?;
+    ensure_searchable(doc)?;
+    let (hits, truncated) = doc.find_all_c(&re, scoped.unwrap_or(false), max.unwrap_or(10_000), &cancel_token())?;
+    Ok(FindAllResult { hits, truncated })
+}
+
+/// Pick up data appended to a large file by another program (follow / tail mode).
+#[tauri::command]
+async fn paged_tail_check(state: State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
+    let mut docs = state.paged.lock();
+    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    if doc.is_dirty() {
+        return Ok(serde_json::json!({ "status": "dirty", "totalLines": doc.line_count() }));
+    }
+    let status = doc.refresh_append()?;
+    Ok(serde_json::json!({
+        "status": status,
+        "totalLines": doc.line_count(),
+        "size": doc.file_len(),
+        "mtime": doc.file_mtime_ms(),
+    }))
 }
 
 #[tauri::command]
@@ -428,7 +487,7 @@ async fn paged_replace_all(
     };
     let mut docs = state.paged.lock();
     let doc = docs.get_mut(&id).ok_or("document not open")?;
-    doc.replace_all_in(&re, rep.as_bytes(), scoped.unwrap_or(false))
+    doc.replace_all_in_c(&re, rep.as_bytes(), scoped.unwrap_or(false), &cancel_token())
 }
 
 #[tauri::command]
@@ -472,7 +531,7 @@ async fn paged_store_edits(state: State<'_, AppState>, id: String) -> Result<(),
 /// disk is unchanged. Returns (restored_edits, line_count).
 #[tauri::command]
 async fn paged_restore(state: State<'_, AppState>, id: String, path: String) -> Result<OpenResult, String> {
-    let mut res = open_path(state.clone(), id.clone(), path, None).await?;
+    let mut res = open_path(state.clone(), id.clone(), path, None, None).await?;
     if res.kind != "paged" {
         return Ok(res);
     }
@@ -564,14 +623,71 @@ struct FileHit {
     text: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkippedFile {
+    path: String,
+    /// "binary", "encoding" (large file that is not UTF-8) or "unreadable"
+    reason: String,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct FindInFilesResult {
+    hits: Vec<FileHit>,
+    /// Files that were not searched, with the reason (at most 500 listed).
+    skipped: Vec<SkippedFile>,
+    skipped_count: usize,
+    files_searched: usize,
+    truncated: bool,
+    cancelled: bool,
+}
+
+/// Files larger than this are searched through a memory map instead of being read.
+const FIF_MAP_THRESHOLD: u64 = 32 * 1024 * 1024;
+
+fn search_bytes(re: &regex::bytes::Regex, bytes: &[u8], path: &Path, hits: &mut Vec<FileHit>, max_hits: usize, cancel: &dyn Fn() -> bool) -> bool {
+    let mut line_no = 0usize;
+    let mut line_start = 0usize;
+    for (k, m) in re.find_iter(bytes).enumerate() {
+        if k % 4096 == 4095 && cancel() {
+            return false;
+        }
+        if m.start() == m.end() {
+            continue;
+        }
+        let nl = memchr::memchr_iter(b'\n', &bytes[line_start..m.start()]).count();
+        if nl > 0 {
+            line_no += nl;
+            line_start = memchr::memrchr(b'\n', &bytes[..m.start()]).map(|p| p + 1).unwrap_or(0);
+        }
+        let line_end = memchr::memchr(b'\n', &bytes[m.start()..])
+            .map(|p| m.start() + p)
+            .unwrap_or(bytes.len())
+            .min(line_start + 4096);
+        let line_text = String::from_utf8_lossy(&bytes[line_start..line_end]).trim_end_matches('\r').to_string();
+        hits.push(FileHit {
+            path: path.display().to_string(),
+            line: line_no,
+            col: String::from_utf8_lossy(&bytes[line_start..m.start()]).chars().count(),
+            text: line_text.chars().take(400).collect(),
+        });
+        if hits.len() >= max_hits {
+            return false;
+        }
+    }
+    true
+}
+
 #[tauri::command]
 async fn find_in_files(
     root: String,
     opts: FindOpts,
     include: Option<String>,
     max_hits: Option<usize>,
-) -> Result<Vec<FileHit>, String> {
+) -> Result<FindInFilesResult, String> {
     let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
+    let cancel = cancel_token();
     let max_hits = max_hits.unwrap_or(5000);
     let globs: Vec<String> = include
         .unwrap_or_default()
@@ -579,12 +695,30 @@ async fn find_in_files(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let mut hits = Vec::new();
+    let mut res = FindInFilesResult::default();
+    let skip = |res: &mut FindInFilesResult, path: &Path, reason: &str| {
+        res.skipped_count += 1;
+        if res.skipped.len() < 500 {
+            res.skipped.push(SkippedFile { path: path.display().to_string(), reason: reason.into() });
+        }
+    };
     let walker = walkdir::WalkDir::new(&root).into_iter().filter_entry(|e| {
         let n = e.file_name().to_string_lossy();
         !(n == ".git" || n == "node_modules" || n == "target" || n == ".svn")
     });
-    'outer: for entry in walker.flatten() {
+    for entry in walker {
+        if cancel() {
+            res.cancelled = true;
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                let p = e.path().map(|p| p.to_path_buf()).unwrap_or_default();
+                skip(&mut res, &p, "unreadable");
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -595,61 +729,73 @@ async fn find_in_files(
                 continue;
             }
         }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
+        let len = match entry.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => {
+                skip(&mut res, path, "unreadable");
+                continue;
+            }
         };
-        if meta.len() > 32 * 1024 * 1024 {
-            continue;
-        }
-        let raw = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let (bom, _) = textfmt::detect_bom(&raw);
-        let probe = &raw[..raw.len().min(8192)];
-        if bom == textfmt::Bom::None && probe.contains(&0) {
-            continue; // binary
-        }
-        // Search decoded UTF-8 so legacy code pages and UTF-16 files match and columns are
-        // character based.
-        let bytes: std::borrow::Cow<[u8]> = if bom == textfmt::Bom::None && std::str::from_utf8(&raw).is_ok() {
-            std::borrow::Cow::Borrowed(&raw)
+        let keep_going = if len > FIF_MAP_THRESHOLD {
+            // Large file: search the memory map directly (UTF-8 only, no copy).
+            let map = std::fs::File::open(path).and_then(|f| unsafe { memmap2::Mmap::map(&f) });
+            let map = match map {
+                Ok(m) => m,
+                Err(_) => {
+                    skip(&mut res, path, "unreadable");
+                    continue;
+                }
+            };
+            let probe = &map[..map.len().min(8192)];
+            if textfmt::detect_bom(probe).0 == textfmt::Bom::None && probe.contains(&0) {
+                skip(&mut res, path, "binary");
+                continue;
+            }
+            let sample = &map[..map.len().min(1 << 20)];
+            let utf8 = match std::str::from_utf8(sample) {
+                Ok(_) => true,
+                Err(e) => e.error_len().is_none(),
+            };
+            if !utf8 || matches!(textfmt::detect_bom(probe).0, textfmt::Bom::Utf16Le | textfmt::Bom::Utf16Be) {
+                skip(&mut res, path, "encoding");
+                continue;
+            }
+            res.files_searched += 1;
+            search_bytes(&re, &map, path, &mut res.hits, max_hits, &cancel)
         } else {
-            std::borrow::Cow::Owned(textfmt::decode(&raw).text.into_bytes())
+            let raw = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(_) => {
+                    skip(&mut res, path, "unreadable");
+                    continue;
+                }
+            };
+            let (bom, _) = textfmt::detect_bom(&raw);
+            let probe = &raw[..raw.len().min(8192)];
+            if bom == textfmt::Bom::None && probe.contains(&0) {
+                skip(&mut res, path, "binary");
+                continue;
+            }
+            // Search decoded UTF-8 so legacy code pages and UTF-16 files match and columns are
+            // character based.
+            let bytes: std::borrow::Cow<[u8]> = if bom == textfmt::Bom::None && std::str::from_utf8(&raw).is_ok() {
+                std::borrow::Cow::Borrowed(&raw)
+            } else {
+                std::borrow::Cow::Owned(textfmt::decode(&raw).text.into_bytes())
+            };
+            res.files_searched += 1;
+            search_bytes(&re, &bytes, path, &mut res.hits, max_hits, &cancel)
         };
-        let bytes: &[u8] = &bytes;
-        let mut line_no = 0usize;
-        let mut line_start = 0usize;
-        let mut matches = re.find_iter(&bytes).peekable();
-        if matches.peek().is_none() {
-            continue;
-        }
-        for m in matches {
-            // advance line counter to m.start()
-            let nl = memchr::memchr_iter(b'\n', &bytes[line_start..m.start()]).count();
-            if nl > 0 {
-                line_no += nl;
-                line_start = memchr::memrchr(b'\n', &bytes[..m.start()]).map(|p| p + 1).unwrap_or(0);
+        if !keep_going {
+            if res.hits.len() >= max_hits {
+                res.truncated = true;
+            } else {
+                res.cancelled = true;
             }
-            let line_end = memchr::memchr(b'\n', &bytes[m.start()..])
-                .map(|p| m.start() + p)
-                .unwrap_or(bytes.len());
-            let line_text = String::from_utf8_lossy(&bytes[line_start..line_end])
-                .trim_end_matches('\r')
-                .to_string();
-            hits.push(FileHit {
-                path: path.display().to_string(),
-                line: line_no,
-                col: String::from_utf8_lossy(&bytes[line_start..m.start()]).chars().count(),
-                text: line_text.chars().take(400).collect(),
-            });
-            if hits.len() >= max_hits {
-                break 'outer;
-            }
+            break;
         }
     }
-    Ok(hits)
+    Ok(res)
 }
 
 fn glob_match(pattern: &str, name: &str) -> bool {
@@ -693,6 +839,150 @@ fn file_size(path: String) -> Result<u64, String> {
     std::fs::metadata(&path).map(|m| m.len()).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirEntryInfo {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+/// Entries of one folder for the workspace sidebar: folders first, then files, by name.
+#[tauri::command]
+async fn list_dir(path: String) -> Result<Vec<DirEntryInfo>, String> {
+    let rd = std::fs::read_dir(&path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+    let mut out: Vec<DirEntryInfo> = rd
+        .flatten()
+        .map(|e| {
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            DirEntryInfo { name: e.file_name().to_string_lossy().into_owned(), path: e.path().display().to_string(), is_dir }
+        })
+        .collect();
+    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(out)
+}
+
+/// Read a (small) text file as UTF-8, for imports. Fails above `max_bytes` (default 16 MiB).
+#[tauri::command]
+async fn read_text_file(path: String, max_bytes: Option<u64>) -> Result<String, String> {
+    let max = max_bytes.unwrap_or(16 << 20);
+    let len = std::fs::metadata(&path).map_err(|e| format!("Cannot read {path}: {e}"))?.len();
+    if len > max {
+        return Err(format!("{path} is too large ({len} bytes)"));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+    Ok(textfmt::decode(&bytes).text)
+}
+
+/// Write UTF-8 text atomically, for exports.
+#[tauri::command]
+async fn write_text_file(path: String, text: String) -> Result<(), String> {
+    session::write_atomic(Path::new(&path), text.as_bytes())
+}
+
+fn head_hash(path: &Path, len: u64) -> std::io::Result<u64> {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+    let mut buf = vec![0u8; len as usize];
+    std::fs::File::open(path)?.read_exact(&mut buf)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    buf.hash(&mut h);
+    // 53 bits, so the value survives a round trip through a JavaScript number.
+    Ok(h.finish() & ((1u64 << 53) - 1))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TailStart {
+    size: u64,
+    head_hash: u64,
+    head_len: u64,
+}
+
+/// Remember the current end and beginning of a file before following it.
+#[tauri::command]
+async fn tail_start(path: String) -> Result<TailStart, String> {
+    let size = std::fs::metadata(&path).map_err(|e| format!("Cannot read {path}: {e}"))?.len();
+    let head_len = size.min(64 << 10);
+    let head_hash = head_hash(Path::new(&path), head_len).map_err(|e| e.to_string())?;
+    Ok(TailStart { size, head_hash, head_len })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TailCheck {
+    /// "same", "appended", "rotated" or "missing"
+    status: String,
+    /// Decoded appended text (status "appended").
+    text: String,
+    /// Offset up to which the file has been read.
+    offset: u64,
+    mtime: u64,
+}
+
+/// Read what was appended to a followed file since `offset`. Reports "rotated" when the file
+/// shrank or its beginning changed, so the caller reloads it. Text is only returned up to the
+/// last complete character.
+#[tauri::command]
+async fn tail_check(path: String, offset: u64, head_hash_value: u64, head_len: u64, encoding: String) -> Result<TailCheck, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let p = Path::new(&path);
+    let out = |status: &str, text: String, offset: u64| TailCheck { status: status.into(), text, offset, mtime: mtime_of(p) };
+    let size = match std::fs::metadata(p) {
+        Ok(m) => m.len(),
+        Err(_) => return Ok(out("missing", String::new(), offset)),
+    };
+    if size < offset || size < head_len {
+        return Ok(out("rotated", String::new(), offset));
+    }
+    if head_hash(p, head_len).map_err(|e| e.to_string())? != head_hash_value {
+        return Ok(out("rotated", String::new(), offset));
+    }
+    if size == offset {
+        return Ok(out("same", String::new(), offset));
+    }
+    if size - offset > (64 << 20) {
+        return Ok(out("rotated", String::new(), offset)); // too much at once: reload instead
+    }
+    let mut f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; (size - offset) as usize];
+    f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    let consumed = match encoding.as_str() {
+        "UTF-8" | "UTF-8-BOM" => match std::str::from_utf8(&buf) {
+            Ok(_) => buf.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => buf.len(),
+        },
+        "UTF-16LE" | "UTF-16BE" => buf.len() - buf.len() % 2,
+        _ => buf.len(),
+    };
+    buf.truncate(consumed);
+    let text = match encoding.as_str() {
+        "UTF-8" | "UTF-8-BOM" => String::from_utf8_lossy(&buf).into_owned(),
+        "UTF-16LE" => encoding_rs::UTF_16LE.decode_without_bom_handling(&buf).0.into_owned(),
+        "UTF-16BE" => encoding_rs::UTF_16BE.decode_without_bom_handling(&buf).0.into_owned(),
+        label => match encoding_rs::Encoding::for_label(label.as_bytes()) {
+            Some(enc) => enc.decode_without_bom_handling(&buf).0.into_owned(),
+            None => String::from_utf8_lossy(&buf).into_owned(),
+        },
+    };
+    Ok(out("appended", text, offset + consumed as u64))
+}
+
+/// Where settings, session and unsaved text are stored (shown in About).
+#[tauri::command]
+fn app_data_dir() -> String {
+    session::data_dir().display().to_string()
+}
+
+/// The Notepad++ settings folder, if Notepad++ is installed for this user.
+#[tauri::command]
+fn npp_config_dir() -> Option<String> {
+    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("Notepad++");
+    dir.is_dir().then(|| dir.display().to_string())
+}
+
 #[tauri::command]
 fn path_exists(path: String) -> bool {
     Path::new(&path).exists()
@@ -725,6 +1015,10 @@ fn collect_file_args<I: Iterator<Item = String>>(args: I, cwd: &Path) -> Vec<Str
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Portable mode keeps the browser profile next to the program as well.
+    if let Some(dir) = session::portable_dir() {
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview"));
+    }
     let cwd = std::env::current_dir().unwrap_or_default();
     let initial = collect_file_args(std::env::args(), &cwd);
     let state = AppState {
@@ -756,6 +1050,16 @@ pub fn run() {
             paged_close,
             paged_set_eol,
             paged_disk_state,
+            paged_find_all,
+            paged_tail_check,
+            cancel_search,
+            list_dir,
+            read_text_file,
+            write_text_file,
+            tail_start,
+            tail_check,
+            app_data_dir,
+            npp_config_dir,
             paged_set_scope,
             paged_clear_scope,
             paged_find,
@@ -798,5 +1102,92 @@ mod tests {
         let mut out = Vec::new();
         caps.expand(js_to_rust_replacement("$2 <- $<w> ($&) $$", re.captures_len()).as_bytes(), &mut out);
         assert_eq!(out, b"host <- user (user@host) $");
+    }
+
+    use super::*;
+    use std::io::Write;
+
+    /// Cancelling is global, so tests that search must not overlap with the cancel test.
+    static SEARCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn opts(p: &str) -> FindOpts {
+        FindOpts { pattern: p.into(), regex: false, case_sensitive: false, whole_word: false }
+    }
+
+    #[test]
+    fn find_in_files_reports_skipped_files() {
+        let _g = SEARCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "first\nneedle here\n").unwrap();
+        std::fs::write(dir.path().join("b.bin"), b"needle\0\0\0binary").unwrap();
+        // Legacy code page: found after decoding, with a character column.
+        std::fs::write(dir.path().join("c.txt"), b"Gr\xfc\xdfe needle").unwrap();
+        let res = tauri::async_runtime::block_on(find_in_files(dir.path().display().to_string(), opts("needle"), None, None)).unwrap();
+        let mut hits: Vec<(String, usize, usize)> = res.hits.iter().map(|h| (Path::new(&h.path).file_name().unwrap().to_string_lossy().into_owned(), h.line, h.col)).collect();
+        hits.sort();
+        assert_eq!(hits, vec![("a.txt".into(), 1, 0), ("c.txt".into(), 0, 6)]);
+        assert_eq!(res.skipped_count, 1);
+        assert_eq!(res.skipped[0].reason, "binary");
+        assert!(!res.cancelled && !res.truncated);
+        assert_eq!(res.files_searched, 2);
+    }
+
+    #[test]
+    fn cancel_search_stops_find_in_files() {
+        let _g = SEARCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle").unwrap();
+        let cancel = cancel_token();
+        assert!(!cancel());
+        cancel_search();
+        assert!(cancel(), "a running search sees the cancellation");
+        // A search started afterwards runs normally.
+        let res = tauri::async_runtime::block_on(find_in_files(dir.path().display().to_string(), opts("needle"), None, None)).unwrap();
+        assert_eq!(res.hits.len(), 1);
+    }
+
+    #[test]
+    fn tail_reads_appended_text_and_detects_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("app.log");
+        let path = p.display().to_string();
+        std::fs::write(&p, "one\n").unwrap();
+        let st = tauri::async_runtime::block_on(tail_start(path.clone())).unwrap();
+        assert_eq!(st.size, 4);
+        let check = |offset: u64| tauri::async_runtime::block_on(tail_check(path.clone(), offset, st.head_hash, st.head_len, "UTF-8".into())).unwrap();
+        assert_eq!(check(4).status, "same");
+        // Append "two\n" plus the first byte of "ü": only complete characters are returned.
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"two\n\xc3").unwrap();
+        let r = check(4);
+        assert_eq!((r.status.as_str(), r.text.as_str(), r.offset), ("appended", "two\n", 8));
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"\xbc\n").unwrap();
+        let r = check(8);
+        assert_eq!((r.status.as_str(), r.text.as_str(), r.offset), ("appended", "ü\n", 11));
+        // Rotation: the file is replaced by a new, shorter one.
+        std::fs::rename(&p, dir.path().join("app.log.1")).unwrap();
+        assert_eq!(check(11).status, "missing");
+        std::fs::write(&p, "new\n").unwrap();
+        assert_eq!(check(11).status, "rotated");
+        // Same length but different beginning is also a replacement.
+        std::fs::write(&p, b"xne\ntwo\n\xc3\xbc\n").unwrap();
+        assert_eq!(check(11).status, "rotated");
+    }
+
+    #[test]
+    fn head_hash_fits_a_javascript_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x");
+        std::fs::write(&p, "some content").unwrap();
+        assert!(head_hash(&p, 12).unwrap() < (1u64 << 53));
+    }
+
+    #[test]
+    fn list_dir_puts_folders_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt"), "").unwrap();
+        std::fs::write(dir.path().join("A.txt"), "").unwrap();
+        std::fs::create_dir(dir.path().join("zdir")).unwrap();
+        let names: Vec<String> = tauri::async_runtime::block_on(list_dir(dir.path().display().to_string())).unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["zdir", "A.txt", "b.txt"]);
     }
 }
