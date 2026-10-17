@@ -292,4 +292,32 @@ const de: Record<string, string> = {
   "Offset (hex, or decimal with a # prefix):": "Offset (hex, oder dezimal mit vorangestelltem #):",
   Offset: "Offset",
   bytes: "Bytes",
+  // Data safety (0.3.0)
+  'Could not store "{name}": {error}': "„{name}“ konnte nicht gespeichert werden: {error}",
+  "This line is too long to edit and is shown only in part, read-only.":
+    "Diese Zeile ist zu lang zum Bearbeiten und wird nur teilweise und schreibgeschützt angezeigt.",
+  "This part of the file is not valid UTF-8 and is shown read-only.":
+    "Dieser Teil der Datei ist kein gültiges UTF-8 und wird schreibgeschützt angezeigt.",
+  "This part of the file is read-only and was not changed.": "Dieser Teil der Datei ist schreibgeschützt und wurde nicht geändert.",
+  "Large files in {encoding} can be viewed but not edited yet.": "Große Dateien in {encoding} können angezeigt, aber noch nicht bearbeitet werden.",
+  '"{name}" was opened read-only.': "„{name}“ wurde schreibgeschützt geöffnet.",
+  '"{name}" contains bytes that are not valid {encoding}. It was opened read-only so saving cannot change them. Use the tab menu to allow editing.':
+    "„{name}“ enthält Bytes, die in {encoding} ungültig sind. Die Datei wurde schreibgeschützt geöffnet, damit Speichern sie nicht verändert. Über das Tab-Menü lässt sich das Bearbeiten erlauben.",
+  "Characters cannot be saved in {encoding}": "Zeichen können nicht in {encoding} gespeichert werden",
+  '{count} characters in this document do not exist in {encoding}, for example: {chars}\n\nSave the file as UTF-8 instead, or replace those characters with "?"?':
+    "{count} Zeichen dieses Dokuments gibt es in {encoding} nicht, zum Beispiel: {chars}\n\nDie Datei stattdessen als UTF-8 speichern oder diese Zeichen durch „?“ ersetzen?",
+  "Save as UTF-8": "Als UTF-8 speichern",
+  "Replace with ?": "Durch ? ersetzen",
+  '"{name}" was changed by another program after it was opened. Saving now would overwrite those changes.':
+    "„{name}“ wurde nach dem Öffnen von einem anderen Programm geändert. Speichern würde diese Änderungen überschreiben.",
+  "This document is read-only.": "Dieses Dokument ist schreibgeschützt.",
+  Session: "Sitzung",
+  "The selection scope no longer exists.": "Der Auswahlbereich existiert nicht mehr.",
+  "Select the text to search in first.": "Bitte zuerst den zu durchsuchenden Text markieren.",
+  "Search is not available in large files in {encoding}.": "Suchen ist in großen Dateien in {encoding} nicht verfügbar.",
+  "Unsaved text could not be stored": "Ungespeicherter Text konnte nicht gesichert werden",
+  "Nax-Notepad could not store your unsaved text for recovery:\n{error}\n\nRetry, close and discard it, or cancel to keep the window open and save your work with Save As.":
+    "Nax-Notepad konnte Ihren ungespeicherten Text nicht für die Wiederherstellung sichern:\n{error}\n\nErneut versuchen, schließen und verwerfen, oder abbrechen, um das Fenster offen zu lassen und die Arbeit mit „Speichern unter“ zu sichern.",
+  Retry: "Erneut versuchen",
+  "Close and discard": "Schließen und verwerfen",
 };

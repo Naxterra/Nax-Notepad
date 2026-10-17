@@ -6,6 +6,8 @@ import { languages } from "@codemirror/language-data";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { highlightSelectionMatches } from "@codemirror/search";
 import { Compartment, EditorState, Extension } from "@codemirror/state";
+import { readOnlyGuard } from "./readonly";
+export { systemChange } from "./readonly";
 import {
   crosshairCursor,
   drawSelection,
@@ -87,6 +89,7 @@ export function createState(o: StateOptions): EditorState {
       compartments.indent.of(indentExt(s)),
       compartments.wrap.of(s.wordWrap ? EditorView.lineWrapping : []),
       compartments.readOnly.of(EditorState.readOnly.of(o.readOnly)),
+      readOnlyGuard,
       compartments.indentMarkers.of(s.indentationMarkers ? indentationMarkers({ hideFirstIndent: true }) : []),
       compartments.language.of(o.language),
       compartments.livePreview.of(o.livePreview ? livePreview(o.lpConfig) : []),

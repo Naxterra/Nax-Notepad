@@ -5,12 +5,12 @@ import { LanguageDescription } from "@codemirror/language";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog, message } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { backend, Eol, SessionData, TabMeta } from "./backend";
-import { compartments, createState, languageByName, languageForFile, loadLanguage } from "./editor";
+import { backend, E_EXTERNAL_CHANGE, E_READ_ONLY_ENCODING, E_UNREPRESENTABLE, Eol, errorText, SaveResult, SessionData, TabMeta } from "./backend";
+import { compartments, createState, languageByName, languageForFile, loadLanguage, systemChange } from "./editor";
 import { livePreview, LivePreviewConfig } from "./livepreview";
-import { PagedController, pagedLoad } from "./paged";
+import { PagedController, PagedHost } from "./paged";
 import { settings } from "./settings";
-import { confirm3 } from "./ui/dialogs";
+import { confirm3, toast } from "./ui/dialogs";
 import { t } from "./i18n";
 
 export type TabKind = "memory" | "paged";
@@ -36,6 +36,23 @@ export interface Tab {
   bufferTimer?: number;
   pendingCursor?: { line: number; col: number };
   hexView: boolean;
+  /** Incremented on every change that affects what Save would write. */
+  revision: number;
+  /** Revision that is on disk. */
+  savedRevision: number;
+  /** Saves of this tab run one after another. */
+  saveChain?: Promise<unknown>;
+  /** Why the tab cannot be made editable (shown when the user tries). */
+  lockedReadOnly?: string;
+  /** Disk modification time the user already answered "keep mine" for. */
+  externalAck?: number;
+  /** Last time a background persistence error was shown for this tab. */
+  lastErrorToast?: number;
+}
+
+/** Same file time, also accepting legacy session values stored in whole seconds. */
+function sameMtime(disk: number, known: number): boolean {
+  return disk === known || (known > 0 && known < 1e11 && Math.floor(disk / 1000) === known);
 }
 
 type Listener = () => void;
@@ -100,12 +117,9 @@ export class App {
       const tab = this.active;
       if (!tab) return;
       if (u.docChanged) {
-        const fromLoad = u.transactions.some((t) => t.annotation(pagedLoad));
-        if (!fromLoad) {
-          if (!tab.dirty) {
-            tab.dirty = true;
-            this.emit("tabs");
-          }
+        const userEdit = u.transactions.some((tr) => tr.docChanged && !tr.annotation(systemChange));
+        if (userEdit) {
+          this.noteUserEdit(tab);
           if (tab.kind === "paged") tab.paged?.noteChange();
           else this.scheduleBufferStore(tab);
         }
@@ -132,11 +146,55 @@ export class App {
     };
   }
 
+  /** Record a change that Save must write. */
+  noteUserEdit(tab: Tab): void {
+    tab.revision++;
+    if (!tab.dirty) {
+      tab.dirty = true;
+      this.emit("tabs");
+    }
+  }
+
+  /** Read-only for editing: the tab setting or a window of a large file that cannot be edited. */
+  effectiveReadOnly(tab: Tab): boolean {
+    return tab.readOnly || !!tab.paged?.windowReadOnly;
+  }
+
+  private applyReadOnly(tab: Tab): void {
+    this.dispatchTo(tab, { effects: compartments.readOnly.reconfigure(EditorState.readOnly.of(this.effectiveReadOnly(tab))) });
+    this.emit("status");
+  }
+
+  /** Show a background failure (recovery copy, large-file commit) at most every 30 seconds per tab. */
+  reportBackgroundError(tab: Tab, e: unknown): void {
+    console.warn("background error", tab.name, e);
+    const now = Date.now();
+    if (tab.lastErrorToast && now - tab.lastErrorToast < 30000) return;
+    tab.lastErrorToast = now;
+    toast(t('Could not store "{name}": {error}', { name: tab.name, error: errorText(e) }), 6000);
+  }
+
+  private pagedHost(tab: Tab): PagedHost {
+    return {
+      state: () => (this.active === tab ? this.view.state : tab.state),
+      dispatch: (spec) => this.dispatchTo(tab, spec),
+      view: () => (this.active === tab ? this.view : null),
+      onWindowChanged: () => this.emit("status"),
+      onBackendEdit: () => this.noteUserEdit(tab),
+      onWindowFlags: (f) => {
+        this.applyReadOnly(tab);
+        if (this.active === tab && f.truncated) toast(t("This line is too long to edit and is shown only in part, read-only."), 5000);
+        else if (this.active === tab && f.lossy) toast(t("This part of the file is not valid UTF-8 and is shown read-only."), 5000);
+      },
+      onError: (e) => this.reportBackgroundError(tab, e),
+    };
+  }
+
   private buildState(tab: Tab, text: string, language: Extension, firstLineOffset = 0): EditorState {
     return createState({
       text,
       settings,
-      readOnly: tab.readOnly,
+      readOnly: this.effectiveReadOnly(tab),
       livePreview: tab.livePreview && tab.languageName === "Markdown",
       lpConfig: this.lpConfig(tab),
       language,
@@ -184,6 +242,8 @@ export class App {
       paged: partial.paged ?? null,
       scrollTop: partial.scrollTop ?? 0,
       hexView: false,
+      revision: partial.dirty ? 1 : 0,
+      savedRevision: 0,
     };
     return tab;
   }
@@ -248,27 +308,28 @@ export class App {
       livePreview: restoreOpts?.livePreview ?? settings.livePreviewDefault,
     });
     tab.hexView = restoreOpts?.hexView ?? res.binary;
+    if (res.readOnlyReason === "encoding") {
+      tab.lockedReadOnly = t("Large files in {encoding} can be viewed but not edited yet.", { encoding: res.encoding });
+      if (!this.restoring) toast(t('"{name}" was opened read-only.', { name: res.name }) + " " + tab.lockedReadOnly, 6000);
+    } else if (res.kind === "memory" && res.hadErrors) {
+      tab.readOnly = true;
+      if (!this.restoring)
+        toast(t('"{name}" contains bytes that are not valid {encoding}. It was opened read-only so saving cannot change them. Use the tab menu to allow editing.', { name: res.name, encoding: res.encoding }), 8000);
+    }
     const desc = restoreOpts?.languageName ? languageByName(restoreOpts.languageName) : languageForFile(res.name);
     tab.languageName = desc?.name ?? null;
     const langExt: Extension = desc ? await loadLanguage(desc) : [];
     if (res.kind === "paged") {
-      tab.paged = new PagedController(
-        tabId,
-        res.lineCount ?? 1,
-        () => (this.active === tab ? this.view : null),
-        { onWindowChanged: () => this.emit("status") },
-        () => {
-          if (!tab.dirty) {
-            tab.dirty = true;
-            this.emit("tabs");
-          }
-        }
-      );
+      tab.paged = new PagedController(tabId, res.lineCount ?? 1, this.pagedHost(tab));
       const w = await backend.pagedWindow(tabId, 0, Math.max(500, settings.pagedWindowLines));
       tab.paged.firstLine = w.firstLine;
       tab.paged.count = w.count;
       tab.paged.totalLines = w.totalLines;
-      tab.dirty = w.dirty;
+      tab.paged.windowReadOnly = w.truncated || w.lossy;
+      if (w.dirty) {
+        tab.dirty = true;
+        tab.revision = 1;
+      }
       tab.state = this.buildState(tab, w.text, langExt, 0);
     } else {
       tab.state = this.buildState(tab, res.text ?? "", langExt);
@@ -374,32 +435,109 @@ export class App {
     return state.doc.toString();
   }
 
-  async save(tab: Tab): Promise<boolean> {
+  /** Run the save operations of one tab one after another. */
+  private serial<T>(tab: Tab, fn: () => Promise<T>): Promise<T> {
+    const run = (tab.saveChain ?? Promise.resolve()).then(fn, fn);
+    tab.saveChain = run.catch(() => undefined);
+    return run;
+  }
+
+  save(tab: Tab): Promise<boolean> {
     if (!tab.path) return this.saveAs(tab);
+    const path = tab.path;
+    return this.serial(tab, () => this.writeTab(tab, path, false));
+  }
+
+  /**
+   * Write `tab` to `target`. Only the revision captured before writing is marked as saved:
+   * edits made while the write is in progress keep the tab dirty and protected by recovery.
+   */
+  private async writeTab(tab: Tab, target: string, isSaveAs: boolean, opts: { lossy?: boolean; overwrite?: boolean } = {}): Promise<boolean> {
     try {
+      let rev: number;
+      let r: SaveResult;
       if (tab.kind === "paged" && tab.paged) {
+        rev = tab.revision;
         await tab.paged.commit();
-        const r = await backend.pagedSave(tab.id);
-        tab.mtime = r.mtime;
-        tab.size = r.size;
-        await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine(this.view));
+        r = await backend.pagedSave(tab.id, isSaveAs ? target : undefined, opts.overwrite ?? false);
       } else {
         this.applySaveTransforms(tab);
-        const r = await backend.saveText(tab.path, this.docText(tab), tab.encoding, tab.eol);
-        tab.mtime = r.mtime;
-        tab.size = r.size;
+        rev = tab.revision;
+        r = await backend.saveText(target, this.docText(tab), tab.encoding, tab.eol, opts.lossy ?? false);
       }
-      tab.dirty = false;
-      if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
-      void backend.sessionDropBuffer(tab.id);
+      tab.path = r.path;
+      tab.name = r.name;
+      tab.mtime = r.mtime;
+      tab.size = r.size;
+      tab.externalAck = undefined;
+      if (isSaveAs) tab.untitled = null;
+      if (tab.kind === "paged" && tab.paged) await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
+      this.markSaved(tab, rev);
+      if (isSaveAs) await this.applyLanguage(tab, languageForFile(tab.name));
       this.emit("tabs");
       this.emit("status");
       this.scheduleSessionSave();
       return true;
     } catch (e) {
-      await message(String(e), { title: t("Save failed"), kind: "error" });
+      return this.handleSaveError(tab, target, isSaveAs, e, opts);
+    }
+  }
+
+  private markSaved(tab: Tab, rev: number): void {
+    tab.savedRevision = rev;
+    const clean = tab.revision === rev;
+    tab.dirty = !clean;
+    if (clean) {
+      if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
+      tab.bufferTimer = undefined;
+      void backend.sessionDropBuffer(tab.id);
+    } else if (tab.kind === "memory") {
+      this.scheduleBufferStore(tab);
+    }
+  }
+
+  private async handleSaveError(tab: Tab, target: string, isSaveAs: boolean, e: unknown, opts: { lossy?: boolean; overwrite?: boolean }): Promise<boolean> {
+    const msg = errorText(e);
+    if (msg.startsWith(E_UNREPRESENTABLE)) {
+      let info = { encoding: tab.encoding, chars: "", count: 0 };
+      try {
+        info = JSON.parse(msg.slice(E_UNREPRESENTABLE.length));
+      } catch {
+        /* keep defaults */
+      }
+      const r = await confirm3(
+        t("Characters cannot be saved in {encoding}", { encoding: info.encoding }),
+        t('{count} characters in this document do not exist in {encoding}, for example: {chars}\n\nSave the file as UTF-8 instead, or replace those characters with "?"?', info),
+        [t("Save as UTF-8"), t("Replace with ?")]
+      );
+      if (r === "yes") {
+        tab.encoding = "UTF-8";
+        this.emit("status");
+        return this.writeTab(tab, target, isSaveAs, opts);
+      }
+      if (r === "no") return this.writeTab(tab, target, isSaveAs, { ...opts, lossy: true });
       return false;
     }
+    if (msg.startsWith(E_EXTERNAL_CHANGE)) {
+      const r = await confirm3(
+        t("File changed on disk"),
+        t('"{name}" was changed by another program after it was opened. Saving now would overwrite those changes.', { name: tab.name }),
+        [t("Save As…"), t("Reload")]
+      );
+      if (r === "yes") {
+        const other = await saveDialog({ defaultPath: tab.path ?? tab.name, title: t("Save As") });
+        if (!other) return false;
+        return this.writeTab(tab, other, true, opts);
+      }
+      if (r === "no") await this.reload(tab);
+      return false;
+    }
+    if (msg.startsWith(E_READ_ONLY_ENCODING)) {
+      await message(tab.lockedReadOnly ?? t("This document is read-only."), { title: t("Save failed"), kind: "error" });
+      return false;
+    }
+    await message(msg, { title: t("Save failed"), kind: "error" });
+    return false;
   }
 
   private applySaveTransforms(tab: Tab): void {
@@ -425,35 +563,7 @@ export class App {
       title: t("Save As"),
     });
     if (!target) return false;
-    try {
-      if (tab.kind === "paged" && tab.paged) {
-        await tab.paged.commit();
-        const r = await backend.pagedSave(tab.id, target);
-        tab.path = r.path;
-        tab.name = r.name;
-        tab.mtime = r.mtime;
-        tab.size = r.size;
-        await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine(this.view));
-      } else {
-        this.applySaveTransforms(tab);
-        const r = await backend.saveText(target, this.docText(tab), tab.encoding, tab.eol);
-        tab.path = r.path;
-        tab.name = r.name;
-        tab.mtime = r.mtime;
-        tab.size = r.size;
-      }
-      tab.untitled = null;
-      tab.dirty = false;
-      void backend.sessionDropBuffer(tab.id);
-      await this.applyLanguage(tab, languageForFile(tab.name));
-      this.emit("tabs");
-      this.emit("status");
-      this.scheduleSessionSave();
-      return true;
-    } catch (e) {
-      await message(String(e), { title: t("Save failed"), kind: "error" });
-      return false;
-    }
+    return this.serial(tab, () => this.writeTab(tab, target, true));
   }
 
   async saveAll(): Promise<void> {
@@ -469,13 +579,16 @@ export class App {
   async reload(tab: Tab): Promise<void> {
     if (!tab.path) return;
     if (tab.kind === "paged" && tab.paged) {
+      tab.paged.resetRevisions();
       await backend.pagedClose(tab.id);
       const res = await backend.openPath(tab.id, tab.path, true);
       tab.paged.totalLines = res.lineCount ?? 1;
       tab.mtime = res.mtime;
       tab.size = res.size;
-      tab.dirty = false;
-      await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine(this.view));
+      tab.encoding = res.encoding;
+      tab.eol = res.eol;
+      tab.paged.scopeActive = false;
+      await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
     } else {
       const res = await backend.openPath(tab.id, tab.path);
       const state = tab === this.active ? this.view.state : tab.state;
@@ -483,15 +596,17 @@ export class App {
       this.dispatchTo(tab, {
         changes: { from: 0, to: state.doc.length, insert: res.text ?? "" },
         selection: { anchor: Math.min(head, (res.text ?? "").length) },
-        annotations: [Transaction.addToHistory.of(true)],
+        annotations: [systemChange.of(true), Transaction.addToHistory.of(true)],
       });
       tab.encoding = res.encoding;
       tab.eol = res.eol;
       tab.mtime = res.mtime;
       tab.size = res.size;
-      tab.dirty = false;
-      void backend.sessionDropBuffer(tab.id);
     }
+    tab.savedRevision = tab.revision;
+    tab.dirty = false;
+    tab.externalAck = undefined;
+    void backend.sessionDropBuffer(tab.id);
     this.emit("tabs");
     this.emit("status");
   }
@@ -499,18 +614,26 @@ export class App {
   private checking = false;
   async checkExternalChange(): Promise<void> {
     const tab = this.active;
-    if (!tab || !tab.path || this.checking || tab.kind === "paged") return;
+    if (!tab || !tab.path || this.checking) return;
     this.checking = true;
     try {
-      const exists = await backend.pathExists(tab.path);
-      if (!exists) return;
-      const mtime = await backend.fileMtime(tab.path);
-      if (mtime === tab.mtime) return;
+      let changed: boolean;
+      let mtime: number;
+      if (tab.kind === "paged") {
+        const st = await backend.pagedDiskState(tab.id);
+        changed = st.changed;
+        mtime = st.mtime;
+      } else {
+        if (!(await backend.pathExists(tab.path))) return;
+        mtime = await backend.fileMtime(tab.path);
+        changed = !sameMtime(mtime, tab.mtime);
+      }
+      if (!changed || tab.externalAck === mtime) return;
       if (!tab.dirty && settings.autoReloadExternal) {
         await this.reload(tab);
         return;
       }
-      tab.mtime = mtime; // ask once per change
+      tab.externalAck = mtime; // ask once per change
       const r = await confirm3(t("File changed on disk"), t('"{name}" was modified outside Nax-Notepad.\nReload it and lose your unsaved changes?', { name: tab.name }), [t("Reload"), t("Keep mine")]);
       if (r === "yes") await this.reload(tab);
     } catch {
@@ -527,21 +650,31 @@ export class App {
   }
 
   setEncoding(tab: Tab, enc: string): void {
+    if (tab.kind !== "memory") return;
     tab.encoding = enc;
-    if (tab.kind === "memory") {
-      tab.dirty = true;
-      this.scheduleBufferStore(tab);
-    }
+    this.noteUserEdit(tab);
+    this.scheduleBufferStore(tab);
     this.emit("tabs");
     this.emit("status");
     this.scheduleSessionSave();
   }
 
-  setEol(tab: Tab, eol: Eol): void {
+  async setEol(tab: Tab, eol: Eol): Promise<void> {
+    if (tab.lockedReadOnly) {
+      toast(tab.lockedReadOnly);
+      return;
+    }
+    if (tab.kind === "paged") {
+      try {
+        await backend.pagedSetEol(tab.id, eol);
+      } catch (e) {
+        toast(errorText(e));
+        return;
+      }
+    }
     tab.eol = eol;
-    tab.dirty = true;
-    if (tab.kind === "paged") void backend.pagedSetEol(tab.id, eol);
-    else this.scheduleBufferStore(tab);
+    this.noteUserEdit(tab);
+    if (tab.kind === "memory") this.scheduleBufferStore(tab);
     this.emit("tabs");
     this.emit("status");
     this.scheduleSessionSave();
@@ -563,9 +696,12 @@ export class App {
   }
 
   setReadOnly(tab: Tab, ro: boolean): void {
+    if (!ro && tab.lockedReadOnly) {
+      toast(tab.lockedReadOnly);
+      return;
+    }
     tab.readOnly = ro;
-    this.dispatchTo(tab, { effects: compartments.readOnly.reconfigure(EditorState.readOnly.of(ro)) });
-    this.emit("status");
+    this.applyReadOnly(tab);
   }
 
   togglePinned(tab: Tab): void {
@@ -627,7 +763,7 @@ export class App {
     tab.bufferTimer = window.setTimeout(() => {
       tab.bufferTimer = undefined;
       if (!tab.dirty || tab.kind !== "memory") return;
-      void backend.sessionStoreBuffer(tab.id, this.docText(tab)).catch((e) => console.warn("buffer store failed", e));
+      backend.sessionStoreBuffer(tab.id, this.docText(tab)).catch((e) => this.reportBackgroundError(tab, e));
     }, delay);
   }
 
@@ -670,7 +806,8 @@ export class App {
     };
   }
 
-  async saveSessionNow(): Promise<void> {
+  /** Write the session file. Background saves only log failures; `strict` rethrows them. */
+  async saveSessionNow(strict = false): Promise<void> {
     if (this.sessionTimer) {
       clearTimeout(this.sessionTimer);
       this.sessionTimer = undefined;
@@ -680,20 +817,41 @@ export class App {
       active: this.active?.id ?? null,
       next_untitled: this.nextUntitled,
     };
-    await backend.sessionSave(data).catch((e) => console.warn("session save failed", e));
+    try {
+      await backend.sessionSave(data);
+    } catch (e) {
+      if (strict) throw e;
+      console.warn("session save failed", e);
+    }
   }
 
-  /** Flush unsaved buffers immediately (used before the window closes). */
+  /**
+   * Store everything needed to restore unsaved work (used before the window closes or the
+   * page reloads). Rejects, naming the affected tabs, if anything could not be stored.
+   */
   async flushAll(): Promise<void> {
-    for (const t of this.tabs) {
-      if (t.bufferTimer) {
-        clearTimeout(t.bufferTimer);
-        t.bufferTimer = undefined;
+    const errors: string[] = [];
+    for (const tab of this.tabs) {
+      if (tab.bufferTimer) {
+        clearTimeout(tab.bufferTimer);
+        tab.bufferTimer = undefined;
       }
-      if (t.dirty && t.kind === "memory") await backend.sessionStoreBuffer(t.id, this.docText(t)).catch(() => undefined);
-      if (t.kind === "paged" && t.paged) await t.paged.commit().catch(() => undefined);
+      try {
+        if (tab.dirty && tab.kind === "memory") await backend.sessionStoreBuffer(tab.id, this.docText(tab));
+        if (tab.kind === "paged" && tab.paged) {
+          await tab.paged.commit();
+          if (tab.dirty) await backend.pagedStoreEdits(tab.id);
+        }
+      } catch (e) {
+        errors.push(`${tab.name}: ${errorText(e)}`);
+      }
     }
-    await this.saveSessionNow();
+    try {
+      await this.saveSessionNow(true);
+    } catch (e) {
+      errors.push(`${t("Session")}: ${errorText(e)}`);
+    }
+    if (errors.length) throw new Error(errors.join("\n"));
   }
 
   async restoreSession(): Promise<boolean> {

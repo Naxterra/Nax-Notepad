@@ -126,8 +126,39 @@ pub fn decode(bytes: &[u8]) -> Decoded {
     }
 }
 
+/// Why an encode failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeError {
+    UnknownEncoding(String),
+    /// Characters the target encoding cannot represent (first few distinct ones) and how many
+    /// characters were affected in total.
+    Unrepresentable { encoding: String, chars: Vec<char>, count: usize },
+}
+
+/// Prefix of the error string sent to the frontend for an unrepresentable-character failure;
+/// the rest is JSON `{ "encoding", "chars", "count" }`.
+pub const E_UNREPRESENTABLE: &str = "E_UNREPRESENTABLE:";
+
+impl EncodeError {
+    pub fn to_message(&self) -> String {
+        match self {
+            EncodeError::UnknownEncoding(l) => format!("Unknown encoding: {l}"),
+            EncodeError::Unrepresentable { encoding, chars, count } => format!(
+                "{E_UNREPRESENTABLE}{}",
+                serde_json::json!({ "encoding": encoding, "chars": chars.iter().collect::<String>(), "count": count })
+            ),
+        }
+    }
+}
+
 /// Encode `text` (which uses "\n" line separators) into bytes using `encoding` and `eol`.
+/// Fails instead of silently altering characters the encoding cannot represent.
 pub fn encode(text: &str, encoding: &str, eol: Eol) -> Result<Vec<u8>, String> {
+    encode_with(text, encoding, eol, false).map_err(|e| e.to_message())
+}
+
+/// Like [`encode`]; with `lossy` set, unrepresentable characters become `?` instead of an error.
+pub fn encode_with(text: &str, encoding: &str, eol: Eol, lossy: bool) -> Result<Vec<u8>, EncodeError> {
     let normalized: std::borrow::Cow<str> = if eol == Eol::Lf {
         std::borrow::Cow::Borrowed(text)
     } else {
@@ -155,9 +186,39 @@ pub fn encode(text: &str, encoding: &str, eol: Eol) -> Result<Vec<u8>, String> {
         }
         label => {
             let enc = Encoding::for_label(label.as_bytes())
-                .ok_or_else(|| format!("Unknown encoding: {label}"))?;
-            let (cow, _, _) = enc.encode(&normalized);
-            out.extend_from_slice(&cow);
+                .ok_or_else(|| EncodeError::UnknownEncoding(label.to_string()))?;
+            let mut encoder = enc.new_encoder();
+            let mut src: &str = &normalized;
+            let mut bad: Vec<char> = Vec::new();
+            let mut bad_count = 0usize;
+            loop {
+                let need = encoder
+                    .max_buffer_length_from_utf8_without_replacement(src.len())
+                    .unwrap_or(src.len() * 4 + 16);
+                out.reserve(need.max(16));
+                let (result, read) = encoder.encode_from_utf8_to_vec_without_replacement(src, &mut out, true);
+                src = &src[read..];
+                match result {
+                    encoding_rs::EncoderResult::InputEmpty => break,
+                    encoding_rs::EncoderResult::OutputFull => continue,
+                    encoding_rs::EncoderResult::Unmappable(c) => {
+                        bad_count += 1;
+                        if bad.len() < 10 && !bad.contains(&c) {
+                            bad.push(c);
+                        }
+                        if lossy {
+                            out.push(b'?');
+                        }
+                    }
+                }
+            }
+            if bad_count > 0 && !lossy {
+                return Err(EncodeError::Unrepresentable {
+                    encoding: enc.name().to_string(),
+                    chars: bad,
+                    count: bad_count,
+                });
+            }
         }
     }
     Ok(out)
@@ -215,6 +276,18 @@ mod tests {
         assert_eq!(d.encoding, "windows-1252");
         let back = encode(&d.text, "windows-1252", Eol::Lf).unwrap();
         assert_eq!(back, bytes);
+    }
+
+    #[test]
+    fn encoding_rejects_unrepresentable_characters() {
+        let err = encode("Hello 😀 and 漢", "windows-1252", Eol::Lf).unwrap_err();
+        assert!(err.starts_with(E_UNREPRESENTABLE), "{err}");
+        assert!(err.contains('😀') && err.contains('漢') && err.contains("\"count\":2"), "{err}");
+        // An explicitly confirmed lossy save replaces them with '?'.
+        let bytes = encode_with("Hello 😀", "windows-1252", Eol::Lf, true).unwrap();
+        assert_eq!(bytes, b"Hello ?");
+        // Representable text is unaffected.
+        assert_eq!(encode("Grüße €", "windows-1252", Eol::Lf).unwrap(), b"Gr\xfc\xdfe \x80");
     }
 
     #[test]

@@ -7,12 +7,12 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { App } from "./app";
-import { backend } from "./backend";
+import { backend, errorText } from "./backend";
 import { buildCommands, installKeybindings } from "./commands";
 import { compartments, indentExt, lineNumbersExt } from "./editor";
 import { loadSettings, onSettingsChange, settings, updateSettings } from "./settings";
 import { applyTheme, onSystemThemeChange } from "./theme";
-import { contextMenu, h, isModalOpen } from "./ui/dialogs";
+import { confirm3, contextMenu, h, isModalOpen, message } from "./ui/dialogs";
 import { copySelection, deleteSelection, pasteClipboard, selectAllIn } from "./clipboard";
 import { redo, undo } from "@codemirror/commands";
 import { t } from "./i18n";
@@ -158,14 +158,30 @@ async function main(): Promise<void> {
   // Flush unsaved state before the window closes
   const win = getCurrentWindow();
   let closing = false;
+  // Close only after unsaved work is stored for recovery; on failure the user decides.
   void win.onCloseRequested(async (ev) => {
     if (closing) return;
     ev.preventDefault();
     closing = true;
     try {
-      await app.flushAll();
-    } finally {
+      for (;;) {
+        try {
+          await app.flushAll();
+          break;
+        } catch (e) {
+          const r = await confirm3(
+            t("Unsaved text could not be stored"),
+            t("Nax-Notepad could not store your unsaved text for recovery:\n{error}\n\nRetry, close and discard it, or cancel to keep the window open and save your work with Save As.", { error: errorText(e) }),
+            [t("Retry"), t("Close and discard")]
+          );
+          if (r === "yes") continue;
+          if (r === "no") break;
+          return; // keep the window open
+        }
+      }
       await win.destroy();
+    } finally {
+      closing = false;
     }
   });
 
@@ -189,7 +205,10 @@ async function main(): Promise<void> {
 
   // Language change: persist everything, then reload the UI with the new strings
   window.addEventListener("nax:reload", () => {
-    void app.flushAll().then(() => location.reload());
+    app
+      .flushAll()
+      .then(() => location.reload())
+      .catch((e) => void message(t("Unsaved text could not be stored"), errorText(e)));
   });
   scheduleStartupCheck();
 

@@ -2,7 +2,7 @@ mod paged;
 mod session;
 mod textfmt;
 
-use paged::{Match, PagedDoc, Piece};
+use paged::{DiskState, Match, PagedDoc, Piece};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,6 +32,10 @@ struct OpenResult {
     line_count: Option<usize>,
     had_errors: bool,
     read_only: bool,
+    /// Why the document is read-only beyond the file attribute ("encoding" for large files in
+    /// encodings the paged editor cannot write).
+    read_only_reason: Option<String>,
+    /// Modification time in milliseconds.
     mtime: u64,
     /// True when the first 8 KB contain NUL bytes (opened in hex view by default).
     binary: bool,
@@ -48,7 +52,7 @@ fn mtime_of(p: &Path) -> u64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -75,23 +79,20 @@ async fn open_path(
     };
     if size >= PAGED_THRESHOLD || force_paged.unwrap_or(false) {
         let doc = PagedDoc::open(&p)?;
+        let editable = doc.is_editable();
         let res = OpenResult {
             kind: "paged".into(),
             path: p.display().to_string(),
             name: file_name(&p),
             text: None,
-            encoding: match doc.bom {
-                textfmt::Bom::Utf8 => "UTF-8-BOM".into(),
-                textfmt::Bom::Utf16Le => "UTF-16LE (raw)".into(),
-                textfmt::Bom::Utf16Be => "UTF-16BE (raw)".into(),
-                textfmt::Bom::None => "UTF-8".into(),
-            },
+            encoding: doc.encoding_label().to_string(),
             eol: doc.eol,
             size,
             line_count: Some(doc.line_count()),
             had_errors: false,
-            read_only,
-            mtime: doc.file_mtime,
+            read_only: read_only || !editable,
+            read_only_reason: if editable { None } else { Some("encoding".into()) },
+            mtime: doc.file_mtime_ms(),
             binary,
         };
         state.paged.lock().insert(id, doc);
@@ -110,6 +111,7 @@ async fn open_path(
         line_count: None,
         had_errors: dec.had_errors,
         read_only,
+        read_only_reason: None,
         mtime: mtime_of(&p),
         binary,
     })
@@ -130,9 +132,11 @@ async fn save_text(
     text: String,
     encoding: String,
     eol: Eol,
+    lossy: Option<bool>,
 ) -> Result<SaveResult, String> {
     let p = PathBuf::from(&path);
-    let bytes = textfmt::encode(&text, &encoding, eol)?;
+    // Refuses characters the encoding cannot represent unless the user confirmed a lossy save.
+    let bytes = textfmt::encode_with(&text, &encoding, eol, lossy.unwrap_or(false)).map_err(|e| e.to_message())?;
     if let Some(dir) = p.parent() {
         if !dir.as_os_str().is_empty() && !dir.exists() {
             std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create folder: {e}"))?;
@@ -167,6 +171,10 @@ struct Window {
     count: usize,
     total_lines: usize,
     dirty: bool,
+    /// One line was longer than the window limit and only its start is included.
+    truncated: bool,
+    /// The text contained bytes invalid in the document's encoding.
+    lossy: bool,
 }
 
 #[tauri::command]
@@ -178,13 +186,15 @@ async fn paged_window(
 ) -> Result<Window, String> {
     let docs = state.paged.lock();
     let doc = docs.get(&id).ok_or("document not open")?;
-    let (text, first, n) = doc.read_lines(first_line, count);
+    let w = doc.read_window(first_line, count, paged::MAX_WINDOW_BYTES);
     Ok(Window {
-        text,
-        first_line: first,
-        count: n,
+        text: w.text,
+        first_line: w.first,
+        count: w.count,
         total_lines: doc.line_count(),
         dirty: doc.is_dirty(),
+        truncated: w.truncated,
+        lossy: w.lossy,
     })
 }
 
@@ -198,7 +208,7 @@ async fn paged_commit(
 ) -> Result<usize, String> {
     let mut docs = state.paged.lock();
     let doc = docs.get_mut(&id).ok_or("document not open")?;
-    Ok(doc.replace_lines(first_line, count, &text))
+    doc.replace_lines(first_line, count, &text)
 }
 
 #[tauri::command]
@@ -206,14 +216,15 @@ async fn paged_save(
     state: State<'_, AppState>,
     id: String,
     path: Option<String>,
+    overwrite_external: Option<bool>,
 ) -> Result<SaveResult, String> {
     let mut docs = state.paged.lock();
     let doc = docs.get_mut(&id).ok_or("document not open")?;
     let target = path.map(PathBuf::from).unwrap_or_else(|| doc.path.clone());
-    doc.save_to(&target)?;
+    doc.save_to_opts(&target, overwrite_external.unwrap_or(false))?;
     Ok(SaveResult {
-        size: doc.file_len,
-        mtime: doc.file_mtime,
+        size: doc.file_len(),
+        mtime: doc.file_mtime_ms(),
         name: file_name(&target),
         path: target.display().to_string(),
     })
@@ -228,8 +239,125 @@ fn paged_close(state: State<'_, AppState>, id: String) {
 fn paged_set_eol(state: State<'_, AppState>, id: String, eol: Eol) -> Result<(), String> {
     let mut docs = state.paged.lock();
     let doc = docs.get_mut(&id).ok_or("document not open")?;
+    if !doc.is_editable() {
+        return Err(format!("{}{}", paged::E_READ_ONLY_ENCODING, doc.encoding_label()));
+    }
+    // Takes effect on save: the whole document is converted to this line ending.
     doc.eol = eol;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct DiskCheck {
+    changed: bool,
+    mtime: u64,
+}
+
+/// Whether the backing file of a paged document changed on disk since it was opened or saved.
+#[tauri::command]
+async fn paged_disk_state(state: State<'_, AppState>, id: String) -> Result<DiskCheck, String> {
+    let docs = state.paged.lock();
+    let doc = docs.get(&id).ok_or("document not open")?;
+    let now = DiskState::read(&doc.path).ok();
+    Ok(DiskCheck {
+        changed: now.map_or(true, |n| n != doc.disk_state()),
+        mtime: now.map_or(0, |n| n.mtime_ms()),
+    })
+}
+
+/// Set the "in selection only" range of a paged document from window coordinates
+/// (absolute line, byte column). Returns false when the range is empty.
+#[tauri::command]
+async fn paged_set_scope(
+    state: State<'_, AppState>,
+    id: String,
+    start_line: usize,
+    start_col: usize,
+    end_line: usize,
+    end_col: usize,
+) -> Result<bool, String> {
+    let mut docs = state.paged.lock();
+    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    let a = doc.line_start(start_line) + start_col;
+    let b = doc.line_start(end_line) + end_col;
+    Ok(doc.set_scope(a, b))
+}
+
+#[tauri::command]
+async fn paged_clear_scope(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut docs = state.paged.lock();
+    if let Some(doc) = docs.get_mut(&id) {
+        doc.clear_scope();
+    }
+    Ok(())
+}
+
+/// Translate JavaScript replacement syntax ($&, $1..$99, $<name>, $$) into the regex crate's
+/// expansion syntax, so small and large files accept the same replacement strings.
+fn js_to_rust_replacement(s: &str, groups: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c != '$' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let Some(&n) = chars.get(i + 1) else {
+            out.push_str("$$");
+            i += 1;
+            continue;
+        };
+        if n == '$' {
+            out.push_str("$$");
+            i += 2;
+        } else if n == '&' {
+            out.push_str("${0}");
+            i += 2;
+        } else if n.is_ascii_digit() {
+            let two: Option<usize> = chars
+                .get(i + 1..i + 3)
+                .filter(|d| d.iter().all(|c| c.is_ascii_digit()))
+                .map(|d| d.iter().collect::<String>().parse().unwrap());
+            let one = n.to_digit(10).unwrap() as usize;
+            if let Some(t) = two.filter(|&t| t >= 1 && t < groups) {
+                out.push_str(&format!("${{{t}}}"));
+                i += 3;
+            } else if one >= 1 && one < groups {
+                out.push_str(&format!("${{{one}}}"));
+                i += 2;
+            } else {
+                out.push_str("$$");
+                i += 1;
+            }
+        } else if n == '<' {
+            match chars[i + 2..].iter().position(|&c| c == '>') {
+                Some(end) => {
+                    let name: String = chars[i + 2..i + 2 + end].iter().collect();
+                    out.push_str(&format!("${{{name}}}"));
+                    i += 3 + end;
+                }
+                None => {
+                    out.push_str("$$");
+                    i += 1;
+                }
+            }
+        } else {
+            out.push_str("$$");
+            i += 1;
+        }
+    }
+    out
+}
+
+fn ensure_searchable(doc: &PagedDoc) -> Result<(), String> {
+    if doc.is_editable() {
+        Ok(())
+    } else {
+        Err(format!("E_SEARCH_ENCODING:{}", doc.encoding_label()))
+    }
 }
 
 fn build_regex(pattern: &str, regex: bool, case_sensitive: bool, whole_word: bool) -> Result<regex::bytes::Regex, String> {
@@ -265,20 +393,23 @@ async fn paged_find(
     from_line: usize,
     from_col: usize,
     backwards: bool,
+    scoped: Option<bool>,
 ) -> Result<Option<Match>, String> {
     let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
     let docs = state.paged.lock();
     let doc = docs.get(&id).ok_or("document not open")?;
-    let from = doc.line_start(from_line) + from_col;
-    Ok(doc.find(&re, from, backwards))
+    ensure_searchable(doc)?;
+    let from = doc.line_start(from_line).saturating_add(from_col);
+    doc.find_in(&re, from, backwards, scoped.unwrap_or(false))
 }
 
 #[tauri::command]
-async fn paged_count(state: State<'_, AppState>, id: String, opts: FindOpts) -> Result<usize, String> {
+async fn paged_count(state: State<'_, AppState>, id: String, opts: FindOpts, scoped: Option<bool>) -> Result<usize, String> {
     let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
     let docs = state.paged.lock();
     let doc = docs.get(&id).ok_or("document not open")?;
-    Ok(doc.count_matches(&re, 1_000_000))
+    ensure_searchable(doc)?;
+    doc.count_in(&re, 1_000_000, scoped.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -287,16 +418,17 @@ async fn paged_replace_all(
     id: String,
     opts: FindOpts,
     replacement: String,
+    scoped: Option<bool>,
 ) -> Result<usize, String> {
     let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
     let rep = if opts.regex {
-        replacement
+        js_to_rust_replacement(&replacement, re.captures_len())
     } else {
         replacement.replace('$', "$$")
     };
     let mut docs = state.paged.lock();
     let doc = docs.get_mut(&id).ok_or("document not open")?;
-    Ok(doc.replace_all(&re, rep.as_bytes()))
+    doc.replace_all_in(&re, rep.as_bytes(), scoped.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -309,20 +441,30 @@ async fn paged_store_edits(state: State<'_, AppState>, id: String) -> Result<(),
         let _ = std::fs::remove_file(&add_path);
         return Ok(());
     }
-    let (pieces, add) = doc.export_edits();
+    if !doc.can_log_edits() {
+        // Backed by the temporary copy of a failed save; a log against the original would be wrong.
+        return Ok(());
+    }
+    let (pieces, add) = doc.edits();
     #[derive(Serialize)]
     struct Log<'a> {
         file_len: u64,
+        /// Seconds, kept for logs written by older versions.
         file_mtime: u64,
+        disk: DiskState,
+        eol: Eol,
         pieces: &'a [Piece],
     }
+    let disk = doc.disk_state();
     let log = Log {
-        file_len: doc.file_len,
-        file_mtime: doc.file_mtime,
-        pieces: &pieces,
+        file_len: disk.len,
+        file_mtime: disk.mtime_ns / 1_000_000_000,
+        disk,
+        eol: doc.eol,
+        pieces,
     };
     std::fs::create_dir_all(session::buffers_dir()).map_err(|e| e.to_string())?;
-    session::write_atomic(&add_path, &add)?;
+    session::write_atomic(&add_path, add)?;
     session::write_atomic(&pieces_path, &serde_json::to_vec(&log).map_err(|e| e.to_string())?)
 }
 
@@ -339,17 +481,27 @@ async fn paged_restore(state: State<'_, AppState>, id: String, path: String) -> 
     struct Log {
         file_len: u64,
         file_mtime: u64,
+        #[serde(default)]
+        disk: Option<DiskState>,
+        #[serde(default)]
+        eol: Option<Eol>,
         pieces: Vec<Piece>,
     }
     if let (Ok(pj), Ok(add)) = (std::fs::read(&pieces_path), std::fs::read(&add_path)) {
         if let Ok(log) = serde_json::from_slice::<Log>(&pj) {
             let mut docs = state.paged.lock();
             if let Some(doc) = docs.get_mut(&id) {
-                if log.file_len == doc.file_len && log.file_mtime == doc.file_mtime {
-                    if doc.import_edits(log.pieces, add).is_ok() {
-                        res.line_count = Some(doc.line_count());
-                        res.had_errors = false;
+                let disk = doc.disk_state();
+                let unchanged = match log.disk {
+                    Some(d) => d == disk,
+                    None => log.file_len == disk.len && log.file_mtime == disk.mtime_ns / 1_000_000_000,
+                };
+                if unchanged && doc.is_editable() && doc.import_edits(log.pieces, add).is_ok() {
+                    if let Some(eol) = log.eol {
+                        doc.eol = eol;
                     }
+                    res.line_count = Some(doc.line_count());
+                    res.had_errors = false;
                 }
             }
         }
@@ -603,6 +755,9 @@ pub fn run() {
             paged_save,
             paged_close,
             paged_set_eol,
+            paged_disk_state,
+            paged_set_scope,
+            paged_clear_scope,
             paged_find,
             paged_count,
             paged_replace_all,
@@ -624,4 +779,24 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nax-Notepad");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::js_to_rust_replacement;
+
+    #[test]
+    fn replacement_syntax_matches_javascript() {
+        assert_eq!(js_to_rust_replacement("$&!", 1), "${0}!");
+        assert_eq!(js_to_rust_replacement("$1-$2", 3), "${1}-${2}");
+        assert_eq!(js_to_rust_replacement("$12", 13), "${12}");
+        assert_eq!(js_to_rust_replacement("$12", 2), "${1}2");
+        assert_eq!(js_to_rust_replacement("$<word>", 2), "${word}");
+        assert_eq!(js_to_rust_replacement("$$ and $ and $9", 1), "$$ and $$ and $$9");
+        let re = regex::bytes::Regex::new(r"(?P<w>\w+)@(\w+)").unwrap();
+        let caps = re.captures(b"user@host").unwrap();
+        let mut out = Vec::new();
+        caps.expand(js_to_rust_replacement("$2 <- $<w> ($&) $$", re.captures_len()).as_bytes(), &mut out);
+        assert_eq!(out, b"host <- user (user@host) $");
+    }
 }

@@ -3,8 +3,9 @@ import { SearchQuery } from "@codemirror/search";
 import { EditorSelection } from "@codemirror/state";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { App } from "../app";
-import { backend, FileHit, FindOpts } from "../backend";
-import { setQuery } from "../searchhl";
+import { backend, E_NO_SCOPE, E_SEARCH_ENCODING, errorText, FileHit, FindOpts } from "../backend";
+import { replacementAt, stickyRegex } from "../replace";
+import { searchScope, setQuery, setSearchScope } from "../searchhl";
 import { h, toast } from "./dialogs";
 import { t } from "../i18n";
 
@@ -34,7 +35,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     regex: false,
     inSelection: false,
   };
-  const makeToggle = (key: keyof typeof toggles, label: string, title: string) => {
+  const makeToggle = (key: "caseSensitive" | "wholeWord" | "regex", label: string, title: string) => {
     const b = h("button", { class: "find-toggle", title, tabindex: "-1" }, label);
     b.addEventListener("click", () => {
       toggles[key] = !toggles[key];
@@ -46,7 +47,9 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   const tCase = makeToggle("caseSensitive", "Aa", t("Match case (Alt+C)"));
   const tWord = makeToggle("wholeWord", "ab", t("Whole word (Alt+W)"));
   const tRegex = makeToggle("regex", ".*", t("Regular expression (Alt+R)"));
-  const tSel = makeToggle("inSelection", "≡", t("In selection only"));
+  // "In selection only" captures the selection once as a fixed scope (see searchScope).
+  const tSel = h("button", { class: "find-toggle", title: t("In selection only"), tabindex: "-1" }, "≡");
+  tSel.addEventListener("click", () => void toggleScope());
 
   const btnPrev = h("button", { class: "btn small", title: t("Previous (Shift+F3)"), tabindex: "-1", click: () => prev() }, "↑");
   const btnNext = h("button", { class: "btn small", title: t("Next (F3)"), tabindex: "-1", click: () => next() }, "↓");
@@ -105,10 +108,71 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   };
   app.on("active", pushQuery);
 
-  const scope = () => {
-    const sel = app.view.state.selection.main;
-    return toggles.inSelection && !sel.empty ? { from: sel.from, to: sel.to } : { from: 0, to: app.view.state.doc.length };
+  const setScopeToggle = (on: boolean) => {
+    toggles.inSelection = on;
+    tSel.classList.toggle("on", on);
   };
+
+  /** Range searched in a small file: the fixed scope, the whole document, or null if the scope is gone. */
+  const scope = (): { from: number; to: number } | null => {
+    if (!toggles.inSelection) return { from: 0, to: app.view.state.doc.length };
+    return app.view.state.field(searchScope, false) ?? null;
+  };
+
+  function scopeLost(): void {
+    setScopeToggle(false);
+    app.view.dispatch({ effects: setSearchScope.of(null) });
+    status.textContent = t("The selection scope no longer exists.");
+  }
+
+  async function toggleScope(): Promise<void> {
+    const tab = app.active;
+    if (!tab) return;
+    if (toggles.inSelection) {
+      setScopeToggle(false);
+      if (tab.kind === "paged" && tab.paged) await tab.paged.clearScope().catch(() => undefined);
+      else app.view.dispatch({ effects: setSearchScope.of(null) });
+      pushQuery();
+      return;
+    }
+    if (tab.kind === "paged" && tab.paged) {
+      const ok = await tab.paged.setScope().catch((e) => {
+        status.textContent = errorText(e);
+        return false;
+      });
+      if (!ok) {
+        toast(t("Select the text to search in first."));
+        return;
+      }
+    } else {
+      const sel = app.view.state.selection.main;
+      if (sel.empty) {
+        toast(t("Select the text to search in first."));
+        return;
+      }
+      app.view.dispatch({ effects: setSearchScope.of({ from: sel.from, to: sel.to }) });
+    }
+    setScopeToggle(true);
+    pushQuery();
+  }
+
+  // Show the scope state of the tab that becomes active.
+  app.on("active", () => {
+    const tab = app.active;
+    const on = !!tab && (tab.kind === "paged" ? !!tab.paged?.scopeActive : !!app.view.state.field(searchScope, false));
+    setScopeToggle(on);
+  });
+
+  /** Messages for errors returned by large-file search operations. */
+  function pagedError(e: unknown): void {
+    const msg = errorText(e);
+    if (msg.startsWith(E_NO_SCOPE)) {
+      if (app.active?.paged) app.active.paged.scopeActive = false;
+      scopeLost();
+    } else if (msg.startsWith(E_SEARCH_ENCODING)) {
+      status.textContent = t("Search is not available in large files in {encoding}.", { encoding: msg.slice(E_SEARCH_ENCODING.length) });
+    } else status.textContent = msg;
+  }
 
   function findMemory(backwards: boolean, fromSelEnd = true): boolean {
     const q = query();
@@ -116,6 +180,10 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     const state = app.view.state;
     const sel = state.selection.main;
     const sc = scope();
+    if (!sc) {
+      scopeLost();
+      return false;
+    }
     const matches: { from: number; to: number }[] = [];
     let hit: { from: number; to: number } | null = null;
     if (!backwards) {
@@ -150,12 +218,12 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     const tab = app.active;
     if (!tab?.paged || !findInput.value) return false;
     try {
-      const m = await tab.paged.find(opts(), backwards, true);
+      const m = await tab.paged.find(opts(), backwards, true, toggles.inSelection);
       status.textContent = m ? "" : t("Not found");
       app.view.dispatch({ effects: setQuery.of(query()) });
       return !!m;
     } catch (e) {
-      status.textContent = String(e);
+      pagedError(e);
       return false;
     }
   }
@@ -174,13 +242,18 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   async function count(): Promise<void> {
     if (!findInput.value) return;
     if (app.active?.kind === "paged") {
-      const n = await backend.pagedCount(app.active.id, opts()).catch((e) => (status.textContent = String(e), 0));
-      status.textContent = t("{n} matches", { n: n.toLocaleString() });
+      try {
+        const n = await backend.pagedCount(app.active.id, opts(), toggles.inSelection);
+        status.textContent = t("{n} matches", { n: n.toLocaleString() });
+      } catch (e) {
+        pagedError(e);
+      }
       return;
     }
     const q = query();
     if (!q.valid) return;
     const sc = scope();
+    if (!sc) return scopeLost();
     let n = 0;
     const c = q.getCursor(app.view.state, sc.from, sc.to);
     for (let r = c.next(); !r.done; r = c.next()) n++;
@@ -189,46 +262,57 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
 
   async function replaceOne(): Promise<void> {
     const tab = app.active;
-    if (!tab || tab.readOnly) return;
-    if (tab.kind === "paged") {
-      // replace the current selection if it matches, then find next
-      const q = query();
-      const sel = app.view.state.selection.main;
-      const text = app.view.state.sliceDoc(sel.from, sel.to);
-      if (!sel.empty && matchesWhole(q, text)) {
-        const rep = replacementFor(q, text);
-        app.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: rep }, selection: { anchor: sel.from + rep.length } });
-      }
-      await findPaged(false);
-      return;
-    }
+    if (!tab || app.view.state.readOnly) return;
     const q = query();
     if (!q.valid || !q.search) return;
     const state = app.view.state;
     const sel = state.selection.main;
-    const c = q.getCursor(state, sel.from, sel.to);
-    const r = c.next();
-    if (!sel.empty && !r.done && r.value.from === sel.from && r.value.to === sel.to) {
-      const rep = replacementFor(q, state.sliceDoc(r.value.from, r.value.to));
-      app.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: rep }, selection: { anchor: sel.from + rep.length } });
+    if (tab.kind === "paged") {
+      // Replace the current selection if it is a match, then find the next one.
+      const text = state.doc.toString();
+      if (!sel.empty && selectionIsMatch(q, text, sel.from, sel.to)) {
+        const rep = replacementAt(q, text, sel.from, sel.to);
+        app.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: rep }, selection: { anchor: sel.from + rep.length }, userEvent: "input.replace" });
+      }
+      await findPaged(false);
+      return;
+    }
+    const sc = scope();
+    if (!sc) return scopeLost();
+    if (!sel.empty && sel.from >= sc.from && sel.to <= sc.to) {
+      const c = q.getCursor(state, sel.from, sel.to);
+      const r = c.next();
+      if (!r.done && r.value.from === sel.from && r.value.to === sel.to) {
+        const rep = replacementAt(q, state.doc.toString(), sel.from, sel.to);
+        app.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: rep }, selection: { anchor: sel.from + rep.length }, userEvent: "input.replace" });
+      }
     }
     findMemory(false);
   }
 
   async function replaceAll(): Promise<void> {
     const tab = app.active;
-    if (!tab || tab.readOnly || !findInput.value) return;
-    if (tab.kind === "paged" && tab.paged) {
-      const n = await tab.paged.replaceAll(opts(), replaceInput.value).catch((e) => (status.textContent = String(e), 0));
-      status.textContent = t("Replaced {n}", { n: n.toLocaleString() });
-      return;
-    }
+    if (!tab || app.view.state.readOnly || !findInput.value) return;
     const q = query();
     if (!q.valid) return;
+    if (tab.kind === "paged" && tab.paged) {
+      try {
+        // q.replace has escapes like \n resolved, exactly as for small files.
+        const n = await tab.paged.replaceAll(opts(), q.replace, toggles.inSelection);
+        status.textContent = t("Replaced {n}", { n: n.toLocaleString() });
+      } catch (e) {
+        pagedError(e);
+      }
+      return;
+    }
     const sc = scope();
+    if (!sc) return scopeLost();
+    const state = app.view.state;
+    const text = state.doc.toString();
+    const re = stickyRegex(q);
     const changes: { from: number; to: number; insert: string }[] = [];
-    const c = q.getCursor(app.view.state, sc.from, sc.to);
-    for (let r = c.next(); !r.done; r = c.next()) changes.push({ from: r.value.from, to: r.value.to, insert: replacementFor(q, app.view.state.sliceDoc(r.value.from, r.value.to)) });
+    const c = q.getCursor(state, sc.from, sc.to);
+    for (let r = c.next(); !r.done; r = c.next()) changes.push({ from: r.value.from, to: r.value.to, insert: replacementAt(q, text, r.value.from, r.value.to, re) });
     if (changes.length) app.view.dispatch({ changes, userEvent: "input.replace.all" });
     status.textContent = t("Replaced {n}", { n: changes.length.toLocaleString() });
   }
@@ -310,6 +394,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     pushQuery();
   }
   function close(): void {
+    if (toggles.inSelection) void toggleScope();
     visible = false;
     panel.style.display = "none";
     status.textContent = "";
@@ -346,32 +431,16 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   return { open, close, next, prev, isOpen: () => visible };
 }
 
-function matchesWhole(q: SearchQuery, text: string): boolean {
+/** Whether [from, to) of `text` is exactly one match of `q` (used for Replace in large files). */
+function selectionIsMatch(q: SearchQuery, text: string, from: number, to: number): boolean {
   if (!q.valid || !q.search) return false;
   if (q.regexp) {
-    try {
-      const re = new RegExp(`^(?:${q.search})$`, q.caseSensitive ? "" : "i");
-      return re.test(text);
-    } catch {
-      return false;
-    }
+    const re = stickyRegex(q);
+    if (!re) return false;
+    re.lastIndex = from;
+    const m = re.exec(text);
+    return !!m && m.index === from && m[0].length === to - from;
   }
-  return q.caseSensitive ? text === q.search : text.toLowerCase() === q.search.toLowerCase();
-}
-
-/** Expand the replacement for one matched string ($1, $&, $<name> in regex mode). */
-function replacementFor(q: SearchQuery, matched: string): string {
-  if (!q.regexp) return q.replace;
-  const flags = q.caseSensitive ? "" : "i";
-  let re: RegExp;
-  try {
-    re = new RegExp(`^(?:${q.search})$`, flags + "u");
-  } catch {
-    try {
-      re = new RegExp(`^(?:${q.search})$`, flags);
-    } catch {
-      return q.replace;
-    }
-  }
-  return re.test(matched) ? matched.replace(re, q.replace) : q.replace;
+  const sel = text.slice(from, to);
+  return q.caseSensitive ? sel === q.search : sel.toLowerCase() === q.search.toLowerCase();
 }

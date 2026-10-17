@@ -643,3 +643,8 @@ body {
   color: var(--fg);
   white-space: pre;
 }
+
+/* ---- "in selection only" search scope ---- */
+.cm-searchScope {
+  background-color: var(--selection-match);
+}

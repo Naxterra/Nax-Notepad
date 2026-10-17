@@ -13,7 +13,17 @@ for **multi-gigabyte files**. Built with Tauri 2 (Rust shell, WebView2) and Code
   Toggle per tab with `Ctrl+Shift+V`.
 - **Huge files**: files above 48 MB are memory-mapped and edited in pages (a piece table in
   Rust). Opening, searching and saving a 2.5 GB file works without loading it into memory.
+  UTF-8 files are editable; large UTF-16 and legacy code-page files are shown decoded and
+  read-only. Search and Replace All see the whole logical document, and Replace All stores only
+  the replacement text.
 - **Find / Replace** with regex, whole word, case, in-selection, count, and **Find in Files**.
+  "In selection only" captures the selection once and keeps that range through every replace.
+  Replacement syntax is JavaScript's (`$&`, `$1`, `$<name>`, `$$`) for files of any size.
+- **Safe saving**: every save writes a uniquely named temporary file and replaces the target
+  only when that succeeded. Typing during a save keeps the tab dirty. Saving in a code page
+  that cannot represent some characters asks first. A large file changed by another program
+  is never overwritten silently. Closing waits until unsaved text is stored for recovery and
+  asks what to do if that fails. Read-only mode applies to every command.
 - **Syntax highlighting** for ~150 languages (from `@codemirror/language-data`), picked by file
   name or manually from the status bar.
 - **Themes**: Nax Dark/Light, One Dark, Monokai, Dracula, Solarized Light, GitHub Light, or
@@ -43,6 +53,8 @@ Windows 11.
 ```powershell
 npm install
 npm run tauri dev          # run in development mode
+npm test                   # frontend regression tests
+npm run test:rust          # backend tests (piece table, encodings, saving)
 powershell -File build.ps1 # release build + installer in .\artifacts
 ```
 

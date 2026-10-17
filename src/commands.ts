@@ -39,12 +39,20 @@ export interface Command {
 
 export function buildCommands(app: App, find: FindPanel, extras: { toggleMenuBar: () => void; about: () => void; hexGoto?: () => boolean }): Command[] {
   const v = () => app.view;
+  /** Custom edits respect read-only mode (the editor's own commands already do). */
+  const writable = (): boolean => {
+    if (!v().state.readOnly) return true;
+    toast(t("This document is read-only."));
+    return false;
+  };
   const transformSelection = (fn: (s: string) => string) => {
+    if (!writable()) return;
     const state = v().state;
     const changes = state.selection.ranges.filter((r) => !r.empty).map((r) => ({ from: r.from, to: r.to, insert: fn(state.sliceDoc(r.from, r.to)) }));
     if (changes.length) v().dispatch({ changes });
   };
   const transformLines = (fn: (lines: string[]) => string[]) => {
+    if (!writable()) return;
     const state = v().state;
     const r = state.selection.main;
     const fromLine = state.doc.lineAt(r.from);
@@ -95,7 +103,7 @@ export function buildCommands(app: App, find: FindPanel, extras: { toggleMenuBar
     { id: "edit.trim", title: t("Trim Trailing Whitespace"), category: t("Edit"), run: () => transformLines((l) => l.map((x) => x.replace(/[ \t]+$/, ""))) },
     { id: "edit.tabsToSpaces", title: t("Convert Tabs to Spaces"), category: t("Edit"), run: () => transformLines((l) => l.map((x) => x.replace(/\t/g, " ".repeat(settings.tabSize)))) },
     { id: "edit.spacesToTabs", title: t("Convert Leading Spaces to Tabs"), category: t("Edit"), run: () => transformLines((l) => l.map((x) => x.replace(/^( +)/, (m) => "\t".repeat(Math.floor(m.length / settings.tabSize)) + " ".repeat(m.length % settings.tabSize)))) },
-    { id: "edit.insertDate", title: t("Insert Date/Time"), key: "F5", category: t("Edit"), run: () => v().dispatch(v().state.replaceSelection(new Date().toLocaleString())) },
+    { id: "edit.insertDate", title: t("Insert Date/Time"), key: "F5", category: t("Edit"), run: () => writable() && v().dispatch(v().state.replaceSelection(new Date().toLocaleString())) },
     { id: "edit.matchBracket", title: t("Go to Matching Bracket"), key: "Ctrl+Shift+B", category: t("Edit"), run: () => cursorMatchingBracket(v()) },
     { id: "edit.fold", title: t("Fold"), key: "Ctrl+Shift+[", category: t("Edit"), run: () => foldCode(v()) },
     { id: "edit.unfold", title: t("Unfold"), key: "Ctrl+Shift+]", category: t("Edit"), run: () => unfoldCode(v()) },
@@ -131,27 +139,27 @@ export function buildCommands(app: App, find: FindPanel, extras: { toggleMenuBar
     { id: "view.menuBar", title: t("Toggle Menu Bar"), category: t("View"), run: () => extras.toggleMenuBar() },
     { id: "view.hexView", title: t("Toggle Hex View"), key: "Ctrl+Shift+H", category: t("View"), run: () => app.active && app.toggleHexView(app.active) },
     // Markdown formatting
-    { id: "md.bold", title: t("Bold"), key: "Ctrl+B", category: t("Markdown"), run: () => toggleInline(v(), "**") },
-    { id: "md.italic", title: t("Italic"), key: "Ctrl+I", category: t("Markdown"), run: () => toggleInline(v(), "*") },
-    { id: "md.strike", title: t("Strikethrough"), key: "Ctrl+Shift+X", category: t("Markdown"), run: () => toggleInline(v(), "~~") },
-    { id: "md.code", title: t("Inline Code"), key: "Ctrl+`", category: t("Markdown"), run: () => toggleInline(v(), "`") },
-    { id: "md.highlight", title: t("Highlight"), category: t("Markdown"), run: () => toggleInline(v(), "==") },
-    { id: "md.h1", title: t("Heading 1"), key: "Ctrl+Alt+1", category: t("Markdown"), run: () => setHeading(v(), 1) },
-    { id: "md.h2", title: t("Heading 2"), key: "Ctrl+Alt+2", category: t("Markdown"), run: () => setHeading(v(), 2) },
-    { id: "md.h3", title: t("Heading 3"), key: "Ctrl+Alt+3", category: t("Markdown"), run: () => setHeading(v(), 3) },
-    { id: "md.h4", title: t("Heading 4"), key: "Ctrl+Alt+4", category: t("Markdown"), run: () => setHeading(v(), 4) },
-    { id: "md.h5", title: t("Heading 5"), key: "Ctrl+Alt+5", category: t("Markdown"), run: () => setHeading(v(), 5) },
-    { id: "md.h6", title: t("Heading 6"), key: "Ctrl+Alt+6", category: t("Markdown"), run: () => setHeading(v(), 6) },
-    { id: "md.h0", title: t("Remove Heading"), key: "Ctrl+Alt+0", category: t("Markdown"), run: () => setHeading(v(), 0) },
-    { id: "md.bullet", title: t("Bullet List"), key: "Ctrl+Shift+8", category: t("Markdown"), run: () => toggleLinePrefix(v(), "bullet") },
-    { id: "md.numbered", title: t("Numbered List"), key: "Ctrl+Shift+7", category: t("Markdown"), run: () => toggleLinePrefix(v(), "numbered") },
-    { id: "md.task", title: t("Task List"), key: "Ctrl+Shift+9", category: t("Markdown"), run: () => toggleLinePrefix(v(), "task") },
-    { id: "md.quote", title: t("Quote"), key: "Ctrl+Shift+Q", category: t("Markdown"), run: () => toggleLinePrefix(v(), "quote") },
-    { id: "md.link", title: t("Insert Link"), key: "Ctrl+K", category: t("Markdown"), run: () => insertLink(v()) },
-    { id: "md.image", title: t("Insert Image"), key: "Ctrl+Shift+I", category: t("Markdown"), run: () => insertLink(v(), true) },
-    { id: "md.codeblock", title: t("Code Block"), key: "Ctrl+Alt+C", category: t("Markdown"), run: () => insertCodeBlock(v()) },
-    { id: "md.table", title: t("Insert Table"), category: t("Markdown"), run: () => insertTable(v()) },
-    { id: "md.hr", title: t("Horizontal Rule"), category: t("Markdown"), run: () => insertHorizontalRule(v()) },
+    { id: "md.bold", title: t("Bold"), key: "Ctrl+B", category: t("Markdown"), run: () => writable() && toggleInline(v(), "**") },
+    { id: "md.italic", title: t("Italic"), key: "Ctrl+I", category: t("Markdown"), run: () => writable() && toggleInline(v(), "*") },
+    { id: "md.strike", title: t("Strikethrough"), key: "Ctrl+Shift+X", category: t("Markdown"), run: () => writable() && toggleInline(v(), "~~") },
+    { id: "md.code", title: t("Inline Code"), key: "Ctrl+`", category: t("Markdown"), run: () => writable() && toggleInline(v(), "`") },
+    { id: "md.highlight", title: t("Highlight"), category: t("Markdown"), run: () => writable() && toggleInline(v(), "==") },
+    { id: "md.h1", title: t("Heading 1"), key: "Ctrl+Alt+1", category: t("Markdown"), run: () => writable() && setHeading(v(), 1) },
+    { id: "md.h2", title: t("Heading 2"), key: "Ctrl+Alt+2", category: t("Markdown"), run: () => writable() && setHeading(v(), 2) },
+    { id: "md.h3", title: t("Heading 3"), key: "Ctrl+Alt+3", category: t("Markdown"), run: () => writable() && setHeading(v(), 3) },
+    { id: "md.h4", title: t("Heading 4"), key: "Ctrl+Alt+4", category: t("Markdown"), run: () => writable() && setHeading(v(), 4) },
+    { id: "md.h5", title: t("Heading 5"), key: "Ctrl+Alt+5", category: t("Markdown"), run: () => writable() && setHeading(v(), 5) },
+    { id: "md.h6", title: t("Heading 6"), key: "Ctrl+Alt+6", category: t("Markdown"), run: () => writable() && setHeading(v(), 6) },
+    { id: "md.h0", title: t("Remove Heading"), key: "Ctrl+Alt+0", category: t("Markdown"), run: () => writable() && setHeading(v(), 0) },
+    { id: "md.bullet", title: t("Bullet List"), key: "Ctrl+Shift+8", category: t("Markdown"), run: () => writable() && toggleLinePrefix(v(), "bullet") },
+    { id: "md.numbered", title: t("Numbered List"), key: "Ctrl+Shift+7", category: t("Markdown"), run: () => writable() && toggleLinePrefix(v(), "numbered") },
+    { id: "md.task", title: t("Task List"), key: "Ctrl+Shift+9", category: t("Markdown"), run: () => writable() && toggleLinePrefix(v(), "task") },
+    { id: "md.quote", title: t("Quote"), key: "Ctrl+Shift+Q", category: t("Markdown"), run: () => writable() && toggleLinePrefix(v(), "quote") },
+    { id: "md.link", title: t("Insert Link"), key: "Ctrl+K", category: t("Markdown"), run: () => writable() && insertLink(v()) },
+    { id: "md.image", title: t("Insert Image"), key: "Ctrl+Shift+I", category: t("Markdown"), run: () => writable() && insertLink(v(), true) },
+    { id: "md.codeblock", title: t("Code Block"), key: "Ctrl+Alt+C", category: t("Markdown"), run: () => writable() && insertCodeBlock(v()) },
+    { id: "md.table", title: t("Insert Table"), category: t("Markdown"), run: () => writable() && insertTable(v()) },
+    { id: "md.hr", title: t("Horizontal Rule"), category: t("Markdown"), run: () => writable() && insertHorizontalRule(v()) },
     {
       id: "view.theme",
       title: t("Choose Theme…"),

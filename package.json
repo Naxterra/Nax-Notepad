@@ -1,13 +1,15 @@
 {
   "name": "nax-notepad",
   "private": true,
-  "version": "0.2.5",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node tests/frontend.test.cjs",
+    "test:rust": "cargo test --lib --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6",

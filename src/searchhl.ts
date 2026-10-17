@@ -1,6 +1,6 @@
 // Highlights every match of the active search query in the visible part of the editor.
 import { SearchQuery } from "@codemirror/search";
-import { StateEffect, StateField } from "@codemirror/state";
+import { Extension, StateEffect, StateField } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
 
 export const setQuery = StateEffect.define<SearchQuery | null>();
@@ -43,4 +43,36 @@ export const searchHighlighter = ViewPlugin.fromClass(
   { decorations: (v) => v.decorations }
 );
 
-export const searchHighlight = [queryField, searchHighlighter];
+export const searchHighlight: Extension[] = [queryField, searchHighlighter];
+
+// ---- "in selection only" scope -------------------------------------------------------------
+
+export interface ScopeRange {
+  from: number;
+  to: number;
+}
+
+export const setSearchScope = StateEffect.define<ScopeRange | null>();
+
+const scopeDeco = Decoration.mark({ class: "cm-searchScope" });
+
+/**
+ * The range that "in selection only" searches and replacements are restricted to. It is
+ * captured once when the option is switched on and then mapped through every edit, so finding
+ * or replacing a match never shrinks or widens it. Insertions at its edges stay inside.
+ */
+export const searchScope = StateField.define<ScopeRange | null>({
+  create: () => null,
+  update(value, tr) {
+    for (const e of tr.effects) if (e.is(setSearchScope)) return e.value;
+    if (value && tr.docChanged) {
+      const from = tr.changes.mapPos(value.from, -1);
+      const to = tr.changes.mapPos(value.to, 1);
+      return to > from ? { from, to } : null;
+    }
+    return value;
+  },
+  provide: (f) => EditorView.decorations.from(f, (v) => (v ? Decoration.set([scopeDeco.range(v.from, v.to)]) : Decoration.none)),
+});
+
+searchHighlight.push(searchScope);
