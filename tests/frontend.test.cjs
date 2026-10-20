@@ -83,6 +83,7 @@ function load(name) {
       case "symbols":
       case "whitespace":
       case "encodings":
+      case "hexbuffer":
         return load(id);
     }
     if (id.startsWith("@tauri") || !id.startsWith("@")) return {};
@@ -672,6 +673,103 @@ test("settings: wrong types are ignored", () => {
   const v = real.validSettings({ tabSize: "4", macros: { not: "a list" }, keyOverrides: [], wordWrap: true, unknown: 1, recentFiles: ["a"] });
   assert.deepEqual(v, { wordWrap: true, recentFiles: ["a"] });
   assert.ok(real.DATA_KEYS.includes("macros") && real.DATA_KEYS.includes("keyOverrides"));
+});
+
+// ---- 0.4.1: hex editor -----------------------------------------------------------------------
+
+const memSource = (bytes) => ({ size: bytes.length, read: async (o, l) => bytes.slice(o, o + l) });
+
+test("hex buffer: overwrite, insert, remove, undo and redo (small file)", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const b = await HexBuffer.load(memSource(Uint8Array.from([0x41, 0x42, 0x43, 0x44])));
+  assert.equal(b.resizable, true);
+  b.overwrite(1, Uint8Array.from([0x10]));
+  b.overwrite(1, Uint8Array.from([0x1f])); // second hex digit of the same byte: one undo step
+  b.insert(4, Uint8Array.from([0x0d, 0x0a]));
+  b.remove(0, 1);
+  assert.deepEqual([...b.bytes()], [0x1f, 0x43, 0x44, 0x0d, 0x0a]);
+  assert.equal(b.dirty, true);
+  assert.equal(b.isModified(0), true);
+  assert.equal(b.isModified(1), false);
+  b.undo();
+  b.undo();
+  assert.deepEqual([...b.bytes()], [0x41, 0x1f, 0x43, 0x44]);
+  b.undo();
+  assert.deepEqual([...b.bytes()], [0x41, 0x42, 0x43, 0x44]);
+  assert.equal(b.dirty, false, "undo back to the loaded state is clean");
+  assert.equal(b.isModified(1), false);
+  b.redo();
+  assert.deepEqual([...b.bytes()], [0x41, 0x1f, 0x43, 0x44]);
+  // Writing past the end of a small file appends.
+  b.overwrite(4, Uint8Array.from([1, 2]));
+  assert.deepEqual([...b.bytes()], [0x41, 0x1f, 0x43, 0x44, 1, 2]);
+  b.markSaved();
+  assert.equal(b.dirty, false);
+  b.undo();
+  assert.equal(b.dirty, true, "undo after saving differs from the file");
+});
+
+test("hex buffer: large files are patched, never resized", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const data = Uint8Array.from({ length: 200000 }, (_, i) => i % 256);
+  const reads = [];
+  const src = { size: data.length, read: async (o, l) => (reads.push([o, l]), data.slice(o, o + l)) };
+  const b = await HexBuffer.load(src, 1000);
+  assert.equal(b.resizable, false);
+  assert.equal(reads.length, 0, "nothing is read before it is shown");
+  await b.ready(70000, 70010);
+  assert.deepEqual(reads, [[65536, 65536]]);
+  assert.equal(b.byteAt(70000), 70000 % 256);
+  assert.equal(b.byteAt(10), undefined, "not loaded");
+  assert.equal(b.overwrite(199999, Uint8Array.from([7, 8, 9])), 1, "cannot grow");
+  assert.equal(b.size, 200000);
+  await b.ready(199999, 200000);
+  b.overwrite(70000, Uint8Array.from([0xee]));
+  assert.deepEqual(b.patchList(), [
+    [70000, 0xee],
+    [199999, 7],
+  ]);
+  assert.throws(() => b.remove(0, 1));
+  b.undo();
+  b.undo();
+  assert.deepEqual(b.patchList(), [], "undo removes the patches");
+  assert.equal(b.dirty, false);
+});
+
+test("hex input parsing", () => {
+  const { parseHex, textBytes, toHex } = load("hexbuffer");
+  assert.deepEqual([...parseHex("41 42 0a")], [0x41, 0x42, 0x0a]);
+  assert.deepEqual([...parseHex("0x4142,0x43")], [0x41, 0x42, 0x43]);
+  assert.equal(parseHex("414"), null);
+  assert.equal(parseHex("hello"), null);
+  assert.deepEqual([...textBytes("Aü")], [0x41, 0xfc]);
+  assert.deepEqual([...textBytes("€")], [0xe2, 0x82, 0xac]);
+  assert.equal(toHex(Uint8Array.from([0, 255, 16])), "00 FF 10");
+});
+
+test("the hidden text editor cannot be changed while the hex view is shown", () => {
+  const app = Object.create(App.prototype);
+  assert.equal(app.effectiveReadOnly({ readOnly: false, paged: null, hexView: true }), true);
+  assert.equal(app.effectiveReadOnly({ readOnly: false, paged: null, hexView: false }), false);
+});
+
+test("saving byte changes writes the bytes, not the hidden text", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = { ...memoryTab({ dirty: true, revision: 0, savedRevision: 0, mtime: 1234 }), state: EditorState.create({ doc: "" }) };
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  const app = Object.create(App.prototype);
+  Object.assign(app, { tabs: [tab], panes: [], splitOn: false, emit() {}, scheduleSessionSave() {}, addRecent() {} });
+  const writes = [];
+  backend.writeBytes = async (path, bytes, mtime) => (writes.push([path, [...bytes], mtime]), { size: 3, mtime: 5, name: "test.txt", path });
+  backend.saveText = async () => assert.fail("the text must not be written");
+  backend.openPath = async (id, path) => ({ kind: "memory", path, name: "test.txt", text: "\t\u0002\u0003", encoding: "windows-1252", eol: "LF", size: 3, lineCount: null, hadErrors: false, readOnly: false, readOnlyReason: null, mtime: 5, binary: true });
+  backend.sessionDropBuffer = async () => {};
+  assert.equal(await app.save(tab), true);
+  assert.deepEqual(writes, [["test.txt", [9, 2, 3], 1234]]);
+  assert.equal(tab.dirty, false);
+  assert.equal(tab.hex, undefined, "the buffer is loaded again from the saved file");
+  assert.equal(tab.mtime, 5);
 });
 
 (async () => {

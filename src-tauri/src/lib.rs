@@ -834,6 +834,102 @@ async fn read_bytes(path: String, offset: u64, len: u64) -> Result<tauri::ipc::R
     Ok(tauri::ipc::Response::new(buf))
 }
 
+/// Fails with E_EXTERNAL_CHANGE when the file is no longer what the editor loaded.
+fn ensure_unchanged(p: &Path, expected_mtime: Option<u64>, expected_len: Option<u64>) -> Result<(), String> {
+    let meta = std::fs::metadata(p).map_err(|e| format!("Cannot read {}: {e}", p.display()))?;
+    let changed = expected_mtime.is_some_and(|m| m != 0 && mtime_of(p) != m) || expected_len.is_some_and(|l| l != meta.len());
+    if changed {
+        return Err(format!("{}{}", paged::E_EXTERNAL_CHANGE, p.display()));
+    }
+    Ok(())
+}
+
+fn saved(p: &Path) -> SaveResult {
+    SaveResult {
+        size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        mtime: mtime_of(p),
+        name: file_name(p),
+        path: p.display().to_string(),
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Replace a file with the bytes edited in the hex view (atomic, like every save). The body is
+/// the raw content; headers carry the URI-encoded path and the modification time the editor
+/// loaded, so a file changed by another program is not overwritten.
+#[tauri::command]
+async fn write_bytes(request: tauri::ipc::Request<'_>) -> Result<SaveResult, String> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("write_bytes expects raw bytes".into());
+    };
+    let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let path = percent_decode(&header("x-path").ok_or("missing path")?);
+    let expected = header("x-mtime").and_then(|s| s.parse::<u64>().ok());
+    let p = PathBuf::from(&path);
+    if p.exists() {
+        ensure_unchanged(&p, expected, None)?;
+    }
+    session::write_atomic(&p, data)?;
+    Ok(saved(&p))
+}
+
+/// Write `patches` (offset, byte) into a copy of the file and replace it atomically. Used for
+/// files too large to edit in memory; the file is streamed, so any size works.
+fn patch_file_impl(p: &Path, patches: &mut [(u64, u8)], expected_len: u64, expected_mtime: Option<u64>) -> Result<(), String> {
+    use std::io::{Read, Write};
+    ensure_unchanged(p, expected_mtime, Some(expected_len))?;
+    patches.sort_by_key(|x| x.0);
+    if patches.last().is_some_and(|x| x.0 >= expected_len) {
+        return Err("A changed byte lies beyond the end of the file.".into());
+    }
+    session::replace_atomic(p, |out| {
+        let mut src = std::fs::File::open(p)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut off = 0u64;
+        let mut i = 0usize;
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            while i < patches.len() && patches[i].0 < off + n as u64 {
+                buf[(patches[i].0 - off) as usize] = patches[i].1;
+                i += 1;
+            }
+            out.write_all(&buf[..n])?;
+            off += n as u64;
+        }
+        if off != expected_len {
+            return Err(std::io::Error::other("the file changed while it was being saved"));
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+async fn patch_file(path: String, mut patches: Vec<(u64, u8)>, expected_len: u64, expected_mtime: Option<u64>) -> Result<SaveResult, String> {
+    let p = PathBuf::from(&path);
+    patch_file_impl(&p, &mut patches, expected_len, expected_mtime)?;
+    Ok(saved(&p))
+}
+
 #[tauri::command]
 fn file_size(path: String) -> Result<u64, String> {
     std::fs::metadata(&path).map(|m| m.len()).map_err(|e| e.to_string())
@@ -1051,6 +1147,8 @@ pub fn run() {
             paged_set_eol,
             paged_disk_state,
             paged_find_all,
+            write_bytes,
+            patch_file,
             paged_tail_check,
             cancel_search,
             list_dir,
@@ -1179,6 +1277,39 @@ mod tests {
         let p = dir.path().join("x");
         std::fs::write(&p, "some content").unwrap();
         assert!(head_hash(&p, 12).unwrap() < (1u64 << 53));
+    }
+
+    #[test]
+    fn patch_file_changes_only_the_given_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.bin");
+        let original: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &original).unwrap();
+        let mtime = mtime_of(&p);
+        let mut patches = vec![(2_999_999u64, 0xAAu8), (0, 0xFF), (1_048_576, 0x11)];
+        patch_file_impl(&p, &mut patches, original.len() as u64, Some(mtime)).unwrap();
+        let after = std::fs::read(&p).unwrap();
+        assert_eq!(after.len(), original.len());
+        let mut expected = original.clone();
+        expected[0] = 0xFF;
+        expected[1_048_576] = 0x11;
+        expected[2_999_999] = 0xAA;
+        assert!(after == expected);
+        // A stale length or time is refused and leaves the file alone.
+        let err = patch_file_impl(&p, &mut vec![(1, 1)], 10, None).unwrap_err();
+        assert!(err.starts_with(paged::E_EXTERNAL_CHANGE));
+        let err = patch_file_impl(&p, &mut vec![(1, 1)], after.len() as u64, Some(1)).unwrap_err();
+        assert!(err.starts_with(paged::E_EXTERNAL_CHANGE));
+        assert!(patch_file_impl(&p, &mut vec![(after.len() as u64, 1)], after.len() as u64, None).is_err());
+        assert!(std::fs::read(&p).unwrap() == expected);
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary files remain");
+    }
+
+    #[test]
+    fn percent_decoding_of_paths() {
+        assert_eq!(percent_decode("C%3A%5CData%20Files%5C%C3%BC.bin"), r"C:\Data Files\ü.bin");
+        assert_eq!(percent_decode("100%"), "100%");
     }
 
     #[test]

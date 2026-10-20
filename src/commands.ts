@@ -39,6 +39,7 @@ import { copySelection, pasteClipboard, selectAllIn, writeClipboard } from "./cl
 import { THEMES } from "./theme";
 import { confirmDialog, pickList, prompt, toast } from "./ui/dialogs";
 import { FindPanel } from "./ui/find";
+import type { HexView } from "./ui/hexview";
 import { openSettingsDialog } from "./ui/settingsdialog";
 
 export interface Command {
@@ -59,6 +60,8 @@ export interface CommandExtras {
   toggleMenuBar: () => void;
   about: () => void;
   hexGoto?: () => boolean;
+  /** The hex editor of the focused pane, if it is shown. */
+  hex?: () => HexView | null;
   showSidebar?: (tab: "folders" | "functions" | null) => void;
   sidebarShown?: () => string | null;
   openShortcuts?: () => void;
@@ -119,6 +122,10 @@ export function buildCommands(app: App, find: FindPanel, extras: CommandExtras):
   const v = () => app.view;
   /** Custom edits respect read-only mode (the editor's own commands already do). */
   const writable = (): boolean => {
+    if (extras.hex?.()) {
+      toast(t("This works in the text view. Leave the hex view with Ctrl+Shift+H first."), 4000);
+      return false;
+    }
     if (!v().state.readOnly) return true;
     toast(t("This document is read-only."));
     return false;
@@ -346,12 +353,12 @@ export function buildCommands(app: App, find: FindPanel, extras: CommandExtras):
     { id: "file.clearRecent", title: t("Clear Recent Files"), category: t("File"), run: () => app.clearRecent() },
     { id: "file.exit", title: t("Exit"), key: "Alt+F4", category: t("File"), run: () => getCurrentWindow().close() },
     // Edit
-    { id: "edit.undo", title: t("Undo"), key: "Ctrl+Z", native: true, category: t("Edit"), run: () => undo(v()) },
-    { id: "edit.redo", title: t("Redo"), key: "Ctrl+Y", native: true, category: t("Edit"), run: () => redo(v()) },
-    { id: "edit.cut", title: t("Cut"), key: "Ctrl+X", native: true, category: t("Edit"), run: () => copySelection(v(), true) },
-    { id: "edit.copy", title: t("Copy"), key: "Ctrl+C", native: true, category: t("Edit"), run: () => copySelection(v()) },
-    { id: "edit.paste", title: t("Paste"), key: "Ctrl+V", native: true, category: t("Edit"), run: () => pasteClipboard(v()) },
-    { id: "edit.selectAll", title: t("Select All"), key: "Ctrl+A", native: true, category: t("Edit"), run: () => selectAllIn(v()) },
+    { id: "edit.undo", title: t("Undo"), key: "Ctrl+Z", native: true, category: t("Edit"), run: () => (extras.hex?.() ? extras.hex!()!.undo() : undo(v())) },
+    { id: "edit.redo", title: t("Redo"), key: "Ctrl+Y", native: true, category: t("Edit"), run: () => (extras.hex?.() ? extras.hex!()!.redo() : redo(v())) },
+    { id: "edit.cut", title: t("Cut"), key: "Ctrl+X", native: true, category: t("Edit"), run: () => (extras.hex?.() ? extras.hex!()!.copy(true) : copySelection(v(), true)) },
+    { id: "edit.copy", title: t("Copy"), key: "Ctrl+C", native: true, category: t("Edit"), run: () => (extras.hex?.() ? extras.hex!()!.copy() : copySelection(v())) },
+    { id: "edit.paste", title: t("Paste"), key: "Ctrl+V", native: true, category: t("Edit"), run: () => (extras.hex?.() ? extras.hex!()!.paste() : pasteClipboard(v())) },
+    { id: "edit.selectAll", title: t("Select All"), key: "Ctrl+A", native: true, category: t("Edit"), run: () => (extras.hex?.() ? extras.hex!()!.selectAll() : selectAllIn(v())) },
     { id: "edit.selectLine", title: t("Select Line"), key: "Ctrl+L", category: t("Edit"), run: () => selectLine(v()) },
     { id: "edit.columnUp", title: t("Column Select Up"), key: "Alt+Shift+ArrowUp", category: t("Edit"), run: () => columnSelectCommand("up")(v()) },
     { id: "edit.columnDown", title: t("Column Select Down"), key: "Alt+Shift+ArrowDown", category: t("Edit"), run: () => columnSelectCommand("down")(v()) },

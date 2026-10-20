@@ -14,6 +14,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { backend, E_EXTERNAL_CHANGE, E_READ_ONLY_ENCODING, E_UNREPRESENTABLE, Eol, errorText, SaveResult, SessionData, TabMeta } from "./backend";
 import { bookmarkLines, setBookmarks } from "./bookmarks";
 import { compartments, createState, indentExt, languageByName, languageForFile, loadLanguage, systemChange } from "./editor";
+import { HexBuffer } from "./hexbuffer";
 import { detectIndent, IndentInfo } from "./indentdetect";
 import { livePreview, LivePreviewConfig } from "./livepreview";
 import { PagedController, PagedHost } from "./paged";
@@ -77,6 +78,20 @@ export interface Tab {
   indent: IndentInfo | null;
   /** Follow mode (tail -f). */
   tail?: TailState;
+  /** Bytes shown in the hex view, with their unsaved edits. */
+  hex?: HexBuffer;
+  /** What `hex` was loaded from (file size and time, or the unsaved text). */
+  hexKey?: string;
+  /** The text is read-only because the file has bytes that are invalid in its encoding. */
+  invalidBytes?: boolean;
+}
+
+/** What the hex view of a tab shows. */
+export interface HexInfo {
+  buffer: HexBuffer;
+  name: string;
+  /** Why the bytes cannot be edited, or null. */
+  readOnly: string | null;
 }
 
 interface Pane {
@@ -480,7 +495,8 @@ export class App {
 
   /** Read-only for editing: the tab setting or a window of a large file that cannot be edited. */
   effectiveReadOnly(tab: Tab): boolean {
-    return tab.readOnly || !!tab.paged?.windowReadOnly;
+    // In the hex view the text editor is hidden: nothing may change the text behind it.
+    return tab.readOnly || !!tab.paged?.windowReadOnly || tab.hexView;
   }
 
   private applyReadOnly(tab: Tab): void {
@@ -674,6 +690,7 @@ export class App {
       if (!this.restoring) toast(t('"{name}" was opened read-only.', { name: res.name }) + " " + tab.lockedReadOnly, 6000);
     } else if (res.kind === "memory" && res.hadErrors) {
       tab.readOnly = true;
+      tab.invalidBytes = true;
       if (!this.restoring)
         toast(t('"{name}" contains bytes that are not valid {encoding}. It was opened read-only so saving cannot change them. Use the tab menu to allow editing.', { name: res.name, encoding: res.encoding }), 8000);
     }
@@ -848,6 +865,7 @@ export class App {
 
   save(tab: Tab): Promise<boolean> {
     tab = this.owner(tab);
+    if (tab.hex?.dirty && tab.path) return this.serial(tab, () => this.writeHex(tab));
     if (!tab.path) return this.saveAs(tab);
     const path = tab.path;
     return this.serial(tab, () => this.writeTab(tab, path, false));
@@ -998,6 +1016,8 @@ export class App {
   async reload(tab: Tab, encoding: string | null = null): Promise<void> {
     tab = this.owner(tab);
     if (!tab.path) return;
+    tab.hex = undefined;
+    tab.hexKey = undefined;
     if (tab.kind === "paged" && tab.paged) {
       tab.paged.resetRevisions();
       await backend.pagedClose(tab.id);
@@ -1027,6 +1047,7 @@ export class App {
       tab.size = res.size;
       if (res.hadErrors && !tab.readOnly) {
         tab.readOnly = true;
+        tab.invalidBytes = true;
         this.applyReadOnly(tab);
         toast(t('"{name}" contains bytes that are not valid {encoding}. It was opened read-only so saving cannot change them. Use the tab menu to allow editing.', { name: tab.name, encoding: res.encoding }), 8000);
       }
@@ -1299,10 +1320,99 @@ export class App {
     this.scheduleSessionSave();
   }
 
-  toggleHexView(tab: Tab): void {
+  /** Switch between the text and the hex view. Unsaved byte edits are saved or discarded first. */
+  async toggleHexView(tab: Tab): Promise<void> {
+    const own = this.owner(tab);
+    if (tab.hexView && own.hex?.dirty && !this.tabs.some((x) => x !== tab && x.hexView && this.owner(x) === own)) {
+      const r = await confirm3(t("Unsaved byte changes"), t('Save the changes made in the hex view of "{name}"?', { name: own.name }), [t("Save"), t("Discard")]);
+      if (r === "cancel") return;
+      if (r === "yes" && !(await this.save(own))) return;
+      if (r === "no") this.discardHex(own);
+    }
     tab.hexView = !tab.hexView;
+    this.dispatchTo(tab, { effects: compartments.readOnly.reconfigure(EditorState.readOnly.of(this.effectiveReadOnly(tab))) });
     this.emit("active");
     this.emit("status");
+    this.scheduleSessionSave();
+  }
+
+  /** Bytes for the hex view of `tab`, loaded on first use and after the file changed. */
+  async hexFor(tab: Tab): Promise<HexInfo> {
+    const own = this.owner(tab);
+    const textDirty = own.revision !== own.savedRevision || !own.path;
+    const key = textDirty ? `text:${own.revision}` : `file:${own.path}:${own.size}:${own.mtime}`;
+    if (!own.hex || (!own.hex.dirty && own.hexKey !== key)) {
+      if (textDirty) {
+        const bytes = new TextEncoder().encode(this.docText(own));
+        own.hex = await HexBuffer.load({ size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
+      } else {
+        const path = own.path!;
+        const size = await backend.fileSize(path);
+        own.hex = await HexBuffer.load({ size, read: (o, l) => backend.readBytes(path, o, l) });
+      }
+      own.hexKey = key;
+    }
+    let readOnly: string | null = null;
+    if (own.hexKey?.startsWith("text:")) readOnly = t("The hex view shows the unsaved text as UTF-8. Save the document to edit the bytes of the file.");
+    else if (own.readOnly && !own.lockedReadOnly && !own.invalidBytes) readOnly = t("This document is read-only.");
+    const name = own.name + (readOnly && own.hexKey?.startsWith("text:") ? ` (${t("unsaved")}, UTF-8)` : "");
+    return { buffer: own.hex, name, readOnly };
+  }
+
+  /** The hex view changed bytes: the tab is dirty while they are unsaved. */
+  noteHexChange(tab: Tab): void {
+    const own = this.owner(tab);
+    const dirty = !!own.hex?.dirty || own.revision !== own.savedRevision;
+    if (dirty !== own.dirty) {
+      own.dirty = dirty;
+      this.emit("tabs");
+    }
+    this.emit("status");
+  }
+
+  private discardHex(tab: Tab): void {
+    tab.hex = undefined;
+    tab.hexKey = undefined;
+    tab.dirty = tab.revision !== tab.savedRevision;
+    this.emit("tabs");
+  }
+
+  /** Write the bytes edited in the hex view, then load the file again. */
+  private async writeHex(tab: Tab): Promise<boolean> {
+    const buf = tab.hex!;
+    const path = tab.path!;
+    if (tab.revision !== tab.savedRevision) {
+      await message(t("The text of this document was also changed. Save or reload the text before saving byte changes."), { title: t("Save failed"), kind: "error" });
+      return false;
+    }
+    const paged = tab.kind === "paged";
+    try {
+      // A large file is memory-mapped; Windows cannot replace it while the mapping is open.
+      if (paged) {
+        tab.paged?.resetRevisions();
+        await backend.pagedClose(tab.id);
+      }
+      if (buf.resizable) await backend.writeBytes(path, buf.bytes(), tab.mtime);
+      else await backend.patchFile(path, buf.patchList(), buf.originalSize, tab.mtime);
+    } catch (e) {
+      if (paged) await this.reopenPaged(tab).catch(() => undefined);
+      const msg = errorText(e);
+      if (msg.startsWith(E_EXTERNAL_CHANGE)) {
+        await message(t('"{name}" was changed by another program. Your byte changes were not saved; reload the file to see its current content.', { name: tab.name }), { title: t("Save failed"), kind: "error" });
+      } else await message(msg, { title: t("Save failed"), kind: "error" });
+      return false;
+    }
+    this.discardHex(tab);
+    await this.reload(tab);
+    this.addRecent(path);
+    return true;
+  }
+
+  private async reopenPaged(tab: Tab): Promise<void> {
+    if (!tab.path || !tab.paged) return;
+    const res = await backend.openPath(tab.id, tab.path, true);
+    tab.paged.totalLines = res.lineCount ?? 1;
+    await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
   }
 
   setReadOnly(tab: Tab, ro: boolean): void {
@@ -1455,8 +1565,9 @@ export class App {
         clearTimeout(tab.bufferTimer);
         tab.bufferTimer = undefined;
       }
+      if (tab.hex?.dirty) errors.push(`${tab.name}: ${t("byte changes in the hex view cannot be kept for recovery. Save them first.")}`);
       try {
-        if (tab.dirty && tab.kind === "memory") await backend.sessionStoreBuffer(tab.id, this.docText(tab));
+        if (tab.revision !== tab.savedRevision && tab.kind === "memory") await backend.sessionStoreBuffer(tab.id, this.docText(tab));
         if (tab.kind === "paged" && tab.paged) {
           await tab.paged.commit();
           if (tab.dirty) await backend.pagedStoreEdits(tab.id);

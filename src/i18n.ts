@@ -513,5 +513,31 @@ const de: Record<string, string> = {
   "Following is paused. Click to resume.": "Verfolgen ist pausiert. Klicken zum Fortsetzen.",
   "New lines appended to the file are shown automatically. Click to pause.": "Neue Zeilen am Dateiende werden automatisch angezeigt. Klicken zum Pausieren.",
   clone: "Klon",
+  // Hex editor (0.4.1)
+  "Unsaved byte changes": "Ungespeicherte Byte-Änderungen",
+  'Save the changes made in the hex view of "{name}"?': "Die Änderungen in der Hex-Ansicht von „{name}“ speichern?",
+  Discard: "Verwerfen",
+  "The hex view shows the unsaved text as UTF-8. Save the document to edit the bytes of the file.":
+    "Die Hex-Ansicht zeigt den ungespeicherten Text als UTF-8. Bitte das Dokument speichern, um die Bytes der Datei zu bearbeiten.",
+  "The text of this document was also changed. Save or reload the text before saving byte changes.":
+    "Auch der Text dieses Dokuments wurde geändert. Bitte den Text speichern oder neu laden, bevor Byte-Änderungen gespeichert werden.",
+  '"{name}" was changed by another program. Your byte changes were not saved; reload the file to see its current content.':
+    "„{name}“ wurde von einem anderen Programm geändert. Ihre Byte-Änderungen wurden nicht gespeichert. Laden Sie die Datei neu, um ihren aktuellen Inhalt zu sehen.",
+  "byte changes in the hex view cannot be kept for recovery. Save them first.": "Byte-Änderungen in der Hex-Ansicht können nicht für die Wiederherstellung gesichert werden. Bitte zuerst speichern.",
+  "This works in the text view. Leave the hex view with Ctrl+Shift+H first.": "Das funktioniert in der Textansicht. Bitte zuerst die Hex-Ansicht mit Strg+Umschalt+H verlassen.",
+  "Large files cannot grow in the hex view. Only existing bytes were changed.": "Große Dateien können in der Hex-Ansicht nicht wachsen. Nur vorhandene Bytes wurden geändert.",
+  "Bytes cannot be removed from large files in the hex view. Overwrite them instead.": "Aus großen Dateien können in der Hex-Ansicht keine Bytes entfernt werden. Bitte stattdessen überschreiben.",
+  "The selection is too large to copy.": "Die Auswahl ist zu groß zum Kopieren.",
+  "Large files can only be overwritten in the hex view.": "Große Dateien können in der Hex-Ansicht nur überschrieben werden.",
+  "Copy as hex": "Als Hex kopieren",
+  "Copy as text": "Als Text kopieren",
+  "Overwrite mode": "Überschreibmodus",
+  "Insert mode": "Einfügemodus",
+  "{n} bytes selected": "{n} Bytes markiert",
+  "read-only": "schreibgeschützt",
+  INSERT: "EINFÜGEN",
+  OVERWRITE: "ÜBERSCHREIBEN",
+  "{n} changes, Ctrl+S saves": "{n} Änderungen, Strg+S speichert",
+  "Tab switches between hex and characters, Insert between insert and overwrite.": "Tab wechselt zwischen Hex und Zeichen, Einfg zwischen Einfügen und Überschreiben.",
   "Stop following": "Verfolgen beenden",
 };

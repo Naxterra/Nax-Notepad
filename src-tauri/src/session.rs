@@ -92,10 +92,16 @@ pub fn target_lock(target: &Path) -> Arc<Mutex<()>> {
 /// Atomic write: write a unique sibling temp file, flush it to disk, then rename it over the
 /// target. On any failure the target is untouched and the temp file is removed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    replace_atomic(path, |file| file.write_all(bytes))
+}
+
+/// Like [`write_atomic`], but the new content is produced by `write` (for streaming large files).
+/// The target is only replaced when `write` and the flush to disk succeeded.
+pub fn replace_atomic(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
     let lock = target_lock(path);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let (tmp, mut file) = create_temp_sibling(path)?;
-    let written = file.write_all(bytes).and_then(|_| file.sync_all());
+    let written = write(&mut file).and_then(|_| file.sync_all());
     drop(file);
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);

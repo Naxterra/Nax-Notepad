@@ -6,14 +6,14 @@ import { indentationMarkers } from "@replit/codemirror-indentation-markers";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { App } from "./app";
+import { App, Tab } from "./app";
 import { backend, errorText } from "./backend";
 import { addMacroCommands, buildCommands, Command, installKeybindings, recorder, runCommand } from "./commands";
 import { compartments, lineNumbersExt } from "./editor";
 import { applyKeymap } from "./keymap";
 import { loadSettings, onSettingsChange, settings, updateSettings } from "./settings";
 import { applyTheme, onSystemThemeChange } from "./theme";
-import { confirm3, contextMenu, h, isModalOpen, message } from "./ui/dialogs";
+import { confirm3, contextMenu, h, isModalOpen, message, toast } from "./ui/dialogs";
 import { copySelection, deleteSelection, pasteClipboard, selectAllIn } from "./clipboard";
 import { redo, undo } from "@codemirror/commands";
 import { t } from "./i18n";
@@ -60,34 +60,38 @@ async function main(): Promise<void> {
 
   // Hex view per pane, shown instead of the editor for tabs in hex mode.
   const hexes = editorHosts.map((host) => new HexView(host));
-  const hexShown: (string | null)[] = [null, null];
+  // Shows the hex editor instead of the text editor for tabs in hex mode, and follows reloads
+  // (a file changed by another program gets a fresh buffer).
+  const hexTab: (Tab | null)[] = [null, null];
+  let hexSync = Promise.resolve();
   const syncHex = () => {
-    app.panes.forEach((pane, i) => {
-      const tab = pane.tab;
-      const hex = hexes[i];
-      if (tab?.hexView) {
-        pane.view.dom.style.display = "none";
-        const own = app.owner(tab);
-        const key = `${tab.id}:${own.dirty}:${own.size}:${own.mtime}`;
-        if (hexShown[i] === key && hex.visible) return;
-        hexShown[i] = key;
-        if (own.path && !own.dirty) {
-          const path = own.path;
-          hex.show({ name: own.name, size: own.size, read: (o, l) => backend.readBytes(path, o, l) });
-        } else {
-          const bytes = new TextEncoder().encode(app.docText(tab));
-          hex.show({ name: own.name + " (" + (own.dirty ? t("unsaved") + ", UTF-8" : "UTF-8") + ")", size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
+    hexSync = hexSync.then(async () => {
+      for (const [i, pane] of app.panes.entries()) {
+        const tab = pane.tab;
+        const hex = hexes[i];
+        if (tab?.hexView) {
+          pane.view.dom.style.display = "none";
+          try {
+            const info = await app.hexFor(tab);
+            if (pane.tab !== tab) continue;
+            const isNew = hex.buffer !== info.buffer || hexTab[i] !== tab || !hex.visible;
+            hexTab[i] = tab;
+            hex.show({ ...info, onChange: () => app.noteHexChange(tab) }, isNew && i === app.focused);
+          } catch (e) {
+            toast(errorText(e), 6000);
+          }
+        } else if (hex.visible) {
+          hexTab[i] = null;
+          hex.hide();
+          pane.view.dom.style.display = "";
+          if (i === app.focused) pane.view.focus();
         }
-      } else if (hex.visible) {
-        hexShown[i] = null;
-        hex.hide();
-        pane.view.dom.style.display = "";
-        if (i === app.focused) pane.view.focus();
       }
     });
   };
   app.on("active", syncHex);
   app.on("layout", syncHex);
+  app.on("tabs", syncHex);
   mountTabBar(app, tabbars[0], 0);
   mountTabBar(app, tabbars[1], 1);
   const sidebar = mountSidebar(app, sidebarEl);
@@ -107,6 +111,7 @@ async function main(): Promise<void> {
   const extras = {
     toggleMenuBar,
     about: () => openAboutDialog(),
+    hex: () => (hexes[app.focused].visible ? hexes[app.focused] : null),
     hexGoto: () => {
       const hex = hexes[app.focused];
       if (!hex.visible) return false;
@@ -186,6 +191,13 @@ async function main(): Promise<void> {
   });
 
   window.addEventListener("nax:findInFolder", (e) => find.searchIn((e as CustomEvent<string>).detail));
+
+  // The WebView2 browser menu (Print, More tools, ...) does not belong in the app; text inputs
+  // keep their native menu.
+  document.addEventListener("contextmenu", (e) => {
+    const el = e.target as HTMLElement;
+    if (!e.defaultPrevented && !el.closest("input, textarea")) e.preventDefault();
+  });
 
   // Editor context menu (replaces the WebView2 default, which has no working Paste)
   panesEl.addEventListener("contextmenu", (e) => {

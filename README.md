@@ -66,7 +66,7 @@ for **multi-gigabyte files**. Built with Tauri 2 (Rust shell, WebView2) and Code
   lists `Ctrl+Shift+7/8/9`, link `Ctrl+K`, code block `Ctrl+Alt+C`, table, rule). Typing ``` opens
   a language picker (bash, sql, python, powershell, ...) that also adds the closing fence. All common Markdown
   extensions (.md, .markdown, .mdown, .mkd, .mdx, .rmd, ...) open as Markdown.
-- **Hex view** (`Ctrl+Shift+H`) for any tab, including multi-gigabyte files, with go to offset.
+- **Hex editor** (`Ctrl+Shift+H`) for any tab, including multi-gigabyte files. Type hex digits or characters to change bytes, use Insert to switch between overwrite and insert, and use Delete, Backspace, Ctrl+C/X/V, Ctrl+Z/Y, go to offset and Ctrl+S. Files up to 8 MB can grow and shrink; larger files are edited by overwriting bytes and saved by streaming the file through a temporary copy. While the hex view is shown, the hidden text cannot be changed, and a file changed by another program is never overwritten.
 - English and German UI, following the Windows language by default.
 - About dialog with links to this repository and a **Check for updates** that reads the latest
   GitHub release (also runs silently once a day; can be disabled in Settings).

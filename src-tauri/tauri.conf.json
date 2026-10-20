@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Nax-Notepad",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "identifier": "com.nax.notepad",
   "build": {
     "beforeDevCommand": "npm run dev",

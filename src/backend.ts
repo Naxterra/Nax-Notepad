@@ -193,5 +193,11 @@ export const backend = {
   pathExists: (path: string) => invoke<boolean>("path_exists", { path }),
   readBytes: async (path: string, offset: number, len: number) => new Uint8Array(await invoke<ArrayBuffer>("read_bytes", { path, offset, len })),
   fileSize: (path: string) => invoke<number>("file_size", { path }),
+  /** Replace a file with `bytes` (atomic). Fails with E_EXTERNAL_CHANGE if its time differs. */
+  writeBytes: (path: string, bytes: Uint8Array, expectedMtime: number) =>
+    invoke<SaveResult>("write_bytes", bytes, { headers: { "x-path": encodeURIComponent(path), "x-mtime": String(expectedMtime) } }),
+  /** Change single bytes of a (large) file through an atomic copy. */
+  patchFile: (path: string, patches: [number, number][], expectedLen: number, expectedMtime: number) =>
+    invoke<SaveResult>("patch_file", { path, patches, expectedLen, expectedMtime }),
   revealInExplorer: (path: string) => invoke<void>("reveal_in_explorer", { path }),
 };
