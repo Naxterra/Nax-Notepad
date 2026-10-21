@@ -24,6 +24,11 @@ if (-not (Test-Path node_modules)) {
     if ($LASTEXITCODE) { throw "npm install failed" }
 }
 
+# Release binaries must not contain local paths: panic messages of dependencies name their source
+# files under the user profile (cargo registry). Remap that prefix. The encoded form keeps a path
+# with spaces in one argument.
+$env:CARGO_ENCODED_RUSTFLAGS = "--remap-path-prefix=$($env:USERPROFILE)=~"
+
 Write-Host "-- tauri build (release)"
 npx tauri build --no-bundle
 if ($LASTEXITCODE) { throw "tauri build failed" }
