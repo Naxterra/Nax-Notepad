@@ -18,6 +18,10 @@ export interface HexSession {
   readOnly: string | null;
   /** Called after every edit. */
   onChange(): void;
+  /** Called when the user moves the cursor or selection ([from, to) bytes; from === to is a caret). */
+  onSelect?(from: number, to: number): void;
+  /** Section title shown above the columns. */
+  title?: string;
 }
 
 const BYTES_PER_ROW = 16;
@@ -32,6 +36,9 @@ function esc(c: string): string {
 export class HexView {
   readonly root: HTMLElement;
   private header: HTMLElement;
+  private titleEl: HTMLElement;
+  private cols: HTMLElement;
+  private listeners = new Set<() => void>();
   private scroller: HTMLElement;
   private spacer: HTMLElement;
   private body: HTMLElement;
@@ -48,14 +55,19 @@ export class HexView {
   private dragging = false;
 
   constructor(parent: HTMLElement) {
-    this.header = h("div", { class: "hex-header" });
+    this.header = h("span", { class: "hex-info" });
+    this.titleEl = h("span", { class: "hex-title-text" });
+    this.cols = h("div", { class: "hex-cols" });
     this.spacer = h("div", { class: "hex-spacer" });
     this.body = h("div", { class: "hex-body" });
     this.scroller = h("div", { class: "hex-scroller", tabindex: "0" }, this.spacer, this.body);
-    this.root = h("div", { class: "hex-root" }, this.header, this.scroller);
+    this.root = h("div", { class: "hex-root" }, h("div", { class: "hex-title" }, this.titleEl, this.header), this.cols, this.scroller);
     this.root.style.display = "none";
     parent.appendChild(this.root);
-    this.scroller.addEventListener("scroll", () => this.onScroll());
+    this.scroller.addEventListener("scroll", () => {
+      this.cols.scrollLeft = this.scroller.scrollLeft;
+      this.onScroll();
+    });
     this.scroller.addEventListener(
       "wheel",
       (e) => {
@@ -187,6 +199,58 @@ export class HexView {
     this.anchor = 0;
     this.cursor = Math.max(0, this.size() - 1);
     this.render();
+    this.userMoved();
+  }
+
+  /** Called after the cursor, selection or bytes changed (for the inspector). */
+  onState(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  /** Cursor and selection as [from, to) bytes (from === to when nothing is selected). */
+  get state(): { cursor: number; from: number; to: number; pane: Pane; insert: boolean } {
+    const sel = this.selection();
+    return { cursor: this.cursor, from: sel ? sel.from : this.cursor, to: sel ? sel.to : this.cursor, pane: this.pane, insert: this.insertMode };
+  }
+
+  /** Select bytes [from, to) without reporting it back through onSelect. */
+  setSelection(from: number, to: number, scroll = true): void {
+    if (!this.session) return;
+    const max = this.maxCursor();
+    if (to > from) {
+      this.anchor = Math.min(from, max);
+      this.cursor = Math.min(to - 1, max);
+      if (this.anchor === this.cursor) this.anchor = null;
+    } else {
+      this.anchor = null;
+      this.cursor = Math.min(from, max);
+    }
+    this.nibble = 0;
+    if (scroll) {
+      const row = Math.floor(Math.min(from, max) / BYTES_PER_ROW);
+      const vis = this.visibleRows();
+      if (row < this.firstRow || row >= this.firstRow + vis) this.setFirstRow(row - Math.floor(vis / 3));
+      else this.render();
+    } else this.render();
+  }
+
+  /** Find `pattern` after (or before) the cursor and select it. */
+  async findBytes(pattern: Uint8Array, backwards: boolean): Promise<boolean> {
+    if (!this.session || !pattern.length) return false;
+    const { from, to } = this.state;
+    const start = backwards ? from - 1 : to > from ? from + 1 : this.cursor + 1;
+    let at = await this.buf.find(pattern, start, backwards);
+    if (at === null) at = await this.buf.find(pattern, backwards ? this.size() - 1 : 0, backwards);
+    if (at === null) return false;
+    this.setSelection(at, at + pattern.length);
+    this.userMoved();
+    return true;
+  }
+
+  private userMoved(): void {
+    const st = this.state;
+    this.session?.onSelect?.(st.from, st.to);
   }
 
   private editable(): boolean {
@@ -203,6 +267,10 @@ export class HexView {
     this.spacer.style.height = `${this.virtualHeight()}px`;
     this.session?.onChange();
     this.render();
+  }
+
+  private notify(): void {
+    for (const fn of this.listeners) fn();
   }
 
   // ---- editing ----------------------------------------------------------------------------
@@ -271,7 +339,8 @@ export class HexView {
     this.moveTo(at, false);
   }
 
-  async copy(cut = false): Promise<void> {
+  /** Copy the selection (or the byte at the cursor) as hex digits or as text. */
+  async copy(cut = false, as: "hex" | "text" | null = null): Promise<void> {
     if (!this.session) return;
     const sel = this.selection() ?? (this.cursor < this.size() ? { from: this.cursor, to: this.cursor + 1 } : null);
     if (!sel) return;
@@ -281,7 +350,8 @@ export class HexView {
     }
     await this.buf.ready(sel.from, sel.to);
     const bytes = this.buf.slice(sel.from, sel.to);
-    const text = this.pane === "hex" ? toHex(bytes) : Array.from(bytes, (x) => (x === 0 ? "." : String.fromCharCode(x))).join("");
+    const asHex = as ? as === "hex" : this.pane === "hex";
+    const text = asHex ? toHex(bytes) : Array.from(bytes, (x) => (x === 0 ? "." : String.fromCharCode(x))).join("");
     await writeClipboard(text);
     if (!cut || !this.editable()) return;
     if (!this.buf.resizable) {
@@ -356,8 +426,8 @@ export class HexView {
       if (c === "KeyA") return handled(), this.selectAll();
       if (c === "KeyZ" && !shift) return handled(), this.undo();
       if (c === "KeyY" || (c === "KeyZ" && shift)) return handled(), this.redo();
-      if (k === "Home") return handled(), this.moveTo(0, shift);
-      if (k === "End") return handled(), this.moveTo(this.maxCursor(), shift);
+      if (k === "Home") return handled(), this.moveTo(0, shift), this.userMoved();
+      if (k === "End") return handled(), this.moveTo(this.maxCursor(), shift), this.userMoved();
       return; // other shortcuts are app commands
     }
     if (e.altKey && !altGr) return;
@@ -375,6 +445,7 @@ export class HexView {
       handled();
       if ((k === "ArrowUp" && this.cursor < BYTES_PER_ROW) || (k === "ArrowDown" && moves[k] > this.maxCursor() && Math.floor(this.cursor / 16) === Math.floor(this.maxCursor() / 16))) return;
       this.moveTo(moves[k], shift);
+      this.userMoved();
       return;
     }
     if (k === "Tab") {
@@ -424,6 +495,7 @@ export class HexView {
     this.moveTo(hit.o, e.shiftKey);
     if (!e.shiftKey) this.anchor = hit.o;
     this.dragging = true;
+    this.userMoved();
   }
 
   private onMouseMove(e: MouseEvent): void {
@@ -432,6 +504,7 @@ export class HexView {
     if (!hit || hit.o === this.cursor) return;
     this.cursor = Math.min(hit.o, this.maxCursor());
     this.render();
+    this.userMoved();
   }
 
   private onContextMenu(e: MouseEvent): void {
@@ -513,9 +586,12 @@ export class HexView {
       out.push(`<div class="hx-row"><span class="hx-off">${off.toString(16).padStart(width, "0")}</span>  ${hex} <span class="hx-bar">|</span>${ascii}<span class="hx-bar">|</span></div>`);
     }
     this.body.innerHTML = out.join("");
+    let cols = `<span class="hx-off">${"OFFSET".padEnd(width, " ")}</span>  `;
+    for (let i = 0; i < BYTES_PER_ROW; i++) cols += i.toString(16).padStart(2, "0").toUpperCase() + (i === 7 ? "  " : " ");
+    this.cols.innerHTML = `<div class="hx-row">${cols} <span class="hx-bar">|</span>${this.pane === "ascii" ? "<b>ASCII</b>" : "ASCII"}</div>`;
+    this.titleEl.textContent = s.title ?? t("Hex · 16 bytes per row");
     this.body.style.top = `${this.scaled() ? this.scroller.scrollTop : first * this.rowHeight}px`;
     const parts = [
-      s.name,
       `${size.toLocaleString()} ${t("bytes")}`,
       `${t("Offset")} 0x${this.cursor.toString(16).toUpperCase()} (${this.cursor.toLocaleString()})`,
     ];
@@ -524,5 +600,6 @@ export class HexView {
     if (b.dirty) parts.push(t("{n} changes, Ctrl+S saves", { n: b.changeCount.toLocaleString() }));
     this.header.textContent = parts.join("  ·  ");
     this.header.title = s.readOnly ?? t("Tab switches between hex and characters, Insert between insert and overwrite.");
+    this.notify();
   }
 }

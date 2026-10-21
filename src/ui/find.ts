@@ -8,7 +8,10 @@ import { backend, E_CANCELLED, E_NO_SCOPE, E_SEARCH_ENCODING, errorText, FindInF
 import { replacementAt, stickyRegex } from "../replace";
 import { searchScope, setQuery, setSearchScope } from "../searchhl";
 import { settings, updateSettings } from "../settings";
-import { h, toast } from "./dialogs";
+import { contextMenu, h, toast } from "./dialogs";
+import { icon } from "./icons";
+import type { HexView } from "./hexview";
+import { parseHex, textBytes } from "../hexbuffer";
 import { t } from "../i18n";
 
 export interface FindPanel {
@@ -21,6 +24,8 @@ export interface FindPanel {
   filterLines(): Promise<void>;
   /** Open Find in Files for a folder. */
   searchIn(dir: string): void;
+  /** Open the find bar with `text` and jump to the next match. */
+  findText(text: string): void;
 }
 
 function dirname(p: string): string {
@@ -45,7 +50,7 @@ interface ResultGroup {
 
 let listCounter = 0;
 
-export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): FindPanel {
+export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexView: () => HexView | null = () => null): FindPanel {
   const findList = h("datalist", { id: `nax-find-history-${++listCounter}` });
   const replaceList = h("datalist", { id: `nax-replace-history-${listCounter}` });
   const findInput = h("input", { class: "input find-input", type: "text", placeholder: t("Find"), list: findList.id, autocomplete: "off" }) as HTMLInputElement;
@@ -53,6 +58,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   const dirInput = h("input", { class: "input find-input", type: "text", placeholder: t("Folder") }) as HTMLInputElement;
   const globInput = h("input", { class: "input find-input glob", type: "text", placeholder: t("*.txt;*.md (all if empty)") }) as HTMLInputElement;
   const status = h("span", { class: "find-status" });
+  const counter = h("span", { class: "find-counter" });
 
   const toggles = {
     caseSensitive: false,
@@ -61,7 +67,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     inSelection: false,
   };
   const makeToggle = (key: "caseSensitive" | "wholeWord" | "regex", label: string, title: string) => {
-    const b = h("button", { class: "find-toggle", title, tabindex: "-1" }, label);
+    const b = h("button", { class: "find-toggle", title, tabindex: "-1" }, h("span", { class: "chk" }), label);
     b.addEventListener("click", () => {
       toggles[key] = !toggles[key];
       b.classList.toggle("on", toggles[key]);
@@ -70,26 +76,53 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     });
     return b;
   };
-  const tCase = makeToggle("caseSensitive", "Aa", t("Match case (Alt+C)"));
-  const tWord = makeToggle("wholeWord", "ab", t("Whole word (Alt+W)"));
-  const tRegex = makeToggle("regex", ".*", t("Regular expression (Alt+R)"));
+  const tCase = makeToggle("caseSensitive", t("Match case"), t("Match case (Alt+C)"));
+  const tWord = makeToggle("wholeWord", t("Word"), t("Whole word (Alt+W)"));
+  const tRegex = makeToggle("regex", t("Regex"), t("Regular expression (Alt+R)"));
   // "In selection only" captures the selection once as a fixed scope (see searchScope).
-  const tSel = h("button", { class: "find-toggle", title: t("In selection only"), tabindex: "-1" }, "≡");
+  const tSel = h("button", { class: "find-toggle", title: t("In selection only"), tabindex: "-1" }, h("span", { class: "chk" }), t("Selection"));
+
+  // Where to search when a hex view is shown: the text, or the bytes (hex digits or text).
+  let scopeMode: "text" | "bytes" = "text";
+  const sText = h("button", { class: "seg-btn on", tabindex: "-1" }, t("Text"));
+  const sBytes = h("button", { class: "seg-btn", tabindex: "-1", title: t("Hex bytes such as 25 50 44 46, or text") }, t("Bytes"));
+  const setScopeMode = (m: "text" | "bytes") => {
+    scopeMode = m;
+    sText.classList.toggle("on", m === "text");
+    sBytes.classList.toggle("on", m === "bytes");
+    counter.textContent = "";
+  };
+  sText.addEventListener("click", () => setScopeMode("text"));
+  sBytes.addEventListener("click", () => setScopeMode("bytes"));
+  const scopeBox = h("div", { class: "find-scope" }, h("span", { class: "find-label" }, t("Search in:")), h("div", { class: "seg" }, sText, sBytes));
+  const syncScopeBox = () => {
+    const hx = hexView();
+    scopeBox.style.display = hx ? "" : "none";
+    if (!hx && scopeMode === "bytes") setScopeMode("text");
+  };
   tSel.addEventListener("click", () => void toggleScope());
 
-  const btnPrev = h("button", { class: "btn small", title: t("Previous (Shift+F3)"), tabindex: "-1", click: () => prev() }, "↑");
-  const btnNext = h("button", { class: "btn small", title: t("Next (F3)"), tabindex: "-1", click: () => next() }, "↓");
-  const btnCount = h("button", { class: "btn small", title: t("Count matches"), tabindex: "-1", click: () => void count() }, t("Count"));
+  const btnPrev = h("button", { class: "btn small icon-only", title: t("Previous (Shift+F3)"), tabindex: "-1", click: () => prev() }, icon("chevronUp"));
+  const btnNext = h("button", { class: "btn small icon-only", title: t("Next (F3)"), tabindex: "-1", click: () => next() }, icon("chevronDown"));
   const btnAll = h("button", { class: "btn small", title: t("Find All in Current Document"), tabindex: "-1", click: () => void findAll("doc") }, t("Find all"));
-  const btnAllTabs = h("button", { class: "btn small", title: t("Find All in All Open Tabs"), tabindex: "-1", click: () => void findAll("tabs") }, t("All tabs"));
-  const btnFilter = h("button", { class: "btn small", title: t("Show only matching lines, updated live (Ctrl+Alt+L)"), tabindex: "-1", click: () => void filterLines() }, t("Filter"));
   const btnCancel = h("button", { class: "btn small danger", title: t("Stop the running search"), tabindex: "-1", click: () => void backend.cancelSearch() }, t("Cancel"));
   btnCancel.style.display = "none";
+  // Less frequent actions share one menu so the bar fits on one line.
+  const btnMore = h("button", { class: "btn small icon-only", title: t("More search actions"), tabindex: "-1" }, icon("menu"));
+  btnMore.addEventListener("click", () => {
+    const r = btnMore.getBoundingClientRect();
+    contextMenu(r.left, r.top - 4 - 3 * 34, [
+      { label: t("Count matches"), run: () => void count() },
+      { label: t("Find All in All Open Tabs"), run: () => void findAll("tabs") },
+      { label: t("Filter Lines (live)…"), run: () => void filterLines() },
+    ]);
+
+  });
   const btnReplace = h("button", { class: "btn small", click: () => void replaceOne() }, t("Replace"));
   const btnReplaceAll = h("button", { class: "btn small", click: () => void replaceAll() }, t("Replace all"));
   const btnFiles = h("button", { class: "btn small", click: () => void searchFiles() }, t("Search files"));
   const btnBrowse = h("button", { class: "btn small", title: t("Choose folder"), click: () => void browse() }, "…");
-  const btnClose = h("button", { class: "find-close", title: t("Close (Esc)"), tabindex: "-1", click: () => close() }, "×");
+  const btnClose = h("button", { class: "find-close", title: t("Close (Esc)"), tabindex: "-1", click: () => close() }, icon("close"));
   const modeBtn = (m: "find" | "replace" | "files", label: string) => h("button", { class: "find-mode", tabindex: "-1", click: () => open(m) }, label);
   const mFind = modeBtn("find", t("Find"));
   const mReplace = modeBtn("replace", t("Replace"));
@@ -98,18 +131,18 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   const rowFind = h(
     "div",
     { class: "find-row" },
-    h("div", { class: "find-modes" }, mFind, mReplace, mFiles),
+    h("div", { class: "find-modes seg" }, mFind, mReplace, mFiles),
     findInput,
+    btnPrev,
+    btnNext,
+    counter,
     tCase,
     tWord,
     tRegex,
     tSel,
-    btnPrev,
-    btnNext,
-    btnCount,
+    scopeBox,
     btnAll,
-    btnAllTabs,
-    btnFilter,
+    btnMore,
     btnCancel,
     status,
     btnClose
@@ -122,7 +155,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
 
   const results = h("div", { class: "results-list" });
   const resultsTitle = h("span", { class: "results-title" }, t("Search results"));
-  const resultsHeader = h("div", { class: "results-header" }, resultsTitle, h("button", { class: "find-close", title: t("Close"), click: () => hideResults() }, "×"));
+  const resultsHeader = h("div", { class: "results-header" }, resultsTitle, h("button", { class: "find-close", title: t("Close"), click: () => hideResults() }, icon("close")));
   const resultsPanel = h("div", { class: "results-panel" }, resultsHeader, results);
   resultsPanel.style.display = "none";
   bottom.append(resultsPanel);
@@ -290,7 +323,37 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     }
     app.view.dispatch({ selection: EditorSelection.range(hit.from, hit.to), scrollIntoView: true, effects: setQuery.of(q) });
     status.textContent = "";
+    updateCounter(q, sc, hit.from);
     return true;
+  }
+
+  /** "3 / 12": position of the current match among all matches (small documents). */
+  function updateCounter(q: SearchQuery, sc: { from: number; to: number }, at: number): void {
+    const state = app.view.state;
+    if (state.doc.length > 20_000_000) {
+      counter.textContent = "";
+      return;
+    }
+    let n = 0;
+    let index = 0;
+    const c = q.getCursor(state, sc.from, sc.to);
+    for (let r = c.next(); !r.done && n < 100_000; r = c.next()) {
+      n++;
+      if (r.value.from === at) index = n;
+    }
+    counter.textContent = n ? `${index || "?"} / ${n >= 100_000 ? "100000+" : n.toLocaleString()}` : "";
+  }
+
+  async function findBytes(backwards: boolean): Promise<void> {
+    const hx = hexView();
+    if (!hx || !findInput.value) return;
+    const bytes = parseHex(findInput.value) ?? textBytes(findInput.value);
+    try {
+      const ok = await busy(() => hx.findBytes(bytes, backwards));
+      status.textContent = ok ? t("Found at 0x{offset}", { offset: hx.state.from.toString(16).toUpperCase() }) : t("Not found");
+    } catch (e) {
+      pagedError(e);
+    }
   }
 
   async function findPaged(backwards: boolean): Promise<boolean> {
@@ -310,13 +373,15 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
   function next(): void {
     if (!findInput.value) return;
     remember();
-    if (app.active?.kind === "paged") void findPaged(false);
+    if (scopeMode === "bytes" && hexView()) void findBytes(false);
+    else if (app.active?.kind === "paged") void findPaged(false);
     else findMemory(false);
   }
   function prev(): void {
     if (!findInput.value) return;
     remember();
-    if (app.active?.kind === "paged") void findPaged(true);
+    if (scopeMode === "bytes" && hexView()) void findBytes(true);
+    else if (app.active?.kind === "paged") void findPaged(true);
     else findMemory(true);
   }
 
@@ -653,6 +718,8 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
       if (!text.includes("\n")) findInput.value = text;
     }
     if (m === "files" && !dirInput.value && app.active?.path) dirInput.value = dirname(app.active.path);
+    syncScopeBox();
+    if (hexView() && !app.active?.splitView) setScopeMode("bytes");
     findInput.focus();
     findInput.select();
     pushQuery();
@@ -666,8 +733,11 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     app.view.focus();
   }
 
+  app.on("active", syncScopeBox);
   findInput.addEventListener("input", () => {
+    counter.textContent = "";
     pushQuery();
+    if (scopeMode === "bytes") return;
     if (mode !== "files" && app.active?.kind !== "paged") findMemory(false, false);
     if (filterActive) scheduleFilter();
   });
@@ -699,7 +769,14 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement): Find
     dirInput.value = dir;
   };
 
-  return { open, close, next, prev, isOpen: () => visible, findAll, filterLines, searchIn };
+  const findText = (text: string) => {
+    open("find");
+    findInput.value = text;
+    pushQuery();
+    next();
+  };
+
+  return { open, close, next, prev, isOpen: () => visible, findAll, filterLines, searchIn, findText };
 }
 
 /** Whether [from, to) of `text` is exactly one match of `q` (used for Replace in large files). */

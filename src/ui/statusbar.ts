@@ -2,6 +2,7 @@ import { App } from "../app";
 import { allLanguages } from "../editor";
 import { settings, updateSettings } from "../settings";
 import { h, pickList } from "./dialogs";
+import { icon } from "./icons";
 import { t } from "../i18n";
 
 function fmtSize(n: number): string {
@@ -42,7 +43,10 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: StatusActio
   hexBadge.addEventListener("click", () => app.active && app.toggleHexView(app.active));
   rec.addEventListener("click", () => actions.run("macro.record"));
   tail.addEventListener("click", () => actions.run("view.followPause"));
-  zoom.addEventListener("click", () => updateSettings({ fontSize: 14 }));
+  zoom.addEventListener("click", async () => {
+    const it = await pickList(t("Zoom"), [70, 80, 90, 100, 110, 120, 140, 160, 200].map((p) => ({ label: `${p}%`, value: String(p), detail: p === 100 ? t("default") : undefined })));
+    if (it) updateSettings({ fontSize: Math.round((14 * Number(it.value)) / 100) });
+  });
   indent.addEventListener("click", () => actions.run("edit.indentation"));
   eol.addEventListener("click", async () => {
     const it = await pickList(t("Line endings"), [
@@ -104,7 +108,7 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: StatusActio
     eol.textContent = own.eol;
     enc.textContent = own.encoding;
     lang.textContent = tab.languageName ?? t("Plain text");
-    zoom.textContent = settings.fontSize === 14 ? "" : `${Math.round((settings.fontSize / 14) * 100)}%`;
+    zoom.replaceChildren(`${Math.round((settings.fontSize / 14) * 100)}%`, icon("chevronDown", "sb-chev"));
   };
 
   app.on("status", render);

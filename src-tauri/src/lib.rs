@@ -923,6 +923,69 @@ fn patch_file_impl(p: &Path, patches: &mut [(u64, u8)], expected_len: u64, expec
     })
 }
 
+/// Offset of the first occurrence of `pattern` at or after `from` (or the last one at or before
+/// `from` when `backwards`), reading the file in blocks so files of any size can be searched.
+fn find_bytes_impl(p: &Path, pattern: &[u8], from: u64, backwards: bool, cancel: &dyn Fn() -> bool) -> Result<Option<u64>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    let mut f = std::fs::File::open(p).map_err(|e| format!("Cannot read {}: {e}", p.display()))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let plen = pattern.len() as u64;
+    if plen > len {
+        return Ok(None);
+    }
+    const BLOCK: u64 = 4 << 20;
+    let finder = memchr::memmem::Finder::new(pattern);
+    let mut buf = Vec::new();
+    let mut read_at = |start: u64, end: u64, buf: &mut Vec<u8>| -> Result<(), String> {
+        buf.resize((end - start) as usize, 0);
+        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        f.read_exact(buf).map_err(|e| e.to_string())
+    };
+    if !backwards {
+        let mut start = from.min(len);
+        while start + plen <= len {
+            if cancel() {
+                return Err(paged::E_CANCELLED.to_string());
+            }
+            let end = (start + BLOCK + plen - 1).min(len);
+            read_at(start, end, &mut buf)?;
+            if let Some(i) = finder.find(&buf) {
+                return Ok(Some(start + i as u64));
+            }
+            if end == len {
+                break;
+            }
+            start = end + 1 - plen;
+        }
+    } else {
+        // Last match starting at or before `from`.
+        let mut end = (from.min(len - plen) + plen).min(len);
+        loop {
+            if cancel() {
+                return Err(paged::E_CANCELLED.to_string());
+            }
+            let start = end.saturating_sub(BLOCK + plen - 1);
+            read_at(start, end, &mut buf)?;
+            if let Some(i) = memchr::memmem::rfind(&buf, pattern) {
+                return Ok(Some(start + i as u64));
+            }
+            if start == 0 {
+                break;
+            }
+            end = start + plen - 1;
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+async fn find_bytes(path: String, pattern: Vec<u8>, from: u64, backwards: bool) -> Result<Option<u64>, String> {
+    find_bytes_impl(Path::new(&path), &pattern, from, backwards, &cancel_token())
+}
+
 #[tauri::command]
 async fn patch_file(path: String, mut patches: Vec<(u64, u8)>, expected_len: u64, expected_mtime: Option<u64>) -> Result<SaveResult, String> {
     let p = PathBuf::from(&path);
@@ -1149,6 +1212,7 @@ pub fn run() {
             paged_find_all,
             write_bytes,
             patch_file,
+            find_bytes,
             paged_tail_check,
             cancel_search,
             list_dir,
@@ -1304,6 +1368,27 @@ mod tests {
         assert!(std::fs::read(&p).unwrap() == expected);
         let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(leftovers, 1, "no temporary files remain");
+    }
+
+    #[test]
+    fn find_bytes_across_block_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.bin");
+        let mut data = vec![0u8; 9 * 1024 * 1024];
+        let at1 = 4 * 1024 * 1024 - 2; // straddles the first block boundary
+        let at2 = 8 * 1024 * 1024 + 5;
+        data[at1..at1 + 4].copy_from_slice(b"NAX!");
+        data[at2..at2 + 4].copy_from_slice(b"NAX!");
+        std::fs::write(&p, &data).unwrap();
+        let never = || false;
+        let f = |from: u64, back: bool| find_bytes_impl(&p, b"NAX!", from, back, &never).unwrap();
+        assert_eq!(f(0, false), Some(at1 as u64));
+        assert_eq!(f(at1 as u64 + 1, false), Some(at2 as u64));
+        assert_eq!(f(at2 as u64 + 1, false), None);
+        assert_eq!(f(data.len() as u64, true), Some(at2 as u64));
+        assert_eq!(f(at2 as u64 - 1, true), Some(at1 as u64));
+        assert_eq!(f(at1 as u64 - 1, true), None);
+        assert_eq!(f(at1 as u64, true), Some(at1 as u64));
     }
 
     #[test]

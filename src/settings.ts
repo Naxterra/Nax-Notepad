@@ -44,6 +44,8 @@ export interface Settings {
   sidebarVisible: boolean;
   /** "folders" or "functions" */
   sidebarTab: string;
+  /** Show the inspector beside the hex view. */
+  inspectorVisible: boolean;
 }
 
 export const DEFAULTS: Settings = {
@@ -85,6 +87,7 @@ export const DEFAULTS: Settings = {
   workspaceFolders: [],
   sidebarVisible: false,
   sidebarTab: "folders",
+  inspectorVisible: true,
 };
 
 /**

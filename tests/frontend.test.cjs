@@ -84,6 +84,8 @@ function load(name) {
       case "whitespace":
       case "encodings":
       case "hexbuffer":
+      case "bytemap":
+      case "signature":
         return load(id);
     }
     if (id.startsWith("@tauri") || !id.startsWith("@")) return {};
@@ -770,6 +772,100 @@ test("saving byte changes writes the bytes, not the hidden text", async () => {
   assert.equal(tab.dirty, false);
   assert.equal(tab.hex, undefined, "the buffer is loaded again from the saved file");
   assert.equal(tab.mtime, 5);
+});
+
+// ---- 0.5.0: split view mapping, file types, value inspector ------------------------------------
+
+test("byte map: text positions and file bytes map both ways", () => {
+  const { createByteMap } = load("bytemap");
+  const { Text } = require("@codemirror/state");
+  // UTF-8 with CRLF: "Grüße\r\nok" is 6 + 1 (ü) + 1 (ß) bytes = "Gr" 2, "ü" 2, "ß" 2, "e" 1 = 7, CRLF 2, "ok" 2 = 11.
+  const doc = Text.of(["Grüße", "ok"]);
+  const m = createByteMap(doc, "UTF-8", "CRLF", 11);
+  assert.ok(m);
+  assert.equal(m.toByte(0), 0);
+  assert.equal(m.toByte(3), 4, "after G, r, ü");
+  assert.equal(m.toByte(5), 7, "end of line 1");
+  assert.equal(m.toByte(6), 9, "line 2 starts after CRLF");
+  assert.equal(m.toPos(4), 3);
+  assert.equal(m.toPos(3), 2, "second byte of ü belongs to ü");
+  assert.equal(m.toPos(8), 5, "inside the line break");
+  assert.equal(m.toPos(10), 7);
+  // A UTF-8 BOM shifts everything by three bytes.
+  const bom = createByteMap(doc, "UTF-8-BOM", "CRLF", 14);
+  assert.equal(bom.toByte(0), 3);
+  assert.equal(bom.toPos(3), 0);
+  // Single-byte code pages: one byte per character.
+  const cp = createByteMap(Text.of(["Grüße"]), "windows-1252", "LF", 5);
+  assert.equal(cp.toByte(4), 4);
+  // UTF-16: two bytes per character, four for characters outside the BMP.
+  const u16 = createByteMap(Text.of(["a😀b"]), "UTF-16LE", "LF", 2 + 8);
+  assert.equal(u16.toByte(1), 4, "after BOM and a");
+  assert.equal(u16.toByte(3), 8, "after the surrogate pair");
+  // Unsupported or inconsistent: no map.
+  assert.equal(createByteMap(doc, "GBK", "CRLF", 11), null);
+  assert.equal(createByteMap(doc, "UTF-8", "LF", 11), null, "size does not match");
+});
+
+test("file types are recognized from their first bytes", () => {
+  const { detectSignature } = load("signature");
+  const b = (...x) => Uint8Array.from(x);
+  assert.equal(detectSignature(b(0x25, 0x50, 0x44, 0x46, 0x2d, 0x31)), "PDF");
+  assert.equal(detectSignature(b(0x4d, 0x5a, 0x90, 0x00)), "Windows executable or DLL (PE)");
+  assert.equal(detectSignature(b(0x50, 0x4b, 0x03, 0x04)), "ZIP archive (also DOCX, XLSX, JAR)");
+  assert.equal(detectSignature(b(0, 0, 0, 0x20, 0x66, 0x74, 0x79, 0x70, 0x69)), "MP4 or MOV video");
+  assert.equal(detectSignature(b(0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x57, 0x45, 0x42, 0x50)), "WebP image");
+  assert.equal(detectSignature(b(0x68, 0x65, 0x6c, 0x6c, 0x6f)), null);
+  assert.equal(detectSignature(b(0x25)), null, "too short");
+});
+
+test("value inspector reads numbers in both byte orders", () => {
+  // inspector.ts needs the DOM; test its pure part through a tiny copy of the module.
+  const src = fs.readFileSync(path.join(repo, "src/ui/inspector.ts"), "utf8");
+  const start = src.indexOf("export function interpret");
+  const end = src.indexOf("export interface Inspector");
+  const code = ts.transpileModule(src.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  const ex = {};
+  new Function("exports", code)(ex);
+  const v = (bytes, le) => Object.fromEntries(ex.interpret(Uint8Array.from(bytes), le).map((x) => [x.label, x.value]));
+  const le = v([0x01, 0x02, 0x00, 0x00, 0, 0, 0, 0], true);
+  assert.equal(le.UInt16, "513");
+  assert.equal(le.Int32, "513");
+  assert.equal(le.Binary, "00000001");
+  const be = v([0x01, 0x02], false);
+  assert.equal(be.UInt16, "258");
+  assert.equal(be.Int32, "–", "not enough bytes");
+  assert.equal(v([0xff], true).Int8, "-1");
+  assert.equal(v([0, 0, 0x80, 0x3f], true).Float32, "1");
+});
+
+test("hex buffer finds byte patterns forwards and backwards", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const data = Uint8Array.from([1, 2, 3, 1, 2, 3, 9]);
+  const b = await HexBuffer.load({ size: data.length, read: async (o, l) => data.slice(o, o + l) });
+  const p = Uint8Array.from([1, 2, 3]);
+  assert.equal(await b.find(p, 0, false), 0);
+  assert.equal(await b.find(p, 1, false), 3);
+  assert.equal(await b.find(p, 4, false), null);
+  assert.equal(await b.find(p, 6, true), 3);
+  assert.equal(await b.find(p, 2, true), 0);
+  // Large files delegate to the source (the backend search).
+  const calls = [];
+  const big = await HexBuffer.load({ size: 100, read: async () => new Uint8Array(0), find: async (pat, from, back) => (calls.push([from, back]), 42) }, 10);
+  assert.equal(await big.find(p, 5, true), 42);
+  assert.deepEqual(calls, [[5, true]]);
+});
+
+test("view modes: only the hex mode locks the text", () => {
+  const app = Object.create(App.prototype);
+  const tab = { readOnly: false, paged: null, hexView: true, splitView: true };
+  assert.equal(app.effectiveReadOnly(tab), false, "split keeps the text editable");
+  assert.equal(app.viewMode(tab), "split");
+  tab.splitView = false;
+  assert.equal(app.effectiveReadOnly(tab), true);
+  assert.equal(app.viewMode(tab), "hex");
+  tab.hexView = false;
+  assert.equal(app.viewMode(tab), "text");
 });
 
 (async () => {

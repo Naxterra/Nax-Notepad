@@ -29,6 +29,11 @@ import { openShortcutDialog } from "./ui/shortcuts";
 import { mountSidebar } from "./ui/sidebar";
 import { mountStatusBar } from "./ui/statusbar";
 import { mountTabBar } from "./ui/tabbar";
+import { mountTitleBar } from "./ui/titlebar";
+import { mountDocToolbar } from "./ui/doctoolbar";
+import { mountInspector } from "./ui/inspector";
+import { ByteMap, createByteMap } from "./bytemap";
+import { Text } from "@codemirror/state";
 import "./styles.css";
 
 function shortPath(p: string, max = 90): string {
@@ -40,26 +45,70 @@ async function main(): Promise<void> {
   initLanguage(settings.language);
   applyTheme(settings.theme);
 
-  // Layout: menu bar, find bar, [sidebar | pane 1 | pane 2], results, status bar.
+  // Layout: title bar, menu bar, [sidebar | pane 1 | pane 2], results, find bar, status bar.
+  // Each pane: tab bar, document toolbar, then the editor (text, hex or both) and the inspector.
   const root = document.getElementById("app")!;
+  const titlebar = h("div", { class: "titlebar" });
   const menubar = h("div", { class: "menubar" });
-  const findTop = h("div", { class: "find-top" });
+  const findBottom = h("div", { class: "find-bottom" });
   const sidebarEl = h("div", { class: "sidebar" });
   const editorHosts = [h("div", { class: "editor" }), h("div", { class: "editor" })];
   const tabbars = [h("div", { class: "tabbar" }), h("div", { class: "tabbar" })];
-  const paneEls = [h("div", { class: "pane" }, tabbars[0], editorHosts[0]), h("div", { class: "pane" }, tabbars[1], editorHosts[1])];
+  const toolbars = [h("div", { class: "doc-toolbar" }), h("div", { class: "doc-toolbar" })];
+  const inspectorEls = [h("div", { class: "inspector" }), h("div", { class: "inspector" })];
+  const paneEls = [0, 1].map((i) => h("div", { class: "pane" }, tabbars[i], toolbars[i], h("div", { class: "pane-body" }, editorHosts[i], inspectorEls[i])));
   paneEls[1].style.display = "none";
   const panesEl = h("div", { class: "panes" }, paneEls[0], paneEls[1]);
   const work = h("div", { class: "work" }, sidebarEl, panesEl);
   const resultsBottom = h("div", { class: "results-bottom" });
   const statusbar = h("div", { class: "statusbar" });
-  root.append(menubar, findTop, work, resultsBottom, statusbar);
+  root.append(titlebar, menubar, work, resultsBottom, findBottom, statusbar);
+  for (const host of editorHosts) host.append(h("div", { class: "text-title" }, t("Text · decoded bytes")));
 
   const app = new App(editorHosts);
-  const find = mountFind(app, findTop, resultsBottom);
+  const find = mountFind(app, findBottom, resultsBottom, () => (hexes[app.focused].visible ? hexes[app.focused] : null));
 
-  // Hex view per pane, shown instead of the editor for tabs in hex mode.
+  // Hex view per pane, shown instead of the editor for tabs in hex mode and beside it in split mode.
   const hexes = editorHosts.map((host) => new HexView(host));
+  const inspectors = [0, 1].map((i) => mountInspector(inspectorEls[i], app, i, hexes[i]));
+
+  // Linked selection in the split view: text positions and file bytes are mapped both ways
+  // for documents whose text matches the file on disk.
+  const maps = new WeakMap<Text, ByteMap | null>();
+  const byteMap = (tab: Tab): ByteMap | null => {
+    const own = app.owner(tab);
+    if (own.kind !== "memory" || !own.path || own.revision !== own.savedRevision || !tab.splitView) return null;
+    const doc = app.stateOf(tab).doc;
+    if (!maps.has(doc)) maps.set(doc, createByteMap(doc, own.encoding, own.eol, own.size));
+    return maps.get(doc) ?? null;
+  };
+  let syncingFromHex = false;
+  const hexToText = (tab: Tab, from: number, to: number) => {
+    const map = byteMap(tab);
+    const view = app.viewOf(tab);
+    if (!map || !view) return;
+    const a = map.toPos(from);
+    const b = to > from ? Math.max(a, map.toPos(to)) : a;
+    syncingFromHex = true;
+    try {
+      view.dispatch({ selection: { anchor: a, head: b }, effects: EditorView.scrollIntoView(a, { y: "center" }) });
+    } finally {
+      syncingFromHex = false;
+    }
+  };
+  const textToHex = () => {
+    if (syncingFromHex) return;
+    const i = app.focused;
+    const tab = app.panes[i]?.tab;
+    if (!tab?.splitView || !hexes[i].visible) return;
+    const map = byteMap(tab);
+    if (!map) return;
+    const sel = app.view.state.selection.main;
+    const a = map.toByte(sel.from);
+    const b = map.toByte(sel.to);
+    hexes[i].setSelection(a, b, true);
+  };
+  app.on("status", textToHex);
   // Shows the hex editor instead of the text editor for tabs in hex mode, and follows reloads
   // (a file changed by another program gets a fresh buffer).
   const hexTab: (Tab | null)[] = [null, null];
@@ -69,14 +118,25 @@ async function main(): Promise<void> {
       for (const [i, pane] of app.panes.entries()) {
         const tab = pane.tab;
         const hex = hexes[i];
+        const split = !!tab?.hexView && tab.splitView;
+        editorHosts[i].classList.toggle("split", split);
         if (tab?.hexView) {
-          pane.view.dom.style.display = "none";
+          pane.view.dom.style.display = split ? "" : "none";
           try {
             const info = await app.hexFor(tab);
             if (pane.tab !== tab) continue;
             const isNew = hex.buffer !== info.buffer || hexTab[i] !== tab || !hex.visible;
             hexTab[i] = tab;
-            hex.show({ ...info, onChange: () => app.noteHexChange(tab) }, isNew && i === app.focused);
+            hex.show(
+              {
+                ...info,
+                title: split ? t("Hex · linked to the text") : t("Hex · 16 bytes per row"),
+                onChange: () => app.noteHexChange(tab),
+                onSelect: (from, to) => (split ? hexToText(tab, from, to) : undefined),
+              },
+              isNew && i === app.focused && !split
+            );
+            if (split && isNew && i === app.focused) textToHex();
           } catch (e) {
             toast(errorText(e), 6000);
           }
@@ -86,6 +146,7 @@ async function main(): Promise<void> {
           pane.view.dom.style.display = "";
           if (i === app.focused) pane.view.focus();
         }
+        inspectors[i].refresh();
       }
     });
   };
@@ -100,6 +161,7 @@ async function main(): Promise<void> {
   const refreshKeys = () => {
     applyKeymap(cmds, settings.keymapPreset, settings.keyOverrides);
     keys?.rebuild();
+    titleBar?.refresh();
   };
   const macrosChanged = () => {
     addMacroCommands(cmds);
@@ -111,10 +173,16 @@ async function main(): Promise<void> {
   const extras = {
     toggleMenuBar,
     about: () => openAboutDialog(),
-    hex: () => (hexes[app.focused].visible ? hexes[app.focused] : null),
+    // In split view the text stays editable: edit commands go to the bytes only when they have the focus.
+    hex: () => {
+      const hx = hexes[app.focused];
+      if (!hx.visible) return null;
+      if (app.active?.splitView && !hx.root.contains(document.activeElement)) return null;
+      return hx;
+    },
     hexGoto: () => {
-      const hex = hexes[app.focused];
-      if (!hex.visible) return false;
+      const hex = extras.hex();
+      if (!hex) return false;
       void hex.gotoOffset();
       return true;
     },
@@ -133,12 +201,14 @@ async function main(): Promise<void> {
     if (c) void runCommand(c);
   };
   const status = mountStatusBar(app, statusbar, {
-    gotoLine: () => (hexes[app.focused].visible ? void hexes[app.focused].gotoOffset() : run("search.goto")),
+    gotoLine: () => (extras.hex() ? void extras.hex()!.gotoOffset() : run("search.goto")),
     run,
     isRecording: () => recorder.recording,
   });
   recorder.onChange(() => status.render());
-  (window as unknown as { __nax: unknown }).__nax = { app, settings, syntaxTree, updateSettings, cmds, recorder, run };
+  (window as unknown as { __nax: unknown }).__nax = { app, settings, syntaxTree, updateSettings, cmds, recorder, run, hexes };
+  const titleBar = mountTitleBar(titlebar, { openPalette: () => run("help.palette"), paletteKey: () => cmds.find((c) => c.id === "help.palette")?.key });
+  const docBars = [mountDocToolbar(app, toolbars[0], 0), mountDocToolbar(app, toolbars[1], 1)];
 
   const dynamicMenus: Record<string, () => DynamicItem[]> = {
     recent: () => {
@@ -185,6 +255,8 @@ async function main(): Promise<void> {
       compartments.whitespace.reconfigure(app.whitespaceExtFor(tab)),
     ] as StateEffect<unknown>[]);
     app.emit("status");
+    for (const ins of inspectors) ins.refresh();
+    for (const bar of docBars) bar.render();
   });
   onSystemThemeChange(() => {
     if (settings.theme === "system") applyTheme("system");

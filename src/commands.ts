@@ -605,7 +605,7 @@ export function buildCommands(app: App, find: FindPanel, extras: CommandExtras):
     { id: "settings.export", title: t("Export Settings…"), category: t("Settings"), run: () => extras.exportSettings?.() },
     { id: "settings.import", title: t("Import Settings…"), category: t("Settings"), run: () => extras.importSettings?.() },
     { id: "settings.dataFolder", title: t("Open Data Folder"), category: t("Settings"), run: async () => backend.revealInExplorer(await backend.appDataDir()) },
-    { id: "help.palette", title: t("Command Palette…"), key: "Ctrl+Shift+P", category: t("Help"), run: () => paletteFor(cmds) },
+    { id: "help.palette", title: t("Command Palette…"), key: "Ctrl+Shift+P", category: t("Help"), run: () => paletteFor(cmds, find) },
     { id: "help.updates", title: t("Check for Updates…"), category: t("Help"), run: () => checkForUpdates(false) },
     { id: "help.github", title: t("GitHub Repository"), category: t("Help"), run: () => openUrl(REPO_URL) },
     { id: "help.issue", title: t("Report an Issue"), category: t("Help"), run: () => openUrl(ISSUES_URL) },
@@ -643,13 +643,27 @@ export function addMacroCommands(cmds: Command[]): void {
   }
 }
 
-export async function paletteFor(cmds: Command[]): Promise<void> {
+/** Command palette: run a command, or find the typed text in the document. */
+export async function paletteFor(cmds: Command[], find?: FindPanel): Promise<void> {
+  const FIND = "@@find";
+  let query = "";
   const it = await pickList(
     "",
     cmds.filter((c) => c.id !== "help.palette").map((c) => ({ label: `${c.category}: ${c.title}`, value: c.id, hint: c.key ? displayChord(c.key, lang) : undefined })),
-    { placeholder: t("Type a command…") }
+    {
+      placeholder: t("Type a command, or text to find…"),
+      dynamic: (q) => {
+        query = q;
+        return q && find ? [{ label: t('Find "{text}" in the document', { text: q }), value: FIND, detail: t("Search") }] : [];
+      },
+    }
   );
-  const c = it && cmds.find((x) => x.id === it.value);
+  if (!it) return;
+  if (it.value === FIND && find) {
+    find.findText(query);
+    return;
+  }
+  const c = cmds.find((x) => x.id === it.value);
   if (c) await runCommand(c);
 }
 

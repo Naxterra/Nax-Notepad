@@ -7,6 +7,8 @@
 export interface ByteSource {
   size: number;
   read(offset: number, len: number): Promise<Uint8Array>;
+  /** Search the source itself (large files; unsaved patches are not searched). */
+  find?(pattern: Uint8Array, from: number, backwards: boolean): Promise<number | null>;
 }
 
 export const FULL_LIMIT = 8 * 1024 * 1024;
@@ -109,6 +111,28 @@ export class HexBuffer {
 
   isModified(o: number): boolean {
     return this.resizable ? this.mod[o] === 1 : this.patches.has(o);
+  }
+
+  /** Offset of the next (or previous) occurrence of `pattern` starting at `from`, or null. */
+  async find(pattern: Uint8Array, from: number, backwards: boolean): Promise<number | null> {
+    if (!pattern.length) return null;
+    if (!this.resizable) return this.source.find ? this.source.find(pattern, Math.max(0, from), backwards) : null;
+    const d = this.data;
+    const last = d.length - pattern.length;
+    const match = (i: number) => {
+      for (let k = 0; k < pattern.length; k++) if (d[i + k] !== pattern[k]) return false;
+      return true;
+    };
+    if (backwards) {
+      for (let i = Math.min(from, last); i >= 0; i--) if (d[i] === pattern[0] && match(i)) return i;
+    } else {
+      for (let i = Math.max(0, from); i <= last; i++) {
+        i = d.indexOf(pattern[0], i);
+        if (i < 0 || i > last) break;
+        if (match(i)) return i;
+      }
+    }
+    return null;
   }
 
   /** Bytes [start, end) (must be ready). */

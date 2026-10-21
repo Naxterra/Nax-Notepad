@@ -2,6 +2,7 @@ import { App, Tab } from "../app";
 import { backend } from "../backend";
 import { writeClipboard } from "../clipboard";
 import { contextMenu, h, toast } from "./dialogs";
+import { fileIcon, icon } from "./icons";
 import { t } from "../i18n";
 
 /** Tab bar of one pane. Tabs can be dragged within the bar or onto the other pane's bar. */
@@ -19,7 +20,7 @@ export function mountTabBar(app: App, root: HTMLElement, pane: 0 | 1): void {
         app.newTab();
       },
     },
-    "+"
+    icon("plus")
   );
   root.append(strip, addBtn);
 
@@ -35,6 +36,7 @@ export function mountTabBar(app: App, root: HTMLElement, pane: 0 | 1): void {
           title: (own.path ?? own.name) + (tab.cloneOf ? ` (${t("clone")})` : ""),
           draggable: "true",
         },
+        icon(own.hexView && !own.path ? "fileBinary" : fileIcon(own.name), "tab-icon"),
         h("span", { class: "tab-name" }, own.name),
         h("span", { class: "tab-dot" }, "●"),
         h(
@@ -47,7 +49,7 @@ export function mountTabBar(app: App, root: HTMLElement, pane: 0 | 1): void {
               void app.closeTab(tab);
             },
           },
-          "×"
+          icon("close")
         )
       );
       el.addEventListener("mousedown", (e) => {

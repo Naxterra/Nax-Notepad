@@ -12,7 +12,7 @@ export interface Theme {
   vars: Record<string, string>;
 }
 
-const base = (dark: boolean): Record<string, string> =>
+const classic = (dark: boolean): Record<string, string> =>
   dark
     ? {
         "--bg": "#1e1e1e",
@@ -127,15 +127,88 @@ const base = (dark: boolean): Record<string, string> =>
         "--syn-constant": "#0070c1",
       };
 
+/** The default look: deep navy chrome with a bright blue accent, or its light counterpart. */
+const base = (dark: boolean): Record<string, string> =>
+  dark
+    ? {
+        ...classic(true),
+        "--bg": "#0d1524",
+        "--chrome-bg": "#0a111e",
+        "--bg-elev": "#101a2b",
+        "--bg-elev2": "#16223a",
+        "--fg": "#d8dfec",
+        "--fg-muted": "#7c89a3",
+        "--border": "#1c2840",
+        "--accent": "#4f8dff",
+        "--accent-soft": "#4f8dff26",
+        "--accent-fg": "#ffffff",
+        "--selection": "#24427c",
+        "--selection-match": "#22314d",
+        "--cursor": "#8fb4ff",
+        "--line-highlight": "#ffffff07",
+        "--gutter-bg": "#0d1524",
+        "--gutter-fg": "#46557280",
+        "--gutter-active-fg": "#c4cfe3",
+        "--tab-bg": "#0a111e",
+        "--tab-active-bg": "#0d1524",
+        "--tab-fg": "#8290aa",
+        "--tab-active-fg": "#eef3fb",
+        "--status-bg": "#0a111e",
+        "--status-fg": "#8592ab",
+        "--menu-bg": "#111b2d",
+        "--menu-hover": "#1b2a46",
+        "--input-bg": "#0a1220",
+        "--input-fg": "#d8dfec",
+        "--button-bg": "#2f6fe8",
+        "--button-fg": "#ffffff",
+        "--scroll-thumb": "#8ea2c833",
+        "--code-bg": "#ffffff0b",
+        "--hr": "#1c2840",
+        "--link": "#6aa2ff",
+        "--quote-border": "#4f8dff",
+        "--syn-keyword": "#6fa2ff",
+        "--syn-heading": "#7fb0ff",
+        "--syn-link": "#6aa2ff",
+        "--syn-tag": "#6fa2ff",
+      }
+    : {
+        ...classic(false),
+        "--bg": "#ffffff",
+        "--chrome-bg": "#f3f5f9",
+        "--bg-elev": "#f7f9fc",
+        "--bg-elev2": "#e9eef6",
+        "--fg": "#1c2333",
+        "--fg-muted": "#66728a",
+        "--border": "#dce2ec",
+        "--accent": "#2563eb",
+        "--accent-soft": "#2563eb1f",
+        "--accent-fg": "#ffffff",
+        "--selection": "#c7dafc",
+        "--tab-bg": "#f3f5f9",
+        "--tab-active-bg": "#ffffff",
+        "--tab-fg": "#5d6880",
+        "--tab-active-fg": "#141a26",
+        "--status-bg": "#f3f5f9",
+        "--status-fg": "#5d6880",
+        "--menu-bg": "#ffffff",
+        "--menu-hover": "#e8effd",
+        "--input-bg": "#ffffff",
+        "--button-bg": "#2563eb",
+        "--scroll-thumb": "#5a6b8c40",
+        "--gutter-fg": "#9aa5b8",
+      };
+
 export const THEMES: Theme[] = [
   { id: "nax-dark", name: "Nax Dark", dark: true, vars: base(true) },
   { id: "nax-light", name: "Nax Light", dark: false, vars: base(false) },
+  { id: "classic-dark", name: "Classic Dark", dark: true, vars: classic(true) },
+  { id: "classic-light", name: "Classic Light", dark: false, vars: classic(false) },
   {
     id: "one-dark",
     name: "One Dark",
     dark: true,
     vars: {
-      ...base(true),
+      ...classic(true),
       "--bg": "#282c34",
       "--bg-elev": "#21252b",
       "--bg-elev2": "#2c313a",
@@ -175,7 +248,7 @@ export const THEMES: Theme[] = [
     name: "Monokai",
     dark: true,
     vars: {
-      ...base(true),
+      ...classic(true),
       "--bg": "#272822",
       "--bg-elev": "#1e1f1c",
       "--bg-elev2": "#2d2e27",
@@ -214,7 +287,7 @@ export const THEMES: Theme[] = [
     name: "Solarized Light",
     dark: false,
     vars: {
-      ...base(false),
+      ...classic(false),
       "--bg": "#fdf6e3",
       "--bg-elev": "#eee8d5",
       "--bg-elev2": "#e4ddc8",
@@ -253,7 +326,7 @@ export const THEMES: Theme[] = [
     name: "GitHub Light",
     dark: false,
     vars: {
-      ...base(false),
+      ...classic(false),
       "--bg": "#ffffff",
       "--bg-elev": "#f6f8fa",
       "--bg-elev2": "#eaeef2",
@@ -286,7 +359,7 @@ export const THEMES: Theme[] = [
     name: "Dracula",
     dark: true,
     vars: {
-      ...base(true),
+      ...classic(true),
       "--bg": "#282a36",
       "--bg-elev": "#21222c",
       "--bg-elev2": "#343746",
@@ -332,7 +405,13 @@ export function resolveTheme(id: string): Theme {
 export function applyTheme(id: string): Theme {
   const theme = resolveTheme(id);
   const root = document.documentElement;
-  for (const [k, v] of Object.entries(theme.vars)) root.style.setProperty(k, v);
+  // Tokens added with the 0.5 design fall back to existing ones for older themes.
+  const vars: Record<string, string> = {
+    "--chrome-bg": theme.vars["--tab-bg"] ?? theme.vars["--bg-elev"],
+    "--accent-soft": (theme.vars["--accent"] ?? "#4f8dff") + "26",
+    ...theme.vars,
+  };
+  for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
   root.style.setProperty("--editor-font", settings.fontFamily);
   root.style.setProperty("--editor-font-size", `${settings.fontSize}px`);
   root.style.setProperty("--lp-font", settings.previewFontFamily);
@@ -368,7 +447,7 @@ export const cmTheme = EditorView.theme({
   ".cm-gutters": {
     backgroundColor: "var(--gutter-bg)",
     color: "var(--gutter-fg)",
-    borderRight: "1px solid var(--border)",
+    borderRight: "none",
     fontFamily: "var(--editor-font)",
   },
   ".cm-lineNumbers .cm-gutterElement": { padding: "0 10px 0 14px", minWidth: "32px" },

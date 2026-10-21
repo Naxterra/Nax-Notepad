@@ -24,6 +24,7 @@ import { confirm3, confirmDialog, toast } from "./ui/dialogs";
 import { t } from "./i18n";
 
 export type TabKind = "memory" | "paged";
+export type ViewMode = "text" | "hex" | "split";
 
 /** State of "follow" (tail -f) mode for a tab. */
 export interface TailState {
@@ -58,6 +59,8 @@ export interface Tab {
   bufferTimer?: number;
   pendingCursor?: { line: number; col: number };
   hexView: boolean;
+  /** With hexView: show the text and the bytes side by side (the bytes are read-only then). */
+  splitView: boolean;
   /** Incremented on every change that affects what Save would write. */
   revision: number;
   /** Revision that is on disk. */
@@ -496,7 +499,7 @@ export class App {
   /** Read-only for editing: the tab setting or a window of a large file that cannot be edited. */
   effectiveReadOnly(tab: Tab): boolean {
     // In the hex view the text editor is hidden: nothing may change the text behind it.
-    return tab.readOnly || !!tab.paged?.windowReadOnly || tab.hexView;
+    return tab.readOnly || !!tab.paged?.windowReadOnly || (tab.hexView && !tab.splitView);
   }
 
   private applyReadOnly(tab: Tab): void {
@@ -600,6 +603,7 @@ export class App {
       paged: partial.paged ?? null,
       scrollTop: partial.scrollTop ?? 0,
       hexView: false,
+      splitView: false,
       revision: partial.dirty ? 1 : 0,
       savedRevision: 0,
       pane: partial.pane ?? (this.splitOn ? (this.focused as 0 | 1) : 0),
@@ -1322,14 +1326,27 @@ export class App {
 
   /** Switch between the text and the hex view. Unsaved byte edits are saved or discarded first. */
   async toggleHexView(tab: Tab): Promise<void> {
+    await this.setViewMode(tab, tab.hexView ? "text" : "hex");
+  }
+
+  viewMode(tab: Tab): ViewMode {
+    return !tab.hexView ? "text" : tab.splitView ? "split" : "hex";
+  }
+
+  /** Show the text, the bytes (editable), or both side by side. */
+  async setViewMode(tab: Tab, mode: ViewMode): Promise<void> {
     const own = this.owner(tab);
-    if (tab.hexView && own.hex?.dirty && !this.tabs.some((x) => x !== tab && x.hexView && this.owner(x) === own)) {
+    const cur = this.viewMode(tab);
+    if (cur === mode) return;
+    // Byte edits are only possible in the hex mode: save or discard them when leaving it.
+    if (cur === "hex" && own.hex?.dirty && !this.tabs.some((x) => x !== tab && x.hexView && !x.splitView && this.owner(x) === own)) {
       const r = await confirm3(t("Unsaved byte changes"), t('Save the changes made in the hex view of "{name}"?', { name: own.name }), [t("Save"), t("Discard")]);
       if (r === "cancel") return;
       if (r === "yes" && !(await this.save(own))) return;
       if (r === "no") this.discardHex(own);
     }
-    tab.hexView = !tab.hexView;
+    tab.hexView = mode !== "text";
+    tab.splitView = mode === "split";
     this.dispatchTo(tab, { effects: compartments.readOnly.reconfigure(EditorState.readOnly.of(this.effectiveReadOnly(tab))) });
     this.emit("active");
     this.emit("status");
@@ -1348,12 +1365,13 @@ export class App {
       } else {
         const path = own.path!;
         const size = await backend.fileSize(path);
-        own.hex = await HexBuffer.load({ size, read: (o, l) => backend.readBytes(path, o, l) });
+        own.hex = await HexBuffer.load({ size, read: (o, l) => backend.readBytes(path, o, l), find: (pattern, from, backwards) => backend.findBytes(path, pattern, from, backwards) });
       }
       own.hexKey = key;
     }
     let readOnly: string | null = null;
-    if (own.hexKey?.startsWith("text:")) readOnly = t("The hex view shows the unsaved text as UTF-8. Save the document to edit the bytes of the file.");
+    if (tab.splitView) readOnly = t("In the split view the bytes are shown for inspection. Choose Hex to edit them.");
+    else if (own.hexKey?.startsWith("text:")) readOnly = t("The hex view shows the unsaved text as UTF-8. Save the document to edit the bytes of the file.");
     else if (own.readOnly && !own.lockedReadOnly && !own.invalidBytes) readOnly = t("This document is read-only.");
     const name = own.name + (readOnly && own.hexKey?.startsWith("text:") ? ` (${t("unsaved")}, UTF-8)` : "");
     return { buffer: own.hex, name, readOnly };
@@ -1518,6 +1536,7 @@ export class App {
       dirty: tab.dirty,
       livePreview: tab.livePreview,
       hexView: tab.hexView,
+      splitView: tab.splitView,
       pinned: tab.pinned,
       untitled: tab.untitled,
       readOnly: tab.readOnly,
@@ -1631,6 +1650,7 @@ export class App {
       dirty?: boolean;
       livePreview?: boolean;
       hexView?: boolean;
+      splitView?: boolean;
       pinned?: boolean;
       untitled?: number | null;
       readOnly?: boolean;
@@ -1683,6 +1703,7 @@ export class App {
     }
     if (!tab) return null;
     tab.pinned = m.pinned ?? false;
+    tab.splitView = !!m.splitView && tab.hexView;
     if (m.encoding && tab.kind === "memory") tab.encoding = m.encoding;
     if (m.eol) tab.eol = m.eol;
     if (m.readOnly) tab.readOnly = true;

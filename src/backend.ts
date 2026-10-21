@@ -196,6 +196,9 @@ export const backend = {
   /** Replace a file with `bytes` (atomic). Fails with E_EXTERNAL_CHANGE if its time differs. */
   writeBytes: (path: string, bytes: Uint8Array, expectedMtime: number) =>
     invoke<SaveResult>("write_bytes", bytes, { headers: { "x-path": encodeURIComponent(path), "x-mtime": String(expectedMtime) } }),
+  /** Offset of a byte pattern in a file (searches the file on disk). */
+  findBytes: (path: string, pattern: Uint8Array, from: number, backwards: boolean) =>
+    invoke<number | null>("find_bytes", { path, pattern: Array.from(pattern), from, backwards }),
   /** Change single bytes of a (large) file through an atomic copy. */
   patchFile: (path: string, patches: [number, number][], expectedLen: number, expectedMtime: number) =>
     invoke<SaveResult>("patch_file", { path, patches, expectedLen, expectedMtime }),

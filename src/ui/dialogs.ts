@@ -158,7 +158,7 @@ export interface PickItem {
 }
 
 /** Fuzzy, keyboard-driven list picker (used by the command palette and the status bar menus). */
-export function pickList(title: string, items: PickItem[], opts: { placeholder?: string; initial?: string } = {}): Promise<PickItem | null> {
+export function pickList(title: string, items: PickItem[], opts: { placeholder?: string; initial?: string; dynamic?: (query: string) => PickItem[] } = {}): Promise<PickItem | null> {
   return new Promise((resolve) => {
     let result: PickItem | null = null;
     let filtered = items;
@@ -184,6 +184,7 @@ export function pickList(title: string, items: PickItem[], opts: { placeholder?:
       const q = input.value.trim().toLowerCase();
       filtered = q ? items.filter((it) => fuzzy(q, (it.label + " " + (it.detail ?? "")).toLowerCase())) : items;
       filtered = q ? filtered.sort((a, b) => score(q, a.label.toLowerCase()) - score(q, b.label.toLowerCase())) : filtered;
+      if (opts.dynamic) filtered = [...opts.dynamic(input.value.trim()), ...filtered];
       index = 0;
       render();
     };

@@ -5,6 +5,9 @@ for **multi-gigabyte files**. Built with Tauri 2 (Rust shell, WebView2) and Code
 
 ## Features
 
+- **Modern interface**: a frameless window with its own title bar and a command search box (it runs commands and finds text), a deep navy default theme with a matching light theme, tabs with file-type icons, and a toolbar per document with a clickable path, the **Text, Hex and Split** switch, "Decode as" and a read-only switch.
+- **Split view and inspector**: Split shows the text and its bytes side by side, and selecting either one selects the other. The inspector beside the bytes shows the selection (offsets, length, the bytes as text, the value at the cursor as signed and unsigned integers and floats in both byte orders) and the file (size, type recognized from the first bytes, access, encoding, line endings), with quick actions to copy as hex or text, go to an offset or find a byte pattern.
+
 - **Tabs** with drag-to-reorder, pin, middle-click close, context menu.
 - **Session restore**: every open tab, including unsaved text, comes back after a restart or
   crash. Unsaved buffers are written to `%APPDATA%\Nax-Notepad\buffers` as you type.
