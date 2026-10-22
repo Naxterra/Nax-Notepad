@@ -1,7 +1,7 @@
 // Obsidian-style Markdown Live Preview: the document is rendered in place and the raw syntax
 // of a block is revealed only while the cursor is on one of its lines.
 import { syntaxTree } from "@codemirror/language";
-import { EditorState, Extension, Range } from "@codemirror/state";
+import { EditorState, Extension, Range, StateEffect } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, WidgetType } from "@codemirror/view";
 import type { SyntaxNode, SyntaxNodeRef } from "@lezer/common";
 
@@ -399,15 +399,26 @@ const livePreviewTheme = EditorView.baseTheme({
   ".cm-lp-sub": { verticalAlign: "sub", fontSize: "0.75em" },
 });
 
+/** Rebuild the decorations once a mouse selection has ended. */
+const mouseSelectionDone = StateEffect.define<null>();
+
 export function livePreview(cfg: LivePreviewConfig): Extension {
   const plugin = ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
+      /**
+       * True while the mouse button is held to place the cursor or select text. Revealing the
+       * Markdown syntax of the touched line would move its text under the mouse, so the selection
+       * would end at the wrong place; the layout is kept until the button is released.
+       */
+      mouseSelecting = false;
       constructor(view: EditorView) {
         this.decorations = buildDecorations(view, cfg);
       }
       update(u: ViewUpdate) {
-        if (u.docChanged || u.viewportChanged || u.selectionSet || syntaxTree(u.startState) !== syntaxTree(u.state)) {
+        const done = u.transactions.some((tr) => tr.effects.some((e) => e.is(mouseSelectionDone)));
+        const structural = u.docChanged || u.viewportChanged || syntaxTree(u.startState) !== syntaxTree(u.state);
+        if (structural || done || (u.selectionSet && !this.mouseSelecting)) {
           this.decorations = buildDecorations(u.view, cfg);
         }
       }
@@ -425,7 +436,18 @@ export function livePreview(cfg: LivePreviewConfig): Extension {
               return true;
             }
           }
-          void view;
+          if (e.button === 0 && !(e.target as HTMLElement).closest("input, .cm-lp-checkbox")) {
+            this.mouseSelecting = true;
+            const end = () => {
+              window.removeEventListener("mouseup", end, true);
+              window.removeEventListener("blur", end);
+              this.mouseSelecting = false;
+              // Let CodeMirror finish its own mouseup handling first.
+              setTimeout(() => view.dispatch({ effects: mouseSelectionDone.of(null) }), 0);
+            };
+            window.addEventListener("mouseup", end, true);
+            window.addEventListener("blur", end);
+          }
           return false;
         },
       },
