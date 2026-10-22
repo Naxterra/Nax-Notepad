@@ -412,8 +412,16 @@ export function livePreview(cfg: LivePreviewConfig): Extension {
        * would end at the wrong place; the layout is kept until the button is released.
        */
       mouseSelecting = false;
+      /** Removes the listeners of a mouse selection in progress. */
+      stopMouse: (() => void) | null = null;
+      /** Set when the plugin is gone (view closed, tab state replaced, Live Preview turned off). */
+      destroyed = false;
       constructor(view: EditorView) {
         this.decorations = buildDecorations(view, cfg);
+      }
+      destroy() {
+        this.destroyed = true;
+        this.stopMouse?.();
       }
       update(u: ViewUpdate) {
         const done = u.transactions.some((tr) => tr.effects.some((e) => e.is(mouseSelectionDone)));
@@ -437,14 +445,28 @@ export function livePreview(cfg: LivePreviewConfig): Extension {
             }
           }
           if (e.button === 0 && !(e.target as HTMLElement).closest("input, .cm-lp-checkbox")) {
+            this.stopMouse?.();
             this.mouseSelecting = true;
-            const end = () => {
+            const stop = () => {
               window.removeEventListener("mouseup", end, true);
               window.removeEventListener("blur", end);
-              this.mouseSelecting = false;
-              // Let CodeMirror finish its own mouseup handling first.
-              setTimeout(() => view.dispatch({ effects: mouseSelectionDone.of(null) }), 0);
+              this.stopMouse = null;
             };
+            const end = () => {
+              stop();
+              this.mouseSelecting = false;
+              // Let CodeMirror finish its own mouseup handling first. The view or this plugin
+              // may be gone by then (tab closed or switched), so only a live plugin redraws.
+              setTimeout(() => {
+                if (this.destroyed) return;
+                try {
+                  view.dispatch({ effects: mouseSelectionDone.of(null) });
+                } catch {
+                  /* the view was destroyed in the meantime */
+                }
+              }, 0);
+            };
+            this.stopMouse = stop;
             window.addEventListener("mouseup", end, true);
             window.addEventListener("blur", end);
           }
