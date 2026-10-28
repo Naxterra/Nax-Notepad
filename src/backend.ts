@@ -175,6 +175,8 @@ export const backend = {
   sessionStoreBuffer: (id: string, text: string, generation: number) => invoke<void>("session_store_buffer", { id, text, generation }),
   sessionLoadBuffer: (id: string) => invoke<string | null>("session_load_buffer", { id }),
   sessionDropBuffer: (id: string, generation: number) => invoke<void>("session_drop_buffer", { id, generation }),
+  /** A new, higher number for every page load (see `bufferGeneration` in app.ts). */
+  sessionBufferEpoch: () => invoke<number>("session_buffer_epoch"),
   settingsLoad: () => invoke<Record<string, unknown>>("settings_load"),
   settingsSave: (value: Record<string, unknown>) => invoke<void>("settings_save", { value }),
   startupFiles: () => invoke<string[]>("startup_files"),

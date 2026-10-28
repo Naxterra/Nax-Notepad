@@ -6,7 +6,7 @@ import { indentationMarkers } from "@replit/codemirror-indentation-markers";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { App, Tab } from "./app";
+import { App, setBufferEpoch, Tab } from "./app";
 import { backend, errorText } from "./backend";
 import { addMacroCommands, buildCommands, Command, installKeybindings, recorder, runCommand } from "./commands";
 import { compartments, lineNumbersExt } from "./editor";
@@ -349,6 +349,7 @@ async function main(): Promise<void> {
 
   // Restore session, then open files from the command line
   // Unsaved text always comes back; the setting only decides about the other tabs.
+  setBufferEpoch(await backend.sessionBufferEpoch());
   let restored = false;
   try {
     restored = await app.restoreSession({ onlyUnsaved: !settings.restoreSession });

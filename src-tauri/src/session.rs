@@ -163,128 +163,214 @@ fn rewrites_dir() -> PathBuf {
     data_dir().join("rewrites")
 }
 
-/// Where the previous content of a file that is being rewritten in place is kept.
+/// Identity of a file (volume and file index); every hard link of a file has the same one.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+struct FileId {
+    volume: u64,
+    index: u64,
+}
+
+/// What an in-place rewrite needs to be finished after a crash: the complete new content in
+/// `new`, the previous content in `backup`, and the identity of the file it is meant for.
 #[derive(Serialize, Deserialize)]
 struct RewriteNote {
     target: PathBuf,
+    new: PathBuf,
     backup: PathBuf,
+    id: Option<FileId>,
+    /// Seconds since 1970 when the rewrite started.
+    started: u64,
 }
 
-/// Rewrite a file in place, keeping a backup copy until the new content is on disk. Used for
-/// files with several hard links, which a replacement would separate.
+/// A note that could not be finished is dropped after this long (its files stay where they are).
+const NOTE_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Rewrite a file in place. Used for files with several hard links, which a replacement would
+/// separate.
 fn rewrite_in_place(target: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
     rewrite_in_place_noted(target, write, &rewrites_dir())
 }
 
 fn rewrite_in_place_noted(target: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>, notes: &Path) -> Result<(), String> {
-    let (backup, f) = create_temp_sibling(target)?;
+    // The new content is written to a temporary copy first. The file itself is not touched yet,
+    // so `write` may still read from it (a hex patch streams the file it patches).
+    let (new, mut f) = create_temp_sibling(target)?;
+    let written = write(&mut f).and_then(|_| f.sync_all());
     drop(f);
-    let copied = fs::copy(target, &backup).and_then(|_| OpenOptions::new().write(true).open(&backup)?.sync_all());
-    if let Err(e) = copied {
+    if let Err(e) = written {
+        let _ = fs::remove_file(&new);
+        return Err(format!("Cannot write {}: {e}", target.display()));
+    }
+    // A backup of the previous content, for a copy that fails with an error.
+    let backup = match create_temp_sibling(target) {
+        Ok((b, f)) => {
+            drop(f);
+            b
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&new);
+            return Err(e);
+        }
+    };
+    let remove_temps = || {
+        let _ = fs::remove_file(&new);
         let _ = fs::remove_file(&backup);
+    };
+    if let Err(e) = copy_into(target, &backup) {
+        remove_temps();
         return Err(format!("Cannot back up {}: {e}", target.display()));
     }
-    // Until the new content is on disk, a note says where the previous content is, so the next
-    // start puts it back if the app or the computer stops in the middle of the write.
-    let note = match write_rewrite_note(notes, target, &backup) {
+    // While the file is rewritten, a note says where the new content is, so the next start
+    // finishes the save if the app or the computer stops in the middle. The note stays open
+    // and locked until the end, so another running copy of the app leaves it alone.
+    let note = RewriteNote { target: target.to_path_buf(), new: new.clone(), backup: backup.clone(), id: file_info(target).map(|(_, id)| id), started: unix_secs() };
+    let (note_path, note_file) = match write_rewrite_note(notes, &note) {
         Ok(n) => n,
         Err(e) => {
-            let _ = fs::remove_file(&backup);
+            remove_temps();
             return Err(format!("Cannot prepare saving {}: {e}", target.display()));
         }
     };
-    let result = OpenOptions::new().write(true).truncate(true).open(target).and_then(|mut f| {
-        write(&mut f)?;
-        f.sync_all()
-    });
-    match result {
+    match copy_into(&new, target) {
         Ok(()) => {
-            let _ = fs::remove_file(&note);
-            let _ = fs::remove_file(&backup);
+            let _ = fs::remove_file(&note_path);
+            drop(note_file);
+            remove_temps();
             Ok(())
         }
         Err(e) => {
-            // Put the original content back; if even that fails, the note stays and the next
-            // start tries again.
-            if put_back(&backup, target).is_ok() {
-                let _ = fs::remove_file(&note);
-                let _ = fs::remove_file(&backup);
+            if copy_into(&backup, target).is_ok() {
+                let _ = fs::remove_file(&note_path);
+                drop(note_file);
+                remove_temps();
                 Err(format!("Cannot write {}: {e}", target.display()))
             } else {
-                Err(format!("Cannot write {}: {e}. The previous content is kept in {}", target.display(), backup.display()))
+                // The note stays: the next start finishes the save from the new content.
+                drop(note_file);
+                Err(format!("Cannot write {}: {e}. The new content is kept in {} and the previous content in {}", target.display(), new.display(), backup.display()))
             }
         }
     }
 }
 
-fn write_rewrite_note(notes: &Path, target: &Path, backup: &Path) -> Result<PathBuf, String> {
+/// Write `note` into a new file in `notes` and keep that file open. On Windows nobody else can
+/// read it while it is open, which is how a second start of the app knows the save is running.
+fn write_rewrite_note(notes: &Path, note: &RewriteNote) -> Result<(PathBuf, File), String> {
     fs::create_dir_all(notes).map_err(|e| e.to_string())?;
-    let (path, mut f) = create_temp_sibling(&notes.join("rewrite.json"))?;
-    let note = RewriteNote { target: target.to_path_buf(), backup: backup.to_path_buf() };
-    let json = serde_json::to_vec(&note).map_err(|e| e.to_string())?;
-    if let Err(e) = f.write_all(&json).and_then(|_| f.sync_all()) {
-        drop(f);
-        let _ = fs::remove_file(&path);
-        return Err(e.to_string());
+    let json = serde_json::to_vec(note).map_err(|e| e.to_string())?;
+    let mut last_err = None;
+    for _ in 0..32 {
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = notes.join(format!("{}-{:x}-{n}.json", std::process::id(), unix_secs()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE);
+        }
+        match options.open(&path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(&json).and_then(|_| f.sync_all()) {
+                    drop(f);
+                    let _ = fs::remove_file(&path);
+                    return Err(e.to_string());
+                }
+                return Ok((path, f));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
     }
-    Ok(path)
+    Err(last_err.map(|e| e.to_string()).unwrap_or_else(|| "name collision".into()))
 }
 
-/// Copy `backup` over the content of `target` without replacing the file, so every hard link
-/// sees it.
-fn put_back(backup: &Path, target: &Path) -> std::io::Result<()> {
-    let mut src = File::open(backup)?;
-    let mut dst = OpenOptions::new().write(true).truncate(true).open(target)?;
-    std::io::copy(&mut src, &mut dst)?;
-    dst.sync_all()
+/// Copy the content of `src` over the content of the existing file `dst` without replacing it,
+/// so every hard link of `dst` sees it.
+fn copy_into(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut s = File::open(src)?;
+    let mut d = OpenOptions::new().write(true).truncate(true).open(dst)?;
+    std::io::copy(&mut s, &mut d)?;
+    d.sync_all()
 }
 
-/// Put back the previous content of files whose in-place rewrite was interrupted (the app or
-/// the computer stopped in the middle of a save). Returns the files that were put back.
+/// Finish in-place rewrites that were interrupted (the app or the computer stopped in the
+/// middle of a save): the file gets the content that was being saved. Returns those files.
 pub fn recover_interrupted_rewrites() -> Vec<PathBuf> {
     recover_rewrites_in(&rewrites_dir())
 }
 
 fn recover_rewrites_in(notes: &Path) -> Vec<PathBuf> {
-    let mut restored = Vec::new();
-    let Ok(rd) = fs::read_dir(notes) else { return restored };
+    let mut finished = Vec::new();
+    let Ok(rd) = fs::read_dir(notes) else { return finished };
     for e in rd.flatten() {
-        let note = fs::read(e.path()).ok().and_then(|b| serde_json::from_slice::<RewriteNote>(&b).ok());
-        if let Some(note) = note {
-            if note.backup.is_file() {
-                if put_back(&note.backup, &note.target).is_err() {
-                    continue; // keep the note and try again at the next start
+        // A note that cannot be read is still open: another copy of the app is saving.
+        let Ok(bytes) = fs::read(e.path()) else { continue };
+        // A note that is not complete was never closed normally, but it is written before the
+        // file is touched, so the file is unchanged.
+        let Ok(note) = serde_json::from_slice::<RewriteNote>(&bytes) else {
+            let _ = fs::remove_file(e.path());
+            continue;
+        };
+        match file_info(&note.target) {
+            // The file is not there (a drive that is not connected): try again at a later start.
+            None => {
+                if unix_secs().saturating_sub(note.started) > NOTE_MAX_AGE_SECS {
+                    let _ = fs::remove_file(e.path());
                 }
-                let _ = fs::remove_file(&note.backup);
-                restored.push(note.target);
+                continue;
             }
+            // Another file now has this path: never overwrite it.
+            Some((_, id)) if note.id.is_some_and(|n| n != id) => {
+                let _ = fs::remove_file(e.path());
+                continue;
+            }
+            Some(_) => {}
         }
-        // A note that cannot be read was never completed, so the target was not touched yet.
+        let source = if note.new.is_file() { &note.new } else { &note.backup };
+        if !source.is_file() || copy_into(source, &note.target).is_err() {
+            continue;
+        }
         let _ = fs::remove_file(e.path());
+        let _ = fs::remove_file(&note.new);
+        let _ = fs::remove_file(&note.backup);
+        finished.push(note.target);
     }
-    restored
+    finished
 }
 
-/// Number of directory entries (hard links) that refer to the file; 1 if unknown.
+/// Number of hard links and identity of a file, if it can be opened.
 #[cfg(windows)]
-pub fn hard_link_count(path: &Path) -> u32 {
+fn file_info(path: &Path) -> Option<(u32, FileId)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-    let Ok(f) = File::open(path) else { return 1 };
+    let f = File::open(path).ok()?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the handle belongs to `f`, which lives until the end of this function.
     let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
-    if ok == 0 {
-        1
-    } else {
-        info.nNumberOfLinks.max(1)
-    }
+    (ok != 0).then(|| {
+        let id = FileId { volume: info.dwVolumeSerialNumber as u64, index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64 };
+        (info.nNumberOfLinks, id)
+    })
 }
 
 #[cfg(not(windows))]
-pub fn hard_link_count(path: &Path) -> u32 {
+fn file_info(path: &Path) -> Option<(u32, FileId)> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(path).map(|m| m.nlink() as u32).unwrap_or(1)
+    let m = fs::metadata(path).ok()?;
+    Some((m.nlink() as u32, FileId { volume: m.dev(), index: m.ino() }))
+}
+
+/// Number of directory entries (hard links) that refer to the file; 1 if unknown.
+pub fn hard_link_count(path: &Path) -> u32 {
+    file_info(path).map(|(n, _)| n.max(1)).unwrap_or(1)
 }
 
 #[cfg(windows)]
@@ -454,6 +540,13 @@ fn store_generation(path: &Path, id: &str, text: &str, generation: Option<u64>) 
         }
     }
     replace_atomic_locked(path, |f| f.write_all(text.as_bytes()))
+}
+
+/// A new number for every page load of the frontend. Tab revisions start again after a reload,
+/// so recovery-buffer generations include this number to stay above those of earlier loads.
+pub fn next_buffer_epoch() -> u64 {
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+    EPOCH.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// Delete the stored buffer and edit log; stores of `generation` or older are ignored afterwards.
@@ -631,29 +724,80 @@ mod tests {
         assert!(err.contains(&kept[0].display().to_string()), "the message must say where it is: {err}");
     }
 
+    /// The state a crash in the middle of an in-place rewrite leaves behind.
+    fn crashed_rewrite(dir: &Path, notes: &Path, target: &Path) -> (PathBuf, PathBuf, File) {
+        let new = dir.join(".a.txt.new.naxtmp");
+        let backup = dir.join(".a.txt.backup.naxtmp");
+        std::fs::write(&new, b"new content").unwrap();
+        std::fs::copy(target, &backup).unwrap();
+        let note = RewriteNote { target: target.to_path_buf(), new: new.clone(), backup: backup.clone(), id: file_info(target).map(|(_, id)| id), started: unix_secs() };
+        let (_, handle) = write_rewrite_note(notes, &note).unwrap();
+        std::fs::OpenOptions::new().write(true).truncate(true).open(target).unwrap().write_all(b"new con").unwrap();
+        (new, backup, handle)
+    }
+
     #[test]
-    fn interrupted_save_of_a_hard_linked_file_is_put_back_at_next_start() {
+    fn interrupted_save_of_a_hard_linked_file_is_finished_at_next_start() {
         let dir = tempfile::tempdir().unwrap();
         let notes = dir.path().join("notes");
         let a = dir.path().join("a.txt");
         let b = dir.path().join("b.txt");
         std::fs::write(&a, b"original content").unwrap();
         std::fs::hard_link(&a, &b).unwrap();
-        // The state a crash leaves: backup and note written, the target half rewritten.
-        let backup = dir.path().join(".a.txt.backup.naxtmp");
-        std::fs::copy(&a, &backup).unwrap();
-        write_rewrite_note(&notes, &a, &backup).unwrap();
-        std::fs::OpenOptions::new().write(true).truncate(true).open(&a).unwrap().write_all(b"new con").unwrap();
-        let restored = recover_rewrites_in(&notes);
-        assert_eq!(restored, vec![a.clone()]);
-        assert_eq!(std::fs::read(&a).unwrap(), b"original content");
-        assert_eq!(std::fs::read(&b).unwrap(), b"original content", "both names must show the previous content");
-        assert!(!backup.exists());
+        let (new, backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
+        drop(handle); // the process that was saving is gone
+        let finished = recover_rewrites_in(&notes);
+        assert_eq!(finished, vec![a.clone()]);
+        assert_eq!(std::fs::read(&a).unwrap(), b"new content");
+        assert_eq!(std::fs::read(&b).unwrap(), b"new content", "both names must show the saved content");
+        assert!(!backup.exists() && !new.exists());
         assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
         // A completed save leaves no note behind.
         rewrite_in_place_noted(&a, |f| f.write_all(b"saved"), &notes).unwrap();
         assert_eq!(std::fs::read(&b).unwrap(), b"saved");
         assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(TEMP_SUFFIX)).count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_save_in_progress_is_not_touched_by_a_second_start_of_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"original content").unwrap();
+        let (new, backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
+        // The note is still open: the first copy of the app is in the middle of saving.
+        assert!(recover_rewrites_in(&notes).is_empty());
+        assert_eq!(std::fs::read(&a).unwrap(), b"new con");
+        assert!(new.exists() && backup.exists());
+        assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 1);
+        drop(handle);
+    }
+
+    #[test]
+    fn an_unfinished_save_never_overwrites_a_different_file_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"original content").unwrap();
+        let (new, _backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
+        drop(handle);
+        // The file was deleted and the user made a new one with the same name.
+        std::fs::remove_file(&a).unwrap();
+        std::fs::write(&a, b"a different file").unwrap();
+        assert!(recover_rewrites_in(&notes).is_empty());
+        assert_eq!(std::fs::read(&a).unwrap(), b"a different file");
+        assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0, "the note is dropped");
+        assert!(new.exists(), "the content that was being saved is still there for the user");
+    }
+
+    #[test]
+    fn each_page_load_gets_a_higher_recovery_epoch() {
+        let a = next_buffer_epoch();
+        let b = next_buffer_epoch();
+        assert!(b > a && a >= 1);
     }
 
     #[test]

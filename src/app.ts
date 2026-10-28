@@ -122,13 +122,22 @@ const mirrored = Annotation.define<boolean>();
 type AppEvent = "tabs" | "status" | "active" | "layout" | "doc";
 type Listener = () => void;
 
+let bufferEpoch = 0;
+
+/** Set once per page load from `backend.sessionBufferEpoch()`, before any recovery data is written. */
+export function setBufferEpoch(epoch: number): void {
+  bufferEpoch = epoch;
+}
+
 /**
  * Generation of the recovery buffer that holds revision `rev` of a tab. The backend ignores a
  * store whose generation is not above the last dropped one, so a store that finishes after the
- * save of the same revision cannot bring the old text back.
+ * save of the same revision cannot bring the old text back. Revisions start again when the page
+ * reloads (a language change) while the backend keeps running, so every page load has its own,
+ * higher epoch in the upper bits.
  */
 export function bufferGeneration(rev: number): number {
-  return rev + 1;
+  return bufferEpoch * 2 ** 32 + rev + 1;
 }
 
 /** Display name of an untitled tab in the current UI language. */

@@ -29,7 +29,8 @@ if ($confVersion -ne $version -or $cargoVersion -ne $version) {
 }
 
 if (-not $AllowDirty) {
-    $changes = git status --porcelain --untracked-files=no
+    # Untracked files count too: the build would compile a new source file that was never added.
+    $changes = git status --porcelain
     if ($LASTEXITCODE) { throw "git status failed" }
     if ($changes) { throw "The working tree has uncommitted changes. Commit them first, or pass -AllowDirty for a local build that is not published." }
 }

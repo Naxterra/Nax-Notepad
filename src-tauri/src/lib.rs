@@ -600,6 +600,11 @@ async fn session_store_buffer(id: String, text: String, generation: Option<u64>)
 }
 
 #[tauri::command]
+fn session_buffer_epoch() -> u64 {
+    session::next_buffer_epoch()
+}
+
+#[tauri::command]
 fn session_load_buffer(id: String) -> Option<String> {
     session::load_buffer(&id)
 }
@@ -1210,7 +1215,7 @@ pub fn run() {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview"));
     }
     for path in session::recover_interrupted_rewrites() {
-        log::warn!("an interrupted save was undone, the previous content is back in {}", path.display());
+        log::warn!("an interrupted save was finished: {}", path.display());
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     let initial = collect_file_args(std::env::args(), &cwd);
@@ -1273,6 +1278,7 @@ pub fn run() {
             session_save,
             session_store_buffer,
             session_load_buffer,
+            session_buffer_epoch,
             session_drop_buffer,
             settings_load,
             settings_save,
@@ -1381,6 +1387,18 @@ mod tests {
         let p = dir.path().join("x");
         std::fs::write(&p, "some content").unwrap();
         assert!(head_hash(&p, 12).unwrap() < (1u64 << 53));
+    }
+
+    #[test]
+    fn hex_patch_of_a_file_with_several_hard_links_is_saved_under_every_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.bin");
+        let other = dir.path().join("other-name.bin");
+        std::fs::write(&p, [1u8, 2, 3, 4]).unwrap();
+        std::fs::hard_link(&p, &other).unwrap();
+        patch_file_impl(&p, &mut vec![(2, 0xEE)], 4, Some(mtime_of(&p))).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), [1, 2, 0xEE, 4]);
+        assert_eq!(std::fs::read(&other).unwrap(), [1, 2, 0xEE, 4]);
     }
 
     #[test]

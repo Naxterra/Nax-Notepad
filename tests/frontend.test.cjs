@@ -283,6 +283,18 @@ test("saving tells the backend which file version it replaces so another program
   assert.deepEqual(expected, [1234, 5678, null]);
 });
 
+test("after the page reloads (language change), recovery writes still count as newer than the last save", () => {
+  const { bufferGeneration, setBufferEpoch } = load("app");
+  try {
+    setBufferEpoch(1);
+    const savedBeforeReload = bufferGeneration(20);
+    setBufferEpoch(2);
+    assert.ok(bufferGeneration(1) > savedBeforeReload, "the first edit after the reload must be stored");
+  } finally {
+    setBufferEpoch(0);
+  }
+});
+
 test("a recovery write that finishes after the save cannot bring the old text back", async () => {
   const stores = [];
   const drops = [];
@@ -852,11 +864,16 @@ test("letter shortcuts follow the keyboard layout (AZERTY), digits stay by posit
 test("text typed through an input method is recorded in a macro", () => {
   const { MacroRecorder } = load("commands");
   const r = new MacroRecorder();
+  const ev = (key, mods = {}) => ({ key, code: "KeyA", ctrlKey: false, shiftKey: false, altKey: false, isComposing: false, ...mods });
   r.start();
+  r.key(ev("Process", { isComposing: true }));
   r.composed("日本");
   r.composed("");
+  // A dead key sequence (^ then e) whose result is a normal key press is recorded once.
+  r.key(ev("ê"));
+  r.composed("ê");
   r.stop();
-  assert.deepEqual(r.last, [{ type: "text", text: "日本" }]);
+  assert.deepEqual(r.last, [{ type: "text", text: "日本ê" }]);
 });
 
 test("Live Preview never loads images from network shares and loads internet images only when allowed", () => {
@@ -870,6 +887,7 @@ test("Live Preview never loads images from network shares and loads internet ima
     assert.equal(imageSource(blocked, doc, false), null, blocked);
   }
   assert.deepEqual(imageSource("https://example.com/x.png", doc, true), { url: "https://example.com/x.png" });
+  assert.equal(imageSource("http://example.com/x.png", doc, true), null, "plain http is never loaded");
   assert.deepEqual(imageSource("data:image/png;base64,AAAA", doc, false), { url: "data:image/png;base64,AAAA" });
   // A document on a share may show images from the same share, but not from other computers.
   const shared = "\\\\srv\\docs\\a.md";

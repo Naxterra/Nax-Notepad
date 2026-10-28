@@ -42,13 +42,15 @@ const NETWORK_OR_DEVICE = /^[\\/]{2}/;
 
 /**
  * What Live Preview may load for an image reference in the document at `docPath`: a data URL,
- * an http(s) URL when `remote` is allowed, or a local file path. Null means the image is not
+ * an https URL when `remote` is allowed, or a local file path. Null means the image is not
  * loaded. Network shares and device paths are refused, because only looking at a document
  * would make Windows connect to another computer (and send the user's credentials to it).
  */
 export function imageSource(src: string, docPath: string | null, remote: boolean): { url: string } | { path: string } | null {
   if (/^data:image\//i.test(src)) return { url: src };
-  if (/^https?:/i.test(src)) return remote ? { url: src } : null;
+  // Plain http is never loaded (the page's content security policy allows only https).
+  if (/^https:/i.test(src)) return remote ? { url: src } : null;
+  if (/^http:/i.test(src)) return null;
   let path: string;
   if (/^file:/i.test(src)) {
     // file:///C:/x is a local file; file://server/share/x is a network share.

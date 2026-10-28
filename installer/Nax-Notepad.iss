@@ -41,6 +41,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ChangesAssociations=yes
+; Tell running programs about the PATH entry that is added on install and removed on uninstall.
+ChangesEnvironment=yes
 CloseApplications=yes
 RestartApplications=no
 ShowLanguageDialog=auto

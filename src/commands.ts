@@ -103,14 +103,22 @@ export class MacroRecorder {
   command(id: string): void {
     if (this.recording && !id.startsWith("macro.")) addStep(this.steps, { type: "cmd", id });
   }
+  /** True while an input method (IME) is composing: its key presses are not recorded. */
+  private imeKeys = false;
   key(e: KeyboardEvent): void {
     if (!this.recording) return;
+    if (e.isComposing || e.key === "Process") this.imeKeys = true;
     const s = stepForKey(e);
     if (s) addStep(this.steps, s);
   }
-  /** Text that an input method (IME) committed; its key presses are not recorded. */
+  /**
+   * Text that an input method committed. Only recorded when its key presses were skipped: a
+   * dead key (^ then e) can also end a composition, but its result arrives as a normal key
+   * press that is already recorded.
+   */
   composed(text: string): void {
-    if (this.recording && text) addStep(this.steps, { type: "text", text });
+    if (this.recording && this.imeKeys && text) addStep(this.steps, { type: "text", text });
+    this.imeKeys = false;
   }
 }
 
