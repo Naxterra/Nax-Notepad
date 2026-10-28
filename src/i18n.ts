@@ -129,8 +129,8 @@ const de: Record<string, string> = {
   "File changed on disk": "Datei auf dem Datenträger geändert",
   '"{name}" has several names (hard links). A file this large cannot be saved without separating them, so it was not saved. Use Save As to save a copy.':
     "„{name}“ hat mehrere Namen (Hardlinks). Eine so große Datei kann nicht gespeichert werden, ohne sie zu trennen, deshalb wurde sie nicht gespeichert. Speichern Sie mit „Speichern unter“ eine Kopie.",
-  "Unsaved changes to these large files could not be restored, because the files were changed or removed by another program:\n\n{files}":
-    "Ungespeicherte Änderungen an diesen großen Dateien konnten nicht wiederhergestellt werden, weil ein anderes Programm die Dateien geändert oder entfernt hat:\n\n{files}",
+  "Unsaved changes to these files could not be restored, because the files were changed by another program or their recovery data is missing:\n\n{files}":
+    "Ungespeicherte Änderungen an diesen Dateien konnten nicht wiederhergestellt werden, weil ein anderes Programm die Dateien geändert hat oder ihre Wiederherstellungsdaten fehlen:\n\n{files}",
   "Unsaved changes lost": "Ungespeicherte Änderungen verloren",
   "Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}":
     "Nax-Notepad wurde beim Speichern dieser Dateien beendet. Das Speichern wurde jetzt abgeschlossen, sie enthalten also den gespeicherten Text:\n\n{files}",

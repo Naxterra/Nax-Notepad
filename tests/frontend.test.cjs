@@ -347,7 +347,7 @@ test("unsaved changes that could not be restored for 30 days are reported as los
   app.tabs = [];
   await app.restoreSession();
   assert.equal(messages.length, 1);
-  assert.match(messages[0], /could not be restored, because the files were changed or removed/);
+  assert.match(messages[0], /could not be restored, because the files were changed by another program or their recovery data is missing/);
   assert.deepEqual(app.keptMetas, []);
 });
 
@@ -365,7 +365,7 @@ test("a tab with unsaved text whose restore fails is kept in the session instead
   assert.match(messages[0], /locked\.txt/);
 });
 
-test("a tab whose recovery data is gone is not kept or reported again at every start", async () => {
+test("a tab whose recovery data is gone is reported as lost once and not kept", async () => {
   messages.length = 0;
   backend.sessionHasRecovery = async () => false;
   backend.sessionLoad = async () => ({ tabs: [{ id: "gone", path: "C:/data/gone.txt", kind: "memory", dirty: true }], active: null, next_untitled: 1 });
@@ -376,7 +376,41 @@ test("a tab whose recovery data is gone is not kept or reported again at every s
   };
   await app.restoreSession();
   assert.deepEqual(app.keptMetas, []);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /recovery data is missing/);
+  assert.match(messages[0], /gone\.txt/);
+});
+
+test("closing before the last session is restored does not write a session that would delete its recovery data", async () => {
+  let writes = 0;
+  backend.sessionSave = async () => {
+    writes++;
+  };
+  backend.sessionStoreBuffer = async () => {};
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "typed early" }) });
+  app.holdSession();
+  await app.saveSessionNow(true);
+  await app.flushAll();
+  assert.equal(writes, 0, "nothing may be written while the old session is not restored");
+  backend.sessionLoad = async () => ({ tabs: [], active: null, next_untitled: 1 });
+  await app.restoreSession();
+  await app.saveSessionNow(true);
+  assert.equal(writes, 1, "after the restore the session is written again");
+});
+
+test("a kept entry that still cannot be restored when its file is opened stays only once", async () => {
+  const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
+  const kept = { id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: Date.now() };
+  app.keptMetas = [kept];
+  app.lostEdits = [];
+  app.notRestored = [];
+  backend.pathExists = async () => false;
+  backend.sessionHasRecovery = async () => true;
+  app.openOne = async () => {
+    throw new Error("drive not connected");
+  };
+  await app.openFiles(["E:/logs/big.log"], false);
+  assert.deepEqual(app.keptMetas.map((m) => m.id), ["big"]);
 });
 
 test("opening a file whose unsaved changes were kept restores those changes instead of a second tab", async () => {

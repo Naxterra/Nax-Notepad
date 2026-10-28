@@ -176,6 +176,8 @@ export class App {
    * deleted, and are tried again at the next start.
    */
   private keptMetas: TabMeta[] = [];
+  /** Set from start-up until `restoreSession` has finished: the session file is not written. */
+  private sessionHeld = false;
   private notRestored: string[] = [];
   private cursorSaveTimer: number | undefined;
   private scrollSyncing = false;
@@ -659,16 +661,18 @@ export class App {
       // instead of beside them in a second tab that would later restore the older ones too.
       const kept = (this.keptMetas ?? []).find((m) => m.path && m.path.toLowerCase() === p.toLowerCase());
       if (kept) {
+        // Taken out first: if it still cannot be restored, restoreTab keeps it again itself.
+        this.keptMetas = this.keptMetas.filter((m) => m !== kept);
         try {
           const tab = await this.restoreTab(kept);
           if (tab) {
-            this.keptMetas = this.keptMetas.filter((m) => m !== kept);
             last = tab;
             continue;
           }
         } catch {
-          /* still not possible: open the file as it is on disk */
+          this.keptMetas.push(kept);
         }
+        if (!this.keptMetas.some((m) => m.id === kept.id)) this.keptMetas.push(kept);
       }
       try {
         last = await this.openOne(p);
@@ -1644,11 +1648,19 @@ export class App {
   }
 
   /** Write the session file. Background saves only log failures; `strict` rethrows them. */
+  /** Do not write the session file until `restoreSession` has finished (see `sessionHeld`). */
+  holdSession(): void {
+    this.sessionHeld = true;
+  }
+
   async saveSessionNow(strict = false): Promise<void> {
     if (this.sessionTimer) {
       clearTimeout(this.sessionTimer);
       this.sessionTimer = undefined;
     }
+    // A session written now would leave out the tabs that are not restored yet, and the backend
+    // would delete their recovery data.
+    if (this.sessionHeld) return;
     const owners = this.tabs.filter((x) => !x.cloneOf);
     const active = this.active ? this.owner(this.active) : null;
     const data: SessionData = {
@@ -1738,9 +1750,10 @@ export class App {
       return true;
     } finally {
       this.restoring = false;
+      this.sessionHeld = false;
       this.scheduleSessionSave();
       if (this.lostEdits.length) {
-        void message(t("Unsaved changes to these large files could not be restored, because the files were changed or removed by another program:\n\n{files}", { files: this.lostEdits.join("\n") }), {
+        void message(t("Unsaved changes to these files could not be restored, because the files were changed by another program or their recovery data is missing:\n\n{files}", { files: this.lostEdits.join("\n") }), {
           title: t("Unsaved changes lost"),
           kind: "warning",
         });
@@ -1759,9 +1772,13 @@ export class App {
    * exists (without it there is nothing to keep); give up after 30 days.
    */
   private async keepForLater(meta: TabMeta): Promise<void> {
-    if (!(await backend.sessionHasRecovery(meta.id).catch(() => true))) return;
-    const since = (meta as { keptSince?: number }).keptSince ?? Date.now();
     const name = meta.path ?? (meta as { name?: string }).name ?? meta.id;
+    // Without recovery data there is nothing to keep; the user is told once.
+    if (!(await backend.sessionHasRecovery(meta.id).catch(() => true))) {
+      this.lostEdits.push(name);
+      return;
+    }
+    const since = (meta as { keptSince?: number }).keptSince ?? Date.now();
     if (Date.now() - since > 30 * 24 * 3600 * 1000) {
       this.lostEdits.push(name);
       return;

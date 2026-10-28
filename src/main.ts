@@ -307,20 +307,24 @@ async function main(): Promise<void> {
     { passive: false }
   );
 
-  // Interrupted saves are repaired before any tab shows those files: files dropped or handed
-  // over by a second instance wait for that too.
+  // Interrupted saves are repaired before any tab shows those files.
   const repaired = backend.finishedSaves().catch(() => ({ finished: [], failed: [] }) as FinishedSaves);
+  // Until the last session is restored, the session file is not written: it would list only
+  // the tabs open so far, and the backend deletes the recovery data of every other tab.
+  app.holdSession();
+  let markRestored!: () => void;
+  const restoredReady = new Promise<void>((resolve) => (markRestored = resolve));
 
-  // Drag & drop files from Explorer
+  // Drag & drop files from Explorer (after the last session is back)
   void getCurrentWebview().onDragDropEvent((ev) => {
     if (ev.payload.type !== "drop") return;
     const paths = ev.payload.paths;
-    void repaired.then(() => app.openFiles(paths));
+    void restoredReady.then(() => app.openFiles(paths));
   });
 
-  // Files handed over by a second instance
+  // Files handed over by a second instance (after the last session is back)
   void listen<string[]>("open-files", (ev) => {
-    void repaired.then(() => app.openFiles(ev.payload));
+    void restoredReady.then(() => app.openFiles(ev.payload));
   });
 
   // Flush unsaved state before the window closes
@@ -332,6 +336,9 @@ async function main(): Promise<void> {
     ev.preventDefault();
     closing = true;
     try {
+      // Closing while the last session is still being restored waits for it, so its unsaved
+      // text is stored again instead of being left out of the session.
+      await restoredReady;
       for (;;) {
         try {
           await app.flushAll();
@@ -366,6 +373,8 @@ async function main(): Promise<void> {
     restored = await app.restoreSession({ onlyUnsaved: !settings.restoreSession });
   } catch (e) {
     console.warn("session restore failed", e);
+  } finally {
+    markRestored();
   }
   if (saves.failed.length) {
     const files = saves.failed.map((f) => `${f.target}\n${t("Copies:")} ${f.kept.join(", ")}`).join("\n\n");

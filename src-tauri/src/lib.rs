@@ -674,6 +674,21 @@ async fn finished_saves(state: State<'_, AppState>) -> Result<FinishedSaves, Str
     .map_err(|e| e.to_string())
 }
 
+/// Security attributes that let every account open the running-app mutex for SYNCHRONIZE (all
+/// the installer needs to see it), so an installer run by another account notices the app.
+#[cfg(windows)]
+fn running_mutex_security() -> Option<windows_sys::Win32::Security::SECURITY_ATTRIBUTES> {
+    use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    // 0x00100000 is SYNCHRONIZE, WD is Everyone. The creator keeps full access to its handle.
+    let sddl: Vec<u16> = "D:(A;;0x00100000;;;WD)".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated; the descriptor is allocated by Windows and deliberately
+    // never freed, because the mutex uses it for the life of the process.
+    let ok = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) };
+    (ok != 0).then(|| SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: descriptor, bInheritHandle: 0 })
+}
+
 /// Tell the user that this portable copy cannot start, before any window exists.
 #[cfg(windows)]
 fn show_startup_error(text: &str) {
@@ -1273,10 +1288,14 @@ pub fn run() {
     // the installer, so it does not create the mutex.
     #[cfg(windows)]
     if session::portable_dir().is_none() {
+        // Other accounts (an administrator running the installer) may only wait on it.
+        let everyone_may_wait = running_mutex_security();
         for name in ["NaxNotepadRunning", "Global\\NaxNotepadRunning"] {
             let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            // SAFETY: the name is NUL-terminated; the handle is kept open until the process ends.
-            unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+            let attrs = everyone_may_wait.as_ref().map_or(std::ptr::null(), |a| a as *const _);
+            // SAFETY: the name is NUL-terminated and `attrs` is null or points to attributes
+            // that live until the call returns; the handle stays open until the process ends.
+            unsafe { windows_sys::Win32::System::Threading::CreateMutexW(attrs, 0, wide.as_ptr()) };
         }
     }
     // Portable mode keeps the browser profile next to the program as well.
@@ -1515,6 +1534,25 @@ mod tests {
         patch_file_impl(&p, &mut vec![(2, 0xEE)], 4, Some(mtime_of(&p))).unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), [1, 2, 0xEE, 4]);
         assert_eq!(std::fs::read(&other).unwrap(), [1, 2, 0xEE, 4]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_running_app_mutex_can_be_opened_by_everyone_for_waiting() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW};
+        let attrs = running_mutex_security().expect("the security descriptor must be valid");
+        let name: Vec<u16> = format!("NaxNotepadTest-{}", std::process::id()).encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: valid NUL-terminated names and attributes that outlive the calls.
+        unsafe {
+            let created = CreateMutexW(&attrs, 0, name.as_ptr());
+            assert!(!created.is_null());
+            // What the installer does: open it for SYNCHRONIZE only.
+            let opened = OpenMutexW(0x0010_0000, 0, name.as_ptr());
+            assert!(!opened.is_null(), "SYNCHRONIZE access must be granted");
+            CloseHandle(opened);
+            CloseHandle(created);
+        }
     }
 
     #[test]
