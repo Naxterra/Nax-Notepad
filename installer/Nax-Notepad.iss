@@ -45,7 +45,7 @@ ChangesAssociations=yes
 ChangesEnvironment=yes
 CloseApplications=yes
 ; The app holds this mutex while it runs; setup and uninstall ask to close it first.
-AppMutex=NaxNotepadRunning
+AppMutex=NaxNotepadRunning,Global\NaxNotepadRunning
 RestartApplications=no
 ShowLanguageDialog=auto
 

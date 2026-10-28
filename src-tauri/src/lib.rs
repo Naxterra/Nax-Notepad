@@ -629,6 +629,11 @@ fn session_buffer_epoch() -> u64 {
 }
 
 #[tauri::command]
+fn session_has_recovery(id: String) -> bool {
+    session::has_recovery(&id)
+}
+
+#[tauri::command]
 fn session_load_buffer(id: String) -> Option<String> {
     session::load_buffer(&id)
 }
@@ -1264,11 +1269,15 @@ pub fn run() {
     // A named mutex for as long as the app runs: the installer and the uninstaller see it
     // (AppMutex) and ask to close the app first, so it cannot write its data folder again
     // after the uninstaller removed it.
+    // The global name is seen from other sign-in sessions too. A portable copy is not managed by
+    // the installer, so it does not create the mutex.
     #[cfg(windows)]
-    {
-        let name: Vec<u16> = "NaxNotepadRunning".encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: the name is NUL-terminated; the handle is kept open until the process ends.
-        unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if session::portable_dir().is_none() {
+        for name in ["NaxNotepadRunning", "Global\\NaxNotepadRunning"] {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: the name is NUL-terminated; the handle is kept open until the process ends.
+            unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        }
     }
     // Portable mode keeps the browser profile next to the program as well.
     // The single-instance plugin is not used in portable mode, so a lock on the data folder keeps
@@ -1325,18 +1334,24 @@ pub fn run() {
         // Runs after the single-instance plugin, so only the copy that stays open finishes
         // interrupted saves, and before the page can ask for them.
         .setup(|app| {
-            // On its own thread, so the window appears even while a large file is repaired.
+            // On its own thread, so the main thread keeps running the window while a large file
+            // is repaired; the frontend waits for the result before it opens any file.
             let recovery = app.state::<AppState>().recovery.clone();
             std::thread::spawn(move || {
-                let mut report = FinishedSaves::default();
-                for r in session::recover_interrupted_rewrites() {
-                    let target = r.target.display().to_string();
-                    if r.finished {
-                        report.finished.push(target);
-                    } else {
-                        report.failed.push(FailedSave { target, kept: r.kept.iter().map(|p| p.display().to_string()).collect() });
+                let work = || {
+                    let mut report = FinishedSaves::default();
+                    for r in session::recover_interrupted_rewrites() {
+                        let target = r.target.display().to_string();
+                        if r.finished {
+                            report.finished.push(target);
+                        } else {
+                            report.failed.push(FailedSave { target, kept: r.kept.iter().map(|p| p.display().to_string()).collect() });
+                        }
                     }
-                }
+                    report
+                };
+                // Even if the repair panics, the frontend must stop waiting.
+                let report = std::panic::catch_unwind(work).unwrap_or_default();
                 *recovery.state.lock().unwrap_or_else(|e| e.into_inner()) = (true, report);
                 recovery.done.notify_all();
             });
@@ -1378,6 +1393,7 @@ pub fn run() {
             session_store_buffer,
             session_load_buffer,
             session_buffer_epoch,
+            session_has_recovery,
             session_drop_buffer,
             settings_load,
             settings_save,

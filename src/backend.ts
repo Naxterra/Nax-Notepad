@@ -181,6 +181,8 @@ export const backend = {
   /** Stores whose `generation` is not above the last dropped one are ignored (late writes after a save). */
   sessionStoreBuffer: (id: string, text: string, generation: number) => invoke<void>("session_store_buffer", { id, text, generation }),
   sessionLoadBuffer: (id: string) => invoke<string | null>("session_load_buffer", { id }),
+  /** True when unsaved text or a large-file edit log is stored for the tab. */
+  sessionHasRecovery: (id: string) => invoke<boolean>("session_has_recovery", { id }),
   sessionDropBuffer: (id: string, generation: number) => invoke<void>("session_drop_buffer", { id, generation }),
   /** A new, higher number for every page load (see `bufferGeneration` in app.ts). */
   sessionBufferEpoch: () => invoke<number>("session_buffer_epoch"),

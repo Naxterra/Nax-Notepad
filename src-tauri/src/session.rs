@@ -132,8 +132,7 @@ pub fn replace_atomic(path: &Path, write: impl FnOnce(&mut File) -> std::io::Res
 pub fn replace_atomic_checked(path: &Path, check: impl FnOnce() -> Result<(), String>, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
     let lock = target_lock(path);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    check()?;
-    replace_atomic_locked(path, write)
+    replace_atomic_locked_checked(path, check, write)
 }
 
 /// [`replace_atomic`] for a caller that already holds the target lock.
@@ -143,15 +142,22 @@ pub fn replace_atomic_checked(path: &Path, check: impl FnOnce() -> Result<(), St
 /// would leave the other names with the old content. Otherwise the file is replaced in a way
 /// that keeps its attributes (such as Hidden) and its permissions.
 fn replace_atomic_locked(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
+    replace_atomic_locked_checked(path, || Ok(()), write)
+}
+
+fn replace_atomic_locked_checked(path: &Path, check: impl FnOnce() -> Result<(), String>, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
     let target = resolve_links(path);
     if hard_link_count(&target) > 1 {
         // Hard links give one file several paths, so the path lock is not enough: these saves
-        // also lock the file itself. Its identity stays the same, because it is rewritten in
-        // place. This lock is always taken last, so it cannot deadlock.
+        // also lock the file itself, and `check` runs under that lock. Its identity stays the
+        // same, because it is rewritten in place. This lock is always taken last, so it cannot
+        // deadlock.
         let file_lock = file_lock(&target);
         let _file_guard = file_lock.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
+        check()?;
         return rewrite_in_place(&target, write);
     }
+    check()?;
     let (tmp, mut file) = create_temp_sibling(&target)?;
     let written = write(&mut file).and_then(|_| file.sync_all());
     drop(file);
@@ -358,9 +364,9 @@ fn drop_notes_for(notes: &Path, current: &RewriteNote) {
             _ => lock_key(&old.target) == lock_key(&current.target),
         };
         if same {
+            // Only the note goes. Its copies may have been listed to the user at a start where
+            // the save could not be finished, and they may be the only complete versions.
             let _ = fs::remove_file(e.path());
-            let _ = fs::remove_file(&old.new);
-            let _ = fs::remove_file(&old.backup);
         }
     }
 }
@@ -753,6 +759,12 @@ fn drop_generation(path: &Path, extra: &[&Path], id: &str, generation: Option<u6
     }
 }
 
+/// True when unsaved text or a large-file edit log is stored for `id`.
+pub fn has_recovery(id: &str) -> bool {
+    let (pieces, _) = edits_paths(id);
+    buffer_path(id).is_file() || pieces.is_file()
+}
+
 pub fn load_buffer(id: &str) -> Option<String> {
     fs::read_to_string(buffer_path(id)).ok()
 }
@@ -1069,7 +1081,7 @@ mod tests {
         rewrite_in_place_noted(&a, |f| f.write_all(b"saved later"), &notes).unwrap();
         assert!(recover_rewrites_in(&notes).is_empty());
         assert_eq!(std::fs::read(&b).unwrap(), b"saved later");
-        assert!(!new.exists() && !backup.exists(), "the copies of the older save are gone");
+        assert!(new.exists() && backup.exists(), "copies the user may have been told about stay");
     }
 
     #[test]

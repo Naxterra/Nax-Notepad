@@ -915,11 +915,12 @@ impl PagedDoc {
             return Err(format!("{E_HARD_LINKS}{}", target.display()));
         }
         let in_place = same_path(target, &self.path);
+        // Checked under the save lock, so a save through another command cannot slip in between.
+        let lock = session::target_lock(target);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         if in_place && !overwrite_external && self.disk_changed() {
             return Err(format!("{E_EXTERNAL_CHANGE}{}", self.path.display()));
         }
-        let lock = session::target_lock(target);
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, file) = session::create_temp_sibling(target)?;
         if let Err(e) = self.write_contents(file) {
             let _ = std::fs::remove_file(&tmp);

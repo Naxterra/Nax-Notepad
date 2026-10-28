@@ -72,9 +72,10 @@ $binary = $latin1.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $exe).P
 # program covers them. Neither the profile folder nor the project folder may appear in it.
 foreach ($local in @($env:USERPROFILE, $PSScriptRoot)) {
     foreach ($text in @($local, $local.Replace("\", "/"), $local.Replace("\", "\\"))) {
-        # Both as plain text and as UTF-16, the form Windows APIs store strings in.
-        $utf16 = -join ($text.ToCharArray() | ForEach-Object { "$_" + [char]0 })
-        foreach ($needle in @($text, $utf16)) {
+        # The bytes of the path as UTF-8 and as UTF-16 (the form Windows APIs store strings in),
+        # compared with the program's bytes, so paths with non-ASCII letters are found too.
+        foreach ($encoding in @([System.Text.Encoding]::UTF8, [System.Text.Encoding]::Unicode)) {
+            $needle = $latin1.GetString($encoding.GetBytes($text))
             if ($binary.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 throw "$exe contains a local path; it must not be published."
             }

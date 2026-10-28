@@ -318,6 +318,7 @@ test("a recovery write that finishes after the save cannot bring the old text ba
 
 test("unsaved changes to a large file on a missing drive are kept for the next start, not deleted", async () => {
   messages.length = 0;
+  backend.sessionHasRecovery = async () => true;
   backend.sessionLoad = async () => ({ tabs: [{ id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true }], active: null, next_untitled: 1 });
   backend.pathExists = async () => false;
   const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
@@ -338,6 +339,7 @@ test("unsaved changes to a large file on a missing drive are kept for the next s
 
 test("unsaved changes that could not be restored for 30 days are reported as lost", async () => {
   messages.length = 0;
+  backend.sessionHasRecovery = async () => true;
   const longAgo = Date.now() - 31 * 24 * 3600 * 1000;
   backend.sessionLoad = async () => ({ tabs: [{ id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: longAgo }], active: null, next_untitled: 1 });
   backend.pathExists = async () => false;
@@ -351,6 +353,7 @@ test("unsaved changes that could not be restored for 30 days are reported as los
 
 test("a tab with unsaved text whose restore fails is kept in the session instead of being dropped", async () => {
   messages.length = 0;
+  backend.sessionHasRecovery = async () => true;
   backend.sessionLoad = async () => ({ tabs: [{ id: "locked", path: "C:/data/locked.txt", kind: "memory", dirty: true }], active: null, next_untitled: 1 });
   const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
   app.tabs = [];
@@ -360,6 +363,37 @@ test("a tab with unsaved text whose restore fails is kept in the session instead
   await app.restoreSession();
   assert.deepEqual(app.keptMetas.map((x) => x.id), ["locked"]);
   assert.match(messages[0], /locked\.txt/);
+});
+
+test("a tab whose recovery data is gone is not kept or reported again at every start", async () => {
+  messages.length = 0;
+  backend.sessionHasRecovery = async () => false;
+  backend.sessionLoad = async () => ({ tabs: [{ id: "gone", path: "C:/data/gone.txt", kind: "memory", dirty: true }], active: null, next_untitled: 1 });
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  app.restoreTab = async () => {
+    throw new Error("access denied");
+  };
+  await app.restoreSession();
+  assert.deepEqual(app.keptMetas, []);
+  assert.equal(messages.length, 0);
+});
+
+test("opening a file whose unsaved changes were kept restores those changes instead of a second tab", async () => {
+  const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
+  const kept = { id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: Date.now() };
+  app.keptMetas = [kept];
+  const restored = { ...memoryTab({ id: "big", path: "E:/logs/big.log" }) };
+  const seen = [];
+  app.restoreTab = async (meta) => {
+    seen.push(meta.id);
+    return restored;
+  };
+  app.openOne = async () => assert.fail("the kept changes must be used");
+  const tab = await app.openFiles(["e:/LOGS/big.log"], false);
+  assert.equal(tab, restored);
+  assert.deepEqual(seen, ["big"]);
+  assert.deepEqual(app.keptMetas, []);
 });
 
 test("text typed while a file is being reloaded stops the reload instead of being replaced", async () => {

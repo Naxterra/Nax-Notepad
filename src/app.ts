@@ -655,6 +655,21 @@ export class App {
         last = existing;
         continue;
       }
+      // A file whose unsaved changes are kept from an earlier session opens with those changes,
+      // instead of beside them in a second tab that would later restore the older ones too.
+      const kept = (this.keptMetas ?? []).find((m) => m.path && m.path.toLowerCase() === p.toLowerCase());
+      if (kept) {
+        try {
+          const tab = await this.restoreTab(kept);
+          if (tab) {
+            this.keptMetas = this.keptMetas.filter((m) => m !== kept);
+            last = tab;
+            continue;
+          }
+        } catch {
+          /* still not possible: open the file as it is on disk */
+        }
+      }
       try {
         last = await this.openOne(p);
       } catch (e) {
@@ -1037,9 +1052,9 @@ export class App {
   async reload(tab: Tab, encoding: string | null = null): Promise<void> {
     tab = this.owner(tab);
     if (!tab.path) return;
-    tab.hex = undefined;
-    tab.hexKey = undefined;
     if (tab.kind === "paged" && tab.paged) {
+      tab.hex = undefined;
+      tab.hexKey = undefined;
       // Opening under the same id replaces the document only when the file could be opened, so
       // a failed reload keeps the current one.
       const res = await backend.openPath(tab.id, tab.path, true, encoding);
@@ -1058,10 +1073,15 @@ export class App {
       const rev = tab.revision;
       const res = await backend.openPath(tab.id, tab.path, false, encoding);
       if (tab.revision !== rev) {
-        // Typed while the file was read: keep that text instead of replacing it.
+        // Typed while the file was read: keep that text instead of replacing it. A file that
+        // grew past the size limit was opened as a large document; close it again, or its
+        // memory map would block saving this tab.
+        if (res.kind === "paged") await backend.pagedClose(tab.id);
         toast(t("The reload was stopped because the text was changed while the file was being read."), 6000);
         return;
       }
+      tab.hex = undefined;
+      tab.hexKey = undefined;
       if (res.kind === "paged") {
         await this.becomePaged(tab, res);
         this.finishReload(tab);
@@ -1699,7 +1719,7 @@ export class App {
           else if ((meta as { shown?: boolean }).shown) shownOther = tab;
         } catch (e) {
           console.warn("restore failed for", meta.path, e);
-          if ((meta as { dirty?: boolean }).dirty) this.keepForLater(meta);
+          if ((meta as { dirty?: boolean }).dirty) await this.keepForLater(meta);
         }
       }
       if (this.tabs.length === 0) return false;
@@ -1734,8 +1754,12 @@ export class App {
     }
   }
 
-  /** Keep the session entry of an unsaved tab that cannot be restored now; give up after 30 days. */
-  private keepForLater(meta: TabMeta): void {
+  /**
+   * Keep the session entry of an unsaved tab that cannot be restored now, if its recovery data
+   * exists (without it there is nothing to keep); give up after 30 days.
+   */
+  private async keepForLater(meta: TabMeta): Promise<void> {
+    if (!(await backend.sessionHasRecovery(meta.id).catch(() => true))) return;
     const since = (meta as { keptSince?: number }).keptSince ?? Date.now();
     const name = meta.path ?? (meta as { name?: string }).name ?? meta.id;
     if (Date.now() - since > 30 * 24 * 3600 * 1000) {
@@ -1772,7 +1796,7 @@ export class App {
       // The recovery log of a large file only describes changes to the file it was made for. A
       // missing file may be on a drive that is not connected, so the log is kept for a while.
       if (!(await backend.pathExists(meta.path))) {
-        if (m.dirty) this.keepForLater(meta);
+        if (m.dirty) await this.keepForLater(meta);
         return null;
       }
       tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView, pane });

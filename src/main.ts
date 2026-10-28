@@ -307,14 +307,20 @@ async function main(): Promise<void> {
     { passive: false }
   );
 
+  // Interrupted saves are repaired before any tab shows those files: files dropped or handed
+  // over by a second instance wait for that too.
+  const repaired = backend.finishedSaves().catch(() => ({ finished: [], failed: [] }) as FinishedSaves);
+
   // Drag & drop files from Explorer
   void getCurrentWebview().onDragDropEvent((ev) => {
-    if (ev.payload.type === "drop") void app.openFiles(ev.payload.paths);
+    if (ev.payload.type !== "drop") return;
+    const paths = ev.payload.paths;
+    void repaired.then(() => app.openFiles(paths));
   });
 
   // Files handed over by a second instance
   void listen<string[]>("open-files", (ev) => {
-    void app.openFiles(ev.payload);
+    void repaired.then(() => app.openFiles(ev.payload));
   });
 
   // Flush unsaved state before the window closes
@@ -347,8 +353,10 @@ async function main(): Promise<void> {
     }
   });
 
-  // Interrupted saves are repaired before any tab shows those files.
-  const saves = await backend.finishedSaves().catch(() => ({ finished: [], failed: [] }) as FinishedSaves);
+  // Repairing a large file can take a while: show the (still empty) window meanwhile.
+  const slow = window.setTimeout(() => void win.show(), 1000);
+  const saves = await repaired;
+  window.clearTimeout(slow);
 
   // Restore session, then open files from the command line
   // Unsaved text always comes back; the setting only decides about the other tabs.
