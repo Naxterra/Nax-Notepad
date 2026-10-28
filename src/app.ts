@@ -661,18 +661,21 @@ export class App {
       // instead of beside them in a second tab that would later restore the older ones too.
       const kept = (this.keptMetas ?? []).find((m) => m.path && m.path.toLowerCase() === p.toLowerCase());
       if (kept) {
-        // Taken out first: if it still cannot be restored, restoreTab keeps it again itself.
-        this.keptMetas = this.keptMetas.filter((m) => m !== kept);
+        // The entry stays in the session while it is tried, so a session save in between does
+        // not let the backend delete its recovery data. restoreTab updates or drops it when the
+        // file still cannot be restored.
+        let tab: Tab | null = null;
         try {
-          const tab = await this.restoreTab(kept);
-          if (tab) {
-            last = tab;
-            continue;
-          }
+          tab = await this.restoreTab(kept);
         } catch {
-          this.keptMetas.push(kept);
+          /* still kept: open the file as it is on disk below */
         }
-        if (!this.keptMetas.some((m) => m.id === kept.id)) this.keptMetas.push(kept);
+        this.reportRestoreProblems();
+        if (tab) {
+          this.keptMetas = this.keptMetas.filter((m) => m.id !== kept.id);
+          last = tab;
+          continue;
+        }
       }
       try {
         last = await this.openOne(p);
@@ -1647,12 +1650,12 @@ export class App {
     };
   }
 
-  /** Write the session file. Background saves only log failures; `strict` rethrows them. */
   /** Do not write the session file until `restoreSession` has finished (see `sessionHeld`). */
   holdSession(): void {
     this.sessionHeld = true;
   }
 
+  /** Write the session file. Background saves only log failures; `strict` rethrows them. */
   async saveSessionNow(strict = false): Promise<void> {
     if (this.sessionTimer) {
       clearTimeout(this.sessionTimer);
@@ -1664,7 +1667,7 @@ export class App {
     const owners = this.tabs.filter((x) => !x.cloneOf);
     const active = this.active ? this.owner(this.active) : null;
     const data: SessionData = {
-      tabs: [...owners.map((x) => this.tabMeta(x)), ...this.keptMetas],
+      tabs: [...owners.map((x) => this.tabMeta(x)), ...this.keptMetas.filter((m) => !owners.some((x) => x.id === m.id))],
       active: active?.id ?? null,
       next_untitled: this.nextUntitled,
     };
@@ -1752,19 +1755,26 @@ export class App {
       this.restoring = false;
       this.sessionHeld = false;
       this.scheduleSessionSave();
-      if (this.lostEdits.length) {
-        void message(t("Unsaved changes to these files could not be restored, because the files were changed by another program or their recovery data is missing:\n\n{files}", { files: this.lostEdits.join("\n") }), {
-          title: t("Unsaved changes lost"),
-          kind: "warning",
-        });
-      }
-      if (this.notRestored.length) {
-        void message(t("Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}", { files: this.notRestored.join("\n") }), {
-          title: t("Unsaved changes kept"),
-          kind: "warning",
-        });
-      }
+      this.reportRestoreProblems();
     }
+  }
+
+  /** Show the unsaved changes that were lost or kept for later, once, and forget them. */
+  private reportRestoreProblems(): void {
+    if (this.lostEdits?.length) {
+      void message(t("Unsaved changes to these files could not be restored, because the files were changed by another program or their recovery data is missing:\n\n{files}", { files: this.lostEdits.join("\n") }), {
+        title: t("Unsaved changes lost"),
+        kind: "warning",
+      });
+    }
+    if (this.notRestored?.length) {
+      void message(t("Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}", { files: this.notRestored.join("\n") }), {
+        title: t("Unsaved changes kept"),
+        kind: "warning",
+      });
+    }
+    this.lostEdits = [];
+    this.notRestored = [];
   }
 
   /**
@@ -1773,6 +1783,8 @@ export class App {
    */
   private async keepForLater(meta: TabMeta): Promise<void> {
     const name = meta.path ?? (meta as { name?: string }).name ?? meta.id;
+    // One entry per tab: a kept entry that is tried again replaces itself, or goes when lost.
+    this.keptMetas = this.keptMetas.filter((m) => m.id !== meta.id);
     // Without recovery data there is nothing to keep; the user is told once.
     if (!(await backend.sessionHasRecovery(meta.id).catch(() => true))) {
       this.lostEdits.push(name);

@@ -680,8 +680,9 @@ async fn finished_saves(state: State<'_, AppState>) -> Result<FinishedSaves, Str
 fn running_mutex_security() -> Option<windows_sys::Win32::Security::SECURITY_ATTRIBUTES> {
     use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    // 0x00100000 is SYNCHRONIZE, WD is Everyone. The creator keeps full access to its handle.
-    let sddl: Vec<u16> = "D:(A;;0x00100000;;;WD)".encode_utf16().chain(std::iter::once(0)).collect();
+    // The owner (OW) and SYSTEM (SY) get full access, so the user's next start of the app can
+    // open the mutex while an older process still holds it; everyone else (WD) gets SYNCHRONIZE.
+    let sddl: Vec<u16> = "D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x00100000;;;WD)".encode_utf16().chain(std::iter::once(0)).collect();
     let mut descriptor = std::ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; the descriptor is allocated by Windows and deliberately
     // never freed, because the mutex uses it for the life of the process.
@@ -1550,6 +1551,10 @@ mod tests {
             // What the installer does: open it for SYNCHRONIZE only.
             let opened = OpenMutexW(0x0010_0000, 0, name.as_ptr());
             assert!(!opened.is_null(), "SYNCHRONIZE access must be granted");
+            // The user's next start of the app, while this one still runs, gets its own handle.
+            let again = CreateMutexW(&attrs, 0, name.as_ptr());
+            assert!(!again.is_null(), "the owner must be able to open the existing mutex");
+            CloseHandle(again);
             CloseHandle(opened);
             CloseHandle(created);
         }

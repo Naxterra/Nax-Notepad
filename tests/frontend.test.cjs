@@ -398,6 +398,40 @@ test("closing before the last session is restored does not write a session that 
   assert.equal(writes, 1, "after the restore the session is written again");
 });
 
+test("a kept entry stays in the session while its file is being opened, so its recovery data is not deleted", async () => {
+  const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
+  const kept = { id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: Date.now() };
+  app.keptMetas = [kept];
+  let written;
+  backend.sessionSave = async (s) => {
+    written = s;
+  };
+  app.restoreTab = async () => {
+    await app.saveSessionNow(); // a background session save while the slow restore runs
+    return { ...memoryTab({ id: "big", path: "E:/logs/big.log" }) };
+  };
+  await app.openFiles(["E:/logs/big.log"], false);
+  assert.ok(written.tabs.some((m) => m.id === "big"), "the kept entry must be in that session");
+  assert.deepEqual(app.keptMetas, []);
+});
+
+test("a kept entry that is lost when its file is opened is reported and not put back", async () => {
+  messages.length = 0;
+  const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
+  const kept = { id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: Date.now() - 31 * 24 * 3600 * 1000 };
+  app.keptMetas = [kept];
+  app.lostEdits = [];
+  app.notRestored = [];
+  backend.pathExists = async () => false;
+  backend.sessionHasRecovery = async () => true;
+  app.openOne = async () => {
+    throw new Error("drive not connected");
+  };
+  await app.openFiles(["E:/logs/big.log"], false);
+  assert.deepEqual(app.keptMetas, []);
+  assert.ok(messages.some((m) => /could not be restored, because/.test(m) && /big\.log/.test(m)));
+});
+
 test("a kept entry that still cannot be restored when its file is opened stays only once", async () => {
   const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
   const kept = { id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: Date.now() };

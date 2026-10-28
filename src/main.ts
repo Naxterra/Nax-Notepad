@@ -367,9 +367,9 @@ async function main(): Promise<void> {
 
   // Restore session, then open files from the command line
   // Unsaved text always comes back; the setting only decides about the other tabs.
-  setBufferEpoch(await backend.sessionBufferEpoch());
   let restored = false;
   try {
+    setBufferEpoch(await backend.sessionBufferEpoch());
     restored = await app.restoreSession({ onlyUnsaved: !settings.restoreSession });
   } catch (e) {
     console.warn("session restore failed", e);
