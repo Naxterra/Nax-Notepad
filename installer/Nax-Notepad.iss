@@ -44,6 +44,8 @@ ChangesAssociations=yes
 ; Tell running programs about the PATH entry that is added on install and removed on uninstall.
 ChangesEnvironment=yes
 CloseApplications=yes
+; The app holds this mutex while it runs; setup and uninstall ask to close it first.
+AppMutex=NaxNotepadRunning
 RestartApplications=no
 ShowLanguageDialog=auto
 
@@ -72,7 +74,8 @@ german.RemoveData=Auch Einstellungen, Sitzung, ungespeicherten Text und die Fens
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "contextmenu"; Description: "{cm:ContextMenu}"; GroupDescription: "{cm:Integration}"
-Name: "addtopath"; Description: "{cm:AddToPath}"; GroupDescription: "{cm:Integration}"; Flags: unchecked
+; The PATH entry is per user; an all-users install would put it into the administrator's profile.
+Name: "addtopath"; Description: "{cm:AddToPath}"; GroupDescription: "{cm:Integration}"; Flags: unchecked; Check: not IsAdminInstallMode
 Name: "assoc_txt"; Description: "{cm:AssocTxt}"; GroupDescription: "{cm:Assoc}"; Flags: unchecked
 Name: "assoc_md"; Description: "{cm:AssocMd}"; GroupDescription: "{cm:Assoc}"; Flags: unchecked
 Name: "assoc_log"; Description: "{cm:AssocLog}"; GroupDescription: "{cm:Assoc}"; Flags: unchecked
@@ -219,7 +222,9 @@ begin
     RemoveFromUserPath(ExpandConstant('{app}'));
     RemoveOldDefaults;
   end;
-  if CurUninstallStep = usPostUninstall then
+  // An all-users uninstall may run as an administrator account; its profile is not the one the
+  // app used, so per-user data is left alone there.
+  if (CurUninstallStep = usPostUninstall) and not IsAdminInstallMode then
   begin
     // The browser engine's cache belongs to the program, not to the user.
     DelTree(ExpandConstant('{localappdata}\com.nax.notepad'), True, True, True);

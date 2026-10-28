@@ -21,6 +21,13 @@ export interface OpenResult {
   binary: boolean;
 }
 
+export interface FinishedSaves {
+  /** Files that got the content that was being saved. */
+  finished: string[];
+  /** Saves that could not be finished safely; the file was left alone and `kept` lists the copies. */
+  failed: { target: string; kept: string[] }[];
+}
+
 export interface SaveResult {
   size: number;
   mtime: number;
@@ -180,8 +187,11 @@ export const backend = {
   settingsLoad: () => invoke<Record<string, unknown>>("settings_load"),
   settingsSave: (value: Record<string, unknown>) => invoke<void>("settings_save", { value }),
   startupFiles: () => invoke<string[]>("startup_files"),
-  /** Files whose interrupted save (hard-linked files) was finished, or undone, when the app started. */
-  finishedSaves: () => invoke<{ finished: string[]; undone: string[] }>("finished_saves"),
+  /**
+   * Interrupted saves of hard-linked files that were dealt with when the app started. Waits
+   * until that is done, so ask before restoring tabs.
+   */
+  finishedSaves: () => invoke<FinishedSaves>("finished_saves"),
 
   findInFiles: (root: string, opts: FindOpts, include: string, maxHits = 5000) =>
     invoke<FindInFilesResult>("find_in_files", { root, opts, include, maxHits }),

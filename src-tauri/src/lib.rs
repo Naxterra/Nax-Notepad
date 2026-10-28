@@ -36,15 +36,30 @@ pub struct AppState {
     paged: Mutex<HashMap<String, Arc<Mutex<PagedDoc>>>>,
     startup_files: Mutex<Vec<String>>,
     /// Files whose interrupted save was dealt with at this start (shown to the user once).
-    finished_saves: Mutex<FinishedSaves>,
+    recovery: Arc<Recovery>,
 }
 
 #[derive(Serialize, Default)]
 struct FinishedSaves {
     /// The file got the content that was being saved.
     finished: Vec<String>,
-    /// The content being saved was missing, so the file got its previous content back.
-    undone: Vec<String>,
+    /// The save could not be finished safely; the file was left as it is.
+    failed: Vec<FailedSave>,
+}
+
+#[derive(Serialize)]
+struct FailedSave {
+    target: String,
+    /// Copies of the content that was being saved and of the previous content.
+    kept: Vec<String>,
+}
+
+/// The result of the recovery of interrupted saves, which runs on its own thread at start.
+#[derive(Default)]
+struct Recovery {
+    /// (finished, report)
+    state: std::sync::Mutex<(bool, FinishedSaves)>,
+    done: std::sync::Condvar,
 }
 
 fn doc_handle(state: &AppState, id: &str) -> Result<Arc<Mutex<PagedDoc>>, String> {
@@ -172,11 +187,6 @@ async fn save_text(
     expected_mtime: Option<u64>,
 ) -> Result<SaveResult, String> {
     let p = PathBuf::from(&path);
-    // The modification time the editor knows; a different one means another program wrote the
-    // file after it was opened or saved.
-    if p.exists() {
-        ensure_unchanged(&p, expected_mtime, None)?;
-    }
     // Refuses characters the encoding cannot represent unless the user confirmed a lossy save.
     let bytes = textfmt::encode_with(&text, &encoding, eol, lossy.unwrap_or(false)).map_err(|e| e.to_message())?;
     if let Some(dir) = p.parent() {
@@ -184,7 +194,11 @@ async fn save_text(
             std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create folder: {e}"))?;
         }
     }
-    session::write_atomic(&p, &bytes)?;
+    // The modification time the editor knows; a different one means another program wrote the
+    // file after it was opened or saved. Checked under the save lock, so two saves cannot both
+    // pass it.
+    let unchanged = || if p.exists() { ensure_unchanged(&p, expected_mtime, None) } else { Ok(()) };
+    session::replace_atomic_checked(&p, unchanged, |f| std::io::Write::write_all(f, &bytes))?;
     Ok(SaveResult {
         size: bytes.len() as u64,
         mtime: mtime_of(&p),
@@ -640,8 +654,19 @@ fn startup_files(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-fn finished_saves(state: State<'_, AppState>) -> FinishedSaves {
-    std::mem::take(&mut *state.finished_saves.lock())
+async fn finished_saves(state: State<'_, AppState>) -> Result<FinishedSaves, String> {
+    // Waits until the recovery at start is done; the frontend asks before it restores tabs, so
+    // no tab shows a file that is still being repaired.
+    let recovery = state.recovery.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut s = recovery.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !s.0 {
+            s = recovery.done.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        std::mem::take(&mut s.1)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Tell the user that this portable copy cannot start, before any window exists.
@@ -932,10 +957,8 @@ async fn write_bytes(request: tauri::ipc::Request<'_>) -> Result<SaveResult, Str
     let path = percent_decode(&header("x-path").ok_or("missing path")?);
     let expected = header("x-mtime").and_then(|s| s.parse::<u64>().ok());
     let p = PathBuf::from(&path);
-    if p.exists() {
-        ensure_unchanged(&p, expected, None)?;
-    }
-    session::write_atomic(&p, data)?;
+    let unchanged = || if p.exists() { ensure_unchanged(&p, expected, None) } else { Ok(()) };
+    session::replace_atomic_checked(&p, unchanged, |f| std::io::Write::write_all(f, data))?;
     Ok(saved(&p))
 }
 
@@ -943,12 +966,11 @@ async fn write_bytes(request: tauri::ipc::Request<'_>) -> Result<SaveResult, Str
 /// files too large to edit in memory; the file is streamed, so any size works.
 fn patch_file_impl(p: &Path, patches: &mut [(u64, u8)], expected_len: u64, expected_mtime: Option<u64>) -> Result<(), String> {
     use std::io::{Read, Write};
-    ensure_unchanged(p, expected_mtime, Some(expected_len))?;
     patches.sort_by_key(|x| x.0);
     if patches.last().is_some_and(|x| x.0 >= expected_len) {
         return Err("A changed byte lies beyond the end of the file.".into());
     }
-    session::replace_atomic(p, |out| {
+    session::replace_atomic_checked(p, || ensure_unchanged(p, expected_mtime, Some(expected_len)), |out| {
         let mut src = std::fs::File::open(p)?;
         let mut buf = vec![0u8; 1 << 20];
         let mut off = 0u64;
@@ -1239,6 +1261,15 @@ fn is_file_argument(a: &str, cwd: &Path) -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // A named mutex for as long as the app runs: the installer and the uninstaller see it
+    // (AppMutex) and ask to close the app first, so it cannot write its data folder again
+    // after the uninstaller removed it.
+    #[cfg(windows)]
+    {
+        let name: Vec<u16> = "NaxNotepadRunning".encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: the name is NUL-terminated; the handle is kept open until the process ends.
+        unsafe { windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    }
     // Portable mode keeps the browser profile next to the program as well.
     // The single-instance plugin is not used in portable mode, so a lock on the data folder keeps
     // a second copy from sharing (and pruning) this copy's session and unsaved text.
@@ -1269,7 +1300,7 @@ pub fn run() {
     let state = AppState {
         paged: Mutex::new(HashMap::new()),
         startup_files: Mutex::new(initial),
-        finished_saves: Mutex::new(FinishedSaves::default()),
+        recovery: Arc::new(Recovery::default()),
     };
     let mut builder = tauri::Builder::default();
     // A portable copy runs on its own: it must not hand its files to an installed copy (both
@@ -1294,16 +1325,21 @@ pub fn run() {
         // Runs after the single-instance plugin, so only the copy that stays open finishes
         // interrupted saves, and before the page can ask for them.
         .setup(|app| {
-            let mut report = FinishedSaves::default();
-            for r in session::recover_interrupted_rewrites() {
-                let path = r.target.display().to_string();
-                if r.finished {
-                    report.finished.push(path);
-                } else {
-                    report.undone.push(path);
+            // On its own thread, so the window appears even while a large file is repaired.
+            let recovery = app.state::<AppState>().recovery.clone();
+            std::thread::spawn(move || {
+                let mut report = FinishedSaves::default();
+                for r in session::recover_interrupted_rewrites() {
+                    let target = r.target.display().to_string();
+                    if r.finished {
+                        report.finished.push(target);
+                    } else {
+                        report.failed.push(FailedSave { target, kept: r.kept.iter().map(|p| p.display().to_string()).collect() });
+                    }
                 }
-            }
-            *app.state::<AppState>().finished_saves.lock() = report;
+                *recovery.state.lock().unwrap_or_else(|e| e.into_inner()) = (true, report);
+                recovery.done.notify_all();
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

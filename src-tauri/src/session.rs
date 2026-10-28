@@ -99,9 +99,20 @@ pub fn create_temp_sibling(target: &Path) -> Result<(PathBuf, File), String> {
 /// One lock per target path, so overlapping writes to the same file are serialised.
 pub fn target_lock(target: &Path) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    let key = target.to_string_lossy().to_lowercase();
+    let key = lock_key(target);
     let mut map = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+/// The key of a path's lock: the canonical path (symbolic links, junctions, "..", "/" and "\\"
+/// resolved), or the canonical folder plus the name for a file that does not exist yet.
+fn lock_key(target: &Path) -> String {
+    let canonical = fs::canonicalize(target).ok().or_else(|| {
+        let name = target.file_name()?;
+        let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        fs::canonicalize(dir).ok().map(|d| d.join(name))
+    });
+    canonical.unwrap_or_else(|| target.to_path_buf()).to_string_lossy().to_lowercase()
 }
 
 /// Atomic write: write a unique sibling temp file, flush it to disk, then put it in place of
@@ -113,10 +124,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Like [`write_atomic`], but the new content is produced by `write` (for streaming large files).
 /// The target is only replaced when `write` and the flush to disk succeeded.
 pub fn replace_atomic(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
-    // Keyed on the file a symbolic link points to, so saves through the link and through the
-    // file itself wait for each other.
-    let lock = target_lock(&resolve_links(path));
+    replace_atomic_checked(path, || Ok(()), write)
+}
+
+/// [`replace_atomic`] that runs `check` (for example "the file was not changed by another
+/// program") while holding the lock, so two saves cannot both pass it before either writes.
+pub fn replace_atomic_checked(path: &Path, check: impl FnOnce() -> Result<(), String>, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
+    let lock = target_lock(path);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    check()?;
     replace_atomic_locked(path, write)
 }
 
@@ -231,6 +247,12 @@ fn rewrite_in_place_noted(target: &Path, write: impl FnOnce(&mut File) -> std::i
         let _ = fs::remove_file(&new);
         return Err(format!("Cannot write {}: {e}", target.display()));
     }
+    // Now the new size is known: the backup takes the old size and the file may grow to the new.
+    let new_size = fs::metadata(&new).map(|m| m.len()).unwrap_or(0);
+    if let Err(e) = ensure_free_space(target, size.max(new_size).saturating_add(1 << 20)) {
+        let _ = fs::remove_file(&new);
+        return Err(e);
+    }
     // A backup of the previous content, for a copy that fails with an error.
     let backup = match create_temp_sibling(target) {
         Ok((b, f)) => {
@@ -254,6 +276,7 @@ fn rewrite_in_place_noted(target: &Path, write: impl FnOnce(&mut File) -> std::i
     // finishes the save if the app or the computer stops in the middle. The note stays open
     // and locked until the end, so another running copy of the app leaves it alone.
     let note = RewriteNote { target: target.to_path_buf(), new: new.clone(), backup: backup.clone(), id: file_info(target).map(|(_, id)| id), started: unix_secs() };
+    drop_notes_for(notes, &note);
     let (note_path, note_file) = match write_rewrite_note(notes, &note) {
         Ok(n) => n,
         Err(e) => {
@@ -299,9 +322,19 @@ fn ensure_free_space(target: &Path, needed: u64) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the free space `free_space` reports.
+    static FAKE_FREE_SPACE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(windows)]
 fn free_space(dir: &Path) -> Option<u64> {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    #[cfg(test)]
+    if let Some(v) = FAKE_FREE_SPACE.with(|f| f.get()) {
+        return Some(v);
+    }
     let mut free: u64 = 0;
     // SAFETY: the path is a NUL-terminated wide string; the other pointers may be null.
     let ok = unsafe { GetDiskFreeSpaceExW(wide(dir).as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -311,6 +344,25 @@ fn free_space(dir: &Path) -> Option<u64> {
 #[cfg(not(windows))]
 fn free_space(_dir: &Path) -> Option<u64> {
     None
+}
+
+/// Remove the notes of earlier, unfinished rewrites of the same file: the save that is starting
+/// now writes newer content, so those must never be applied later. Notes that are still open
+/// belong to a save in progress and are left alone.
+fn drop_notes_for(notes: &Path, current: &RewriteNote) {
+    let Ok(rd) = fs::read_dir(notes) else { return };
+    for e in rd.flatten() {
+        let Some(old) = fs::read(e.path()).ok().and_then(|b| serde_json::from_slice::<RewriteNote>(&b).ok()) else { continue };
+        let same = match (old.id, current.id) {
+            (Some(a), Some(b)) => a == b,
+            _ => lock_key(&old.target) == lock_key(&current.target),
+        };
+        if same {
+            let _ = fs::remove_file(e.path());
+            let _ = fs::remove_file(&old.new);
+            let _ = fs::remove_file(&old.backup);
+        }
+    }
 }
 
 /// Write `note` into a new file in `notes` and keep that file open. On Windows nobody else can
@@ -361,16 +413,40 @@ fn copy_into(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Recovered {
     pub target: PathBuf,
-    /// True when the file got the content that was being saved; false when that copy was gone
-    /// and the previous content was put back instead.
+    /// True when the file got the content that was being saved. False when the save could not
+    /// be finished safely: the file was left as it is, and `kept` lists the copies of the
+    /// content that was being saved and of the previous content.
     pub finished: bool,
+    pub kept: Vec<PathBuf>,
 }
 
 /// Finish in-place rewrites that were interrupted (the app or the computer stopped in the
-/// middle of a save): the file gets the content that was being saved, or its previous content
-/// when the new content is missing.
+/// middle of a save). A file only gets the content that was being saved while it is still in
+/// the state such a stop leaves; a file that was changed since then is never overwritten.
 pub fn recover_interrupted_rewrites() -> Vec<Recovered> {
     recover_rewrites_in(&rewrites_dir())
+}
+
+/// True when the content of `part` is the beginning of the content of `whole` (or all of it
+/// when `exact`).
+fn file_starts_with(whole: &Path, part: &Path, exact: bool) -> bool {
+    use std::io::Read;
+    let (Ok(mut w), Ok(mut p)) = (File::open(whole), File::open(part)) else { return false };
+    let (Ok(wl), Ok(pl)) = (w.metadata().map(|m| m.len()), p.metadata().map(|m| m.len())) else { return false };
+    if pl > wl || (exact && pl != wl) {
+        return false;
+    }
+    let (mut a, mut b) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = match p.read(&mut b) {
+            Ok(0) => return true,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if w.read_exact(&mut a[..n]).is_err() || a[..n] != b[..n] {
+            return false;
+        }
+    }
 }
 
 fn recover_rewrites_in(notes: &Path) -> Vec<Recovered> {
@@ -392,30 +468,55 @@ fn recover_rewrites_in(notes: &Path) -> Vec<Recovered> {
             let _ = fs::remove_file(e.path());
             continue;
         };
+        let kept: Vec<PathBuf> = [&note.new, &note.backup].into_iter().filter(|p| p.is_file()).cloned().collect();
+        let failed = |keep_note: bool, finished: &mut Vec<Recovered>| {
+            if !keep_note {
+                let _ = fs::remove_file(e.path());
+            }
+            if !kept.is_empty() {
+                finished.push(Recovered { target: note.target.clone(), finished: false, kept: kept.clone() });
+            }
+        };
         match file_info(&note.target) {
-            // The file is not there (a drive that is not connected): try again at a later start.
+            // The file is not there or cannot be opened (a drive that is not connected, a file
+            // another program holds): try again at a later start, for a limited time.
             None => {
-                if unix_secs().saturating_sub(note.started) > NOTE_MAX_AGE_SECS {
-                    let _ = fs::remove_file(e.path());
-                }
+                failed(unix_secs().saturating_sub(note.started) <= NOTE_MAX_AGE_SECS, &mut finished);
                 continue;
             }
             // Another file now has this path: never overwrite it.
             Some((_, id)) if note.id.is_some_and(|n| n != id) => {
-                let _ = fs::remove_file(e.path());
+                failed(false, &mut finished);
                 continue;
             }
             Some(_) => {}
         }
-        let finished_save = note.new.is_file();
-        let source = if finished_save { &note.new } else { &note.backup };
-        if !source.is_file() || copy_into(source, &note.target).is_err() {
+        if !note.new.is_file() {
+            // Without the new content nothing can be checked or finished. If the file still has
+            // its previous content, nothing was lost.
+            if note.backup.is_file() && file_starts_with(&note.target, &note.backup, true) {
+                let _ = fs::remove_file(e.path());
+                let _ = fs::remove_file(&note.backup);
+            } else {
+                failed(false, &mut finished);
+            }
+            continue;
+        }
+        // A stop during the save leaves the previous content (the copy had not started) or a
+        // beginning of the new content. Anything else was written after the stop.
+        let untouched = (note.backup.is_file() && file_starts_with(&note.target, &note.backup, true)) || file_starts_with(&note.new, &note.target, false);
+        if !untouched {
+            failed(false, &mut finished);
+            continue;
+        }
+        if copy_into(&note.new, &note.target).is_err() {
+            failed(true, &mut finished);
             continue;
         }
         let _ = fs::remove_file(e.path());
         let _ = fs::remove_file(&note.new);
         let _ = fs::remove_file(&note.backup);
-        finished.push(Recovered { target: note.target, finished: finished_save });
+        finished.push(Recovered { target: note.target, finished: true, kept: Vec::new() });
     }
     finished
 }
@@ -830,7 +931,7 @@ mod tests {
         let (new, backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
         drop(handle); // the process that was saving is gone
         let finished = recover_rewrites_in(&notes);
-        assert_eq!(finished, vec![Recovered { target: a.clone(), finished: true }]);
+        assert_eq!(finished, vec![Recovered { target: a.clone(), finished: true, kept: vec![] }]);
         assert_eq!(std::fs::read(&a).unwrap(), b"new content");
         assert_eq!(std::fs::read(&b).unwrap(), b"new content", "both names must show the saved content");
         assert!(!backup.exists() && !new.exists());
@@ -870,7 +971,9 @@ mod tests {
         // The file was deleted and the user made a new one with the same name.
         std::fs::remove_file(&a).unwrap();
         std::fs::write(&a, b"a different file").unwrap();
-        assert!(recover_rewrites_in(&notes).is_empty());
+        let report = recover_rewrites_in(&notes);
+        assert_eq!(report.len(), 1);
+        assert!(!report[0].finished && report[0].kept.contains(&new), "the user is told where the content is");
         assert_eq!(std::fs::read(&a).unwrap(), b"a different file");
         assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0, "the note is dropped");
         assert!(new.exists(), "the content that was being saved is still there for the user");
@@ -922,26 +1025,87 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_save_whose_new_content_is_gone_is_reported_as_undone() {
+    fn an_interrupted_save_whose_new_content_is_gone_is_reported_and_the_file_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let notes = dir.path().join("notes");
         let a = dir.path().join("a.txt");
         std::fs::write(&a, b"original content").unwrap();
-        let (new, _backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
+        let (new, backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
         drop(handle);
         std::fs::remove_file(&new).unwrap();
-        assert_eq!(recover_rewrites_in(&notes), vec![Recovered { target: a.clone(), finished: false }]);
-        assert_eq!(std::fs::read(&a).unwrap(), b"original content");
+        assert_eq!(recover_rewrites_in(&notes), vec![Recovered { target: a.clone(), finished: false, kept: vec![backup.clone()] }]);
+        assert_eq!(std::fs::read(&a).unwrap(), b"new con", "nothing is written without the new content to check against");
+        assert!(backup.exists(), "the previous content stays for the user");
+        assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_file_changed_after_a_crash_is_not_overwritten_by_the_unfinished_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"original content").unwrap();
+        let (new, backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
+        drop(handle);
+        // Another editor repairs the file in place before the next start.
+        std::fs::OpenOptions::new().write(true).truncate(true).open(&a).unwrap().write_all(b"repaired by hand").unwrap();
+        let report = recover_rewrites_in(&notes);
+        assert_eq!(report, vec![Recovered { target: a.clone(), finished: false, kept: vec![new.clone(), backup.clone()] }]);
+        assert_eq!(std::fs::read(&a).unwrap(), b"repaired by hand");
+        assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_newer_save_of_the_same_file_replaces_an_unfinished_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"original content").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        let (new, backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
+        drop(handle);
+        // The file was locked at the start, so the note stayed; the user saves again.
+        rewrite_in_place_noted(&a, |f| f.write_all(b"saved later"), &notes).unwrap();
+        assert!(recover_rewrites_in(&notes).is_empty());
+        assert_eq!(std::fs::read(&b).unwrap(), b"saved later");
+        assert!(!new.exists() && !backup.exists(), "the copies of the older save are gone");
     }
 
     #[test]
     fn a_hard_linked_save_without_enough_free_space_is_refused_before_anything_is_written() {
         let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
         let a = dir.path().join("a.txt");
         std::fs::write(&a, b"content").unwrap();
-        let err = ensure_free_space(&a, u64::MAX / 2).unwrap_err();
+        FAKE_FREE_SPACE.with(|f| f.set(Some(10)));
+        let result = rewrite_in_place_noted(&a, |f| f.write_all(b"new content"), &notes);
+        FAKE_FREE_SPACE.with(|f| f.set(None));
+        let err = result.unwrap_err();
         assert!(err.contains("Not enough free space"), "{err}");
-        assert!(ensure_free_space(&a, 1).is_ok());
+        assert_eq!(std::fs::read(&a).unwrap(), b"content");
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(TEMP_SUFFIX)).count();
+        assert_eq!(leftovers, 0);
+        assert_eq!(std::fs::read_dir(&notes).map(|d| d.count()).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn different_spellings_of_one_path_share_one_save_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"x").unwrap();
+        let forward = PathBuf::from(a.display().to_string().replace('\\', "/"));
+        let dotted = dir.path().join("sub").join("..").join("a.txt");
+        let upper = PathBuf::from(a.display().to_string().to_uppercase());
+        for other in [&forward, &dotted, &upper] {
+            assert!(Arc::ptr_eq(&target_lock(&a), &target_lock(other)), "{}", other.display());
+        }
+        // A file that does not exist yet gets the same lock before and after it is created.
+        let fresh = dir.path().join("fresh.txt");
+        let before = target_lock(&fresh);
+        std::fs::write(&fresh, b"y").unwrap();
+        assert!(Arc::ptr_eq(&before, &target_lock(&fresh)));
     }
 
     #[test]

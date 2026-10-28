@@ -135,9 +135,14 @@ const de: Record<string, string> = {
   "Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}":
     "Nax-Notepad wurde beim Speichern dieser Dateien beendet. Das Speichern wurde jetzt abgeschlossen, sie enthalten also den gespeicherten Text:\n\n{files}",
   "Interrupted save finished": "Unterbrochenes Speichern abgeschlossen",
-  "Interrupted save undone": "Unterbrochenes Speichern zurückgenommen",
-  "Nax-Notepad stopped while saving these files, and the text being saved was no longer there. They have their previous content again. Your text may still be in the tab:\n\n{files}":
-    "Nax-Notepad wurde beim Speichern dieser Dateien beendet, und der zu speichernde Text war nicht mehr vorhanden. Sie haben wieder ihren vorherigen Inhalt. Ihr Text ist eventuell noch im Tab:\n\n{files}",
+  "Interrupted save not finished": "Unterbrochenes Speichern nicht abgeschlossen",
+  "Copies:": "Kopien:",
+  "Nax-Notepad stopped while saving these files and could not finish the save safely, because the file was changed afterwards, is missing or is in use. Nothing was overwritten. The text you were saving and the previous content are kept in the copies listed:\n\n{files}":
+    "Nax-Notepad wurde beim Speichern dieser Dateien beendet und konnte das Speichern nicht sicher abschließen, weil die Datei danach geändert wurde, fehlt oder in Benutzung ist. Es wurde nichts überschrieben. Der zu speichernde Text und der vorherige Inhalt liegen in den aufgeführten Kopien:\n\n{files}",
+  "Unsaved changes kept": "Ungespeicherte Änderungen aufbewahrt",
+  "Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}":
+    "Ungespeicherte Änderungen an diesen Dateien konnten jetzt nicht wiederhergestellt werden. Sie werden aufbewahrt und beim nächsten Start erneut versucht:\n\n{files}",
+  "The reload was stopped because the text was changed while the file was being read.": "Das Neuladen wurde abgebrochen, weil der Text geändert wurde, während die Datei gelesen wurde.",
   "Load images from the internet in Live Preview": "Bilder aus dem Internet in der Live-Vorschau laden",
   '"{name}" is now larger than {size} MB and is shown in pages.': "„{name}“ ist jetzt größer als {size} MB und wird seitenweise angezeigt.",
   '"{name}" was modified outside Nax-Notepad.\nReload it?': "„{name}“ wurde außerhalb von Nax-Notepad geändert.\nNeu laden?",
@@ -322,8 +327,8 @@ const de: Record<string, string> = {
     "{count} Zeichen dieses Dokuments gibt es in {encoding} nicht, zum Beispiel: {chars}\n\nDie Datei stattdessen als UTF-8 speichern oder diese Zeichen durch „?“ ersetzen?",
   "Save as UTF-8": "Als UTF-8 speichern",
   "Replace with ?": "Durch ? ersetzen",
-  '"{name}" was changed by another program after it was opened. Saving now would overwrite those changes.':
-    "„{name}“ wurde nach dem Öffnen von einem anderen Programm geändert. Speichern würde diese Änderungen überschreiben.",
+  '"{name}" was changed by another program after it was opened. Saving now would overwrite those changes, and reloading discards your unsaved changes.':
+    "„{name}“ wurde nach dem Öffnen von einem anderen Programm geändert. Speichern würde diese Änderungen überschreiben, und Neuladen verwirft Ihre ungespeicherten Änderungen.",
   "This document is read-only.": "Dieses Dokument ist schreibgeschützt.",
   Session: "Sitzung",
   "The selection scope no longer exists.": "Der Auswahlbereich existiert nicht mehr.",

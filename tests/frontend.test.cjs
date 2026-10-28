@@ -1,6 +1,5 @@
 // Frontend regression tests. They transpile the real TypeScript modules and run them with real
 // CodeMirror state; the Tauri backend, dialogs and DOM-heavy modules are replaced by mocks.
-// Based on the expectations of the 2026-10-17 review harness, ported to the current interfaces.
 // Run: node tests/frontend.test.cjs
 const fs = require("node:fs");
 const path = require("node:path");
@@ -147,6 +146,7 @@ function fakeApp(tab, view) {
     focused: 0,
     splitOn: false,
     closedTabs: [],
+    keptMetas: [],
     emit() {},
     scheduleSessionSave() {},
     applyLanguage: async () => {},
@@ -316,16 +316,65 @@ test("a recovery write that finishes after the save cannot bring the old text ba
   assert.ok(stores[1] > drops[0], "text typed after the save must be stored again");
 });
 
-test("unsaved changes to a large file that was removed are reported after restoring the session", async () => {
+test("unsaved changes to a large file on a missing drive are kept for the next start, not deleted", async () => {
   messages.length = 0;
-  backend.sessionLoad = async () => ({ tabs: [{ id: "big", path: "C:/logs/big.log", kind: "paged", dirty: true }], active: null, next_untitled: 1 });
+  backend.sessionLoad = async () => ({ tabs: [{ id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true }], active: null, next_untitled: 1 });
   backend.pathExists = async () => false;
   const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
   app.tabs = [];
   assert.equal(await app.restoreSession(), false);
   assert.equal(messages.length, 1);
-  assert.match(messages[0], /could not be restored/);
+  assert.match(messages[0], /kept and tried again at the next start/);
   assert.match(messages[0], /big\.log/);
+  // The entry stays in the session, so the backend does not delete its recovery log.
+  let saved;
+  backend.sessionSave = async (s) => {
+    saved = s;
+  };
+  await app.saveSessionNow();
+  assert.deepEqual(saved.tabs.map((x) => x.id), ["big"]);
+  assert.ok(saved.tabs[0].keptSince > 0);
+});
+
+test("unsaved changes that could not be restored for 30 days are reported as lost", async () => {
+  messages.length = 0;
+  const longAgo = Date.now() - 31 * 24 * 3600 * 1000;
+  backend.sessionLoad = async () => ({ tabs: [{ id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: longAgo }], active: null, next_untitled: 1 });
+  backend.pathExists = async () => false;
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  await app.restoreSession();
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /could not be restored, because the files were changed or removed/);
+  assert.deepEqual(app.keptMetas, []);
+});
+
+test("a tab with unsaved text whose restore fails is kept in the session instead of being dropped", async () => {
+  messages.length = 0;
+  backend.sessionLoad = async () => ({ tabs: [{ id: "locked", path: "C:/data/locked.txt", kind: "memory", dirty: true }], active: null, next_untitled: 1 });
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  app.restoreTab = async () => {
+    throw new Error("access denied");
+  };
+  await app.restoreSession();
+  assert.deepEqual(app.keptMetas.map((x) => x.id), ["locked"]);
+  assert.match(messages[0], /locked\.txt/);
+});
+
+test("text typed while a file is being reloaded stops the reload instead of being replaced", async () => {
+  toasts.length = 0;
+  const tab = { ...memoryTab({ dirty: true, revision: 3 }), state: EditorState.create({ doc: "typed" }) };
+  const app = Object.create(App.prototype);
+  Object.assign(app, { tabs: [tab], panes: [], splitOn: false, emit() {}, scheduleSessionSave() {} });
+  backend.openPath = async (id, path) => {
+    tab.revision++; // the user types while the file is read
+    return { kind: "memory", path, name: "test.txt", text: "from disk", encoding: "UTF-8", eol: "LF", size: 9, lineCount: null, hadErrors: false, readOnly: false, readOnlyReason: null, mtime: 9, binary: false };
+  };
+  await app.reload(tab);
+  assert.equal(tab.state.doc.toString(), "typed");
+  assert.equal(tab.dirty, true);
+  assert.ok(toasts.some((m) => /reload was stopped/.test(m)));
 });
 
 test("saving a large file with several hard links explains why it was not saved", async () => {

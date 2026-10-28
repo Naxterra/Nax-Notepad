@@ -1639,7 +1639,7 @@ mod tests {
         assert_eq!(doc.line_count(), lines.len());
     }
 
-    // ---- regressions from the 2026-10-17 review ------------------------------------------
+    // ---- data-safety regressions --------------------------------------------------------
 
     #[test]
     fn search_crosses_piece_boundary() {

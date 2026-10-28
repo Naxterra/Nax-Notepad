@@ -170,6 +170,13 @@ export class App {
   private restoring = false;
   /** Large files whose unsaved changes could not be restored during the current session restore. */
   private lostEdits: string[] = [];
+  /**
+   * Session entries of tabs with unsaved changes that could not be restored now (the file is
+   * missing or could not be opened). They stay in the session, so their recovery data is not
+   * deleted, and are tried again at the next start.
+   */
+  private keptMetas: TabMeta[] = [];
+  private notRestored: string[] = [];
   private cursorSaveTimer: number | undefined;
   private scrollSyncing = false;
   private syncOffset = 0;
@@ -960,7 +967,7 @@ export class App {
     if (msg.startsWith(E_EXTERNAL_CHANGE)) {
       const r = await confirm3(
         t("File changed on disk"),
-        t('"{name}" was changed by another program after it was opened. Saving now would overwrite those changes.', { name: tab.name }),
+        t('"{name}" was changed by another program after it was opened. Saving now would overwrite those changes, and reloading discards your unsaved changes.', { name: tab.name }),
         [t("Save As…"), t("Reload")]
       );
       if (r === "yes") {
@@ -1048,7 +1055,13 @@ export class App {
       await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
       this.applyReadOnly(tab);
     } else {
+      const rev = tab.revision;
       const res = await backend.openPath(tab.id, tab.path, false, encoding);
+      if (tab.revision !== rev) {
+        // Typed while the file was read: keep that text instead of replacing it.
+        toast(t("The reload was stopped because the text was changed while the file was being read."), 6000);
+        return;
+      }
       if (res.kind === "paged") {
         await this.becomePaged(tab, res);
         this.finishReload(tab);
@@ -1619,7 +1632,7 @@ export class App {
     const owners = this.tabs.filter((x) => !x.cloneOf);
     const active = this.active ? this.owner(this.active) : null;
     const data: SessionData = {
-      tabs: owners.map((x) => this.tabMeta(x)),
+      tabs: [...owners.map((x) => this.tabMeta(x)), ...this.keptMetas],
       active: active?.id ?? null,
       next_untitled: this.nextUntitled,
     };
@@ -1669,6 +1682,8 @@ export class App {
   async restoreSession(opts: { onlyUnsaved?: boolean } = {}): Promise<boolean> {
     this.restoring = true;
     this.lostEdits = [];
+    this.keptMetas = [];
+    this.notRestored = [];
     try {
       const s = await backend.sessionLoad();
       if (opts.onlyUnsaved) s.tabs = s.tabs.filter((m) => (m as { dirty?: boolean }).dirty);
@@ -1684,6 +1699,7 @@ export class App {
           else if ((meta as { shown?: boolean }).shown) shownOther = tab;
         } catch (e) {
           console.warn("restore failed for", meta.path, e);
+          if ((meta as { dirty?: boolean }).dirty) this.keepForLater(meta);
         }
       }
       if (this.tabs.length === 0) return false;
@@ -1709,7 +1725,25 @@ export class App {
           kind: "warning",
         });
       }
+      if (this.notRestored.length) {
+        void message(t("Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}", { files: this.notRestored.join("\n") }), {
+          title: t("Unsaved changes kept"),
+          kind: "warning",
+        });
+      }
     }
+  }
+
+  /** Keep the session entry of an unsaved tab that cannot be restored now; give up after 30 days. */
+  private keepForLater(meta: TabMeta): void {
+    const since = (meta as { keptSince?: number }).keptSince ?? Date.now();
+    const name = meta.path ?? (meta as { name?: string }).name ?? meta.id;
+    if (Date.now() - since > 30 * 24 * 3600 * 1000) {
+      this.lostEdits.push(name);
+      return;
+    }
+    this.keptMetas.push({ ...meta, keptSince: since } as TabMeta);
+    this.notRestored.push(name);
   }
 
   private async restoreTab(meta: TabMeta): Promise<Tab | null> {
@@ -1735,9 +1769,10 @@ export class App {
     const pane: 0 | 1 = m.pane === 1 && this.splitOn ? 1 : 0;
     let tab: Tab | null = null;
     if (meta.kind === "paged" && meta.path) {
-      // The recovery log of a large file only describes changes to the file it was made for.
+      // The recovery log of a large file only describes changes to the file it was made for. A
+      // missing file may be on a drive that is not connected, so the log is kept for a while.
       if (!(await backend.pathExists(meta.path))) {
-        if (m.dirty) this.lostEdits.push(meta.path);
+        if (m.dirty) this.keepForLater(meta);
         return null;
       }
       tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView, pane });

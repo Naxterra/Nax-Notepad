@@ -7,7 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { App, setBufferEpoch, Tab } from "./app";
-import { backend, errorText } from "./backend";
+import { backend, errorText, FinishedSaves } from "./backend";
 import { addMacroCommands, buildCommands, Command, installKeybindings, recorder, runCommand } from "./commands";
 import { compartments, lineNumbersExt } from "./editor";
 import { applyKeymap } from "./keymap";
@@ -347,6 +347,9 @@ async function main(): Promise<void> {
     }
   });
 
+  // Interrupted saves are repaired before any tab shows those files.
+  const saves = await backend.finishedSaves().catch(() => ({ finished: [], failed: [] }) as FinishedSaves);
+
   // Restore session, then open files from the command line
   // Unsaved text always comes back; the setting only decides about the other tabs.
   setBufferEpoch(await backend.sessionBufferEpoch());
@@ -356,11 +359,11 @@ async function main(): Promise<void> {
   } catch (e) {
     console.warn("session restore failed", e);
   }
-  const saves = await backend.finishedSaves().catch(() => ({ finished: [] as string[], undone: [] as string[] }));
-  if (saves.undone.length) {
+  if (saves.failed.length) {
+    const files = saves.failed.map((f) => `${f.target}\n${t("Copies:")} ${f.kept.join(", ")}`).join("\n\n");
     void message(
-      t("Interrupted save undone"),
-      t("Nax-Notepad stopped while saving these files, and the text being saved was no longer there. They have their previous content again. Your text may still be in the tab:\n\n{files}", { files: saves.undone.join("\n") })
+      t("Interrupted save not finished"),
+      t("Nax-Notepad stopped while saving these files and could not finish the save safely, because the file was changed afterwards, is missing or is in use. Nothing was overwritten. The text you were saving and the previous content are kept in the copies listed:\n\n{files}", { files })
     );
   }
   const finished = saves.finished;
@@ -397,6 +400,9 @@ async function main(): Promise<void> {
 
 void main().catch((e) => {
   console.error(e);
-  document.body.innerHTML = `<pre style="color:#f55;padding:16px">${String(e)}</pre>`;
+  const pre = document.createElement("pre");
+  pre.style.cssText = "color:#f55;padding:16px";
+  pre.textContent = String(e);
+  document.body.replaceChildren(pre);
   void getCurrentWindow().show();
 });
