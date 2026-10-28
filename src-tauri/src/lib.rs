@@ -185,6 +185,7 @@ async fn save_text(
     eol: Eol,
     lossy: Option<bool>,
     expected_mtime: Option<u64>,
+    expected_size: Option<u64>,
 ) -> Result<SaveResult, String> {
     let p = PathBuf::from(&path);
     // Refuses characters the encoding cannot represent unless the user confirmed a lossy save.
@@ -197,7 +198,8 @@ async fn save_text(
     // The modification time the editor knows; a different one means another program wrote the
     // file after it was opened or saved. Checked under the save lock, so two saves cannot both
     // pass it.
-    let unchanged = || if p.exists() { ensure_unchanged(&p, expected_mtime, None) } else { Ok(()) };
+    // The size is compared too: some programs keep the modification time when they write.
+    let unchanged = || if p.exists() { ensure_unchanged(&p, expected_mtime, expected_size) } else { Ok(()) };
     session::replace_atomic_checked(&p, unchanged, |f| std::io::Write::write_all(f, &bytes))?;
     Ok(SaveResult {
         size: bytes.len() as u64,
@@ -634,7 +636,7 @@ fn session_has_recovery(id: String) -> bool {
 }
 
 #[tauri::command]
-fn session_load_buffer(id: String) -> Option<String> {
+fn session_load_buffer(id: String) -> Result<Option<String>, String> {
     session::load_buffer(&id)
 }
 
@@ -680,14 +682,49 @@ async fn finished_saves(state: State<'_, AppState>) -> Result<FinishedSaves, Str
 fn running_mutex_security() -> Option<windows_sys::Win32::Security::SECURITY_ATTRIBUTES> {
     use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    // The owner (OW) and SYSTEM (SY) get full access, so the user's next start of the app can
-    // open the mutex while an older process still holds it; everyone else (WD) gets SYNCHRONIZE.
-    let sddl: Vec<u16> = "D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x00100000;;;WD)".encode_utf16().chain(std::iter::once(0)).collect();
+    // The user (by SID, also when the process runs elevated) and SYSTEM get full access, so the
+    // user's next start of the app can open the mutex while an older process still holds it;
+    // everyone else (WD) gets SYNCHRONIZE.
+    let user = current_user_sid()?;
+    let sddl: Vec<u16> = format!("D:(A;;GA;;;{user})(A;;GA;;;SY)(A;;0x00100000;;;WD)").encode_utf16().chain(std::iter::once(0)).collect();
     let mut descriptor = std::ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; the descriptor is allocated by Windows and deliberately
     // never freed, because the mutex uses it for the life of the process.
     let ok = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) };
     (ok != 0).then(|| SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: descriptor, bInheritHandle: 0 })
+}
+
+/// The SID of the user this process runs as, in its "S-1-5-..." form.
+#[cfg(windows)]
+fn current_user_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: every pointer refers to a local that outlives the call; the token handle and the
+    // string are released before returning.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; 256];
+        let mut len = 0u32;
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), buf.len() as u32, &mut len);
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
+            return None;
+        }
+        let n = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+        LocalFree(text.cast());
+        Some(sid)
+    }
 }
 
 /// Tell the user that this portable copy cannot start, before any window exists.
@@ -1342,7 +1379,10 @@ pub fn run() {
                     let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
-                let _ = app.emit("open-files", files);
+                // Queued with the start-up files, so none is lost if the page is not listening
+                // yet; the event only tells the page to take them.
+                app.state::<AppState>().startup_files.lock().extend(files);
+                let _ = app.emit("open-files", ());
             }))
             .plugin(tauri_plugin_window_state::Builder::default().build());
     }
@@ -1620,7 +1660,8 @@ mod tests {
         let p = dir.path().join("notes.txt");
         std::fs::write(&p, b"from another program").unwrap();
         let known = mtime_of(&p) - 5_000; // the editor loaded an older version
-        let save = |m: Option<u64>| tauri::async_runtime::block_on(save_text(p.display().to_string(), "mine".into(), "UTF-8".into(), Eol::Lf, None, m));
+        let save_sized = |m: Option<u64>, size: Option<u64>| tauri::async_runtime::block_on(save_text(p.display().to_string(), "mine".into(), "UTF-8".into(), Eol::Lf, None, m, size));
+        let save = |m: Option<u64>| save_sized(m, None);
         let err = save(Some(known)).err().expect("must refuse");
         assert!(err.starts_with(paged::E_EXTERNAL_CHANGE), "{err}");
         assert_eq!(std::fs::read(&p).unwrap(), b"from another program");
@@ -1629,6 +1670,10 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"mine");
         // Sessions of old versions stored seconds; those still match.
         save(Some(mtime_of(&p) / 1000)).unwrap();
+        // Another program that keeps the modification time but changes the size is noticed.
+        let err = save_sized(Some(mtime_of(&p)), Some(999)).err().expect("a different size must refuse");
+        assert!(err.starts_with(paged::E_EXTERNAL_CHANGE), "{err}");
+        save_sized(Some(mtime_of(&p)), Some(4)).unwrap();
     }
 
     #[test]

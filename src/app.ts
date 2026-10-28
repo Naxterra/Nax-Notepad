@@ -649,7 +649,17 @@ export class App {
     return this.tabs.find((x) => !x.cloneOf && x.path && x.path.toLowerCase() === norm);
   }
 
-  async openFiles(paths: string[], activate = true): Promise<Tab | null> {
+  /** Open requests (drops, a second start, the command line) one after another. */
+  private openQueue: Promise<unknown> = Promise.resolve();
+
+  /** Open files, one request at a time, so the same file dropped twice opens once. */
+  openFiles(paths: string[], activate = true): Promise<Tab | null> {
+    const run = (this.openQueue ?? Promise.resolve()).then(() => this.openFilesNow(paths, activate));
+    this.openQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async openFilesNow(paths: string[], activate: boolean): Promise<Tab | null> {
     let last: Tab | null = null;
     for (const p of paths) {
       const existing = this.findByPath(p);
@@ -667,8 +677,11 @@ export class App {
         let tab: Tab | null = null;
         try {
           tab = await this.restoreTab(kept);
-        } catch {
-          /* still kept: open the file as it is on disk below */
+        } catch (e) {
+          // Opening the disk version beside the kept changes would give two diverging tabs for
+          // one file; the changes stay kept and the user is told why nothing opened.
+          await message(t("{file} has unsaved changes from an earlier session that cannot be restored yet ({error}). They are kept and tried again later.", { file: p, error: errorText(e) }), { title: t("Unsaved changes kept"), kind: "warning" });
+          continue;
         }
         this.reportRestoreProblems();
         if (tab) {
@@ -922,7 +935,9 @@ export class App {
         // refuses when another program changed the file since it was read, unless the user
         // chose "Keep mine" for exactly that change.
         const expected = isSaveAs ? null : (tab.externalAck ?? (tab.mtime || null));
-        r = await backend.saveText(target, this.docText(tab), tab.encoding, tab.eol, opts.lossy ?? false, expected);
+        // The size on disk when the file was read; unknown (0) for old sessions and after "Keep mine".
+        const size = isSaveAs || tab.externalAck !== undefined || !tab.size ? null : tab.size;
+        r = await backend.saveText(target, this.docText(tab), tab.encoding, tab.eol, opts.lossy ?? false, expected, size);
       }
       tab.path = r.path;
       tab.name = r.name;
@@ -1643,6 +1658,7 @@ export class App {
       cursorCol: head - line.from,
       scrollTop: view ? view.scrollDOM.scrollTop : tab.scrollTop,
       mtime: tab.mtime,
+      size: tab.size,
       pane: this.paneIndex(tab),
       shown: !!this.paneOf(tab),
       indent: tab.indent,
@@ -1847,6 +1863,7 @@ export class App {
           untitled: m.untitled ?? null,
           readOnly: m.readOnly,
           mtime: (m as { mtime?: number }).mtime ?? 0,
+          size: (m as { size?: number }).size ?? 0,
           pane,
           indent: m.indent ?? null,
         });
@@ -1856,9 +1873,13 @@ export class App {
         tab.state = this.buildState(tab, buffer, langExt);
         this.insertTab(tab);
       } else if (meta.path) {
+        // Unsaved changes without stored text cannot come back; say so instead of silently
+        // showing the file as it is on disk.
+        if (m.dirty) this.lostEdits.push(meta.path);
         if (!(await backend.pathExists(meta.path))) return null;
         tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, hexView: m.hexView, pane });
       } else {
+        if (m.dirty) this.lostEdits.push(m.name ?? untitledName(m.untitled ?? 1));
         // untitled with no stored buffer: empty tab
         tab = this.makeTab({ id: meta.id, name: untitledName(m.untitled ?? 1), kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview, pane });
         tab.state = this.buildState(tab, "", []);

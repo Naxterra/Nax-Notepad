@@ -151,8 +151,8 @@ export const backend = {
   openPath: (id: string, path: string, forcePaged = false, encoding: string | null = null) =>
     invoke<OpenResult>("open_path", { id, path, forcePaged, encoding }),
   /** `expectedMtime`: the time the file had when it was read; the save fails with E_EXTERNAL_CHANGE if it differs. */
-  saveText: (path: string, text: string, encoding: string, eol: Eol, lossy = false, expectedMtime: number | null = null) =>
-    invoke<SaveResult>("save_text", { path, text, encoding, eol, lossy, expectedMtime }),
+  saveText: (path: string, text: string, encoding: string, eol: Eol, lossy = false, expectedMtime: number | null = null, expectedSize: number | null = null) =>
+    invoke<SaveResult>("save_text", { path, text, encoding, eol, lossy, expectedMtime, expectedSize }),
   fileMtime: (path: string) => invoke<number>("file_mtime", { path }),
   encodings: () => invoke<string[]>("encodings"),
 

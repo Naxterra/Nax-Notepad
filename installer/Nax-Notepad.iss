@@ -213,10 +213,31 @@ begin
     RemoveOldDefaults;
 end;
 
+{ An all-users uninstall cannot ask every account about its data, but the browser engine's
+  cache belongs to the program, so it is removed from every profile under the Users folder. }
+procedure RemoveCacheFromAllProfiles;
+var
+  Rec: TFindRec;
+  Root: string;
+begin
+  Root := ExpandConstant('{sd}\Users\');
+  if FindFirst(Root + '*', Rec) then
+  try
+    repeat
+      if ((Rec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and (Rec.Name <> '.') and (Rec.Name <> '..') then
+        DelTree(Root + Rec.Name + '\AppData\Local\com.nax.notepad', True, True, True);
+    until not FindNext(Rec);
+  finally
+    FindClose(Rec);
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: string;
 begin
+  if (CurUninstallStep = usPostUninstall) and IsAdminInstallMode then
+    RemoveCacheFromAllProfiles;
   if CurUninstallStep = usUninstall then
   begin
     RemoveFromUserPath(ExpandConstant('{app}'));

@@ -322,9 +322,10 @@ async function main(): Promise<void> {
     void restoredReady.then(() => app.openFiles(paths));
   });
 
-  // Files handed over by a second instance (after the last session is back)
-  void listen<string[]>("open-files", (ev) => {
-    void restoredReady.then(() => app.openFiles(ev.payload));
+  // Files handed over by a second instance (after the last session is back). The backend
+  // queues them, so files sent before this listener existed are not lost either.
+  void listen("open-files", () => {
+    void restoredReady.then(async () => app.openFiles(await backend.startupFiles()));
   });
 
   // Flush unsaved state before the window closes
@@ -332,8 +333,10 @@ async function main(): Promise<void> {
   let closing = false;
   // Close only after unsaved work is stored for recovery; on failure the user decides.
   void win.onCloseRequested(async (ev) => {
-    if (closing) return;
+    // A second click while the first close is still storing unsaved text must not close the
+    // window without it.
     ev.preventDefault();
+    if (closing) return;
     closing = true;
     try {
       // Closing while the last session is still being restored waits for it, so its unsaved

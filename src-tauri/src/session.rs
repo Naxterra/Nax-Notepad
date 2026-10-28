@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Portable mode: when a file named `portable.txt` sits next to the program, everything is
@@ -675,12 +675,89 @@ pub struct Session {
     pub next_untitled: u32,
 }
 
+/// Set when this start could not read the session file completely. Buffers are then not
+/// pruned during this run, because the session may not list every tab they belong to.
+static SESSION_INCOMPLETE: AtomicBool = AtomicBool::new(false);
+
 pub fn load_session() -> Session {
-    let p = data_dir().join("session.json");
-    match fs::read(&p) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => Session::default(),
+    let (session, complete) = load_session_from(&data_dir().join("session.json"), &buffers_dir());
+    if !complete {
+        SESSION_INCOMPLETE.store(true, Ordering::Relaxed);
     }
+    session
+}
+
+/// Read a file, trying again a few times when another program (a virus scanner, a backup
+/// tool) briefly holds it.
+fn read_patiently(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut last = None;
+    for _ in 0..5 {
+        match fs::read(path) {
+            Ok(b) => return Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("cannot read")))
+}
+
+/// Read a session file. An entry that cannot be read is skipped instead of dropping the whole
+/// session. If anything could not be read, the file is kept as `session.json.unreadable`, and
+/// every unsaved text in `buffers` that the session does not mention comes back as a
+/// recovered tab, so no unsaved text is lost. Returns the session and whether it was complete.
+fn load_session_from(path: &Path, buffers: &Path) -> (Session, bool) {
+    let mut session = Session::default();
+    let mut complete = true;
+    match read_patiently(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (session, true),
+        Err(_) => complete = false,
+        Ok(bytes) => {
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(v) => {
+                    session.active = v.get("active").and_then(|a| a.as_str()).map(String::from);
+                    session.next_untitled = v.get("next_untitled").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+                    match v.get("tabs") {
+                        Some(serde_json::Value::Array(items)) => {
+                            for item in items {
+                                match serde_json::from_value::<TabMeta>(item.clone()) {
+                                    Ok(t) => session.tabs.push(t),
+                                    Err(_) => complete = false,
+                                }
+                            }
+                        }
+                        None => {}
+                        Some(_) => complete = false,
+                    }
+                }
+                Err(_) => complete = false,
+            }
+            if !complete {
+                let mut keep = path.as_os_str().to_owned();
+                keep.push(".unreadable");
+                let _ = fs::write(PathBuf::from(keep), &bytes);
+            }
+        }
+    }
+    if !complete {
+        let known: std::collections::HashSet<String> = session.tabs.iter().map(|t| sanitize(&t.id)).collect();
+        let mut found: Vec<String> = fs::read_dir(buffers)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".txt")).map(String::from))
+                    .filter(|stem| !stem.contains('.') && !known.contains(stem))
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        for (n, id) in found.into_iter().enumerate() {
+            let mut extra = serde_json::Map::new();
+            extra.insert("dirty".into(), true.into());
+            extra.insert("name".into(), format!("recovered {}", n + 1).into());
+            session.tabs.push(TabMeta { id, path: None, kind: "memory".into(), extra });
+        }
+    }
+    (session, complete)
 }
 
 pub fn save_session(s: &Session) -> Result<(), String> {
@@ -765,13 +842,27 @@ pub fn has_recovery(id: &str) -> bool {
     buffer_path(id).is_file() || pieces.is_file()
 }
 
-pub fn load_buffer(id: &str) -> Option<String> {
-    fs::read_to_string(buffer_path(id)).ok()
+/// The unsaved text stored for `id`: `Ok(None)` when there is none, an error when it exists but
+/// cannot be read (then it must not be treated as missing, or the text would be lost).
+pub fn load_buffer(id: &str) -> Result<Option<String>, String> {
+    load_buffer_from(&buffer_path(id))
+}
+
+fn load_buffer_from(path: &Path) -> Result<Option<String>, String> {
+    match read_patiently(path) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| format!("The unsaved text in {} is damaged.", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Cannot read the unsaved text in {}: {e}", path.display())),
+    }
 }
 
 /// Remove buffer files that belong to no tab in `s`. Temporary files of writes that may still
 /// be in progress are left alone unless they are older than an hour.
 pub fn prune_buffers(s: &Session) {
+    // After an incomplete session load, buffers may belong to tabs the session does not list.
+    if SESSION_INCOMPLETE.load(Ordering::Relaxed) {
+        return;
+    }
     let keep: std::collections::HashSet<String> = s.tabs.iter().map(|t| sanitize(&t.id)).collect();
     if let Ok(rd) = fs::read_dir(buffers_dir()) {
         for e in rd.flatten() {
@@ -1118,6 +1209,57 @@ mod tests {
         let before = target_lock(&fresh);
         std::fs::write(&fresh, b"y").unwrap();
         assert!(Arc::ptr_eq(&before, &target_lock(&fresh)));
+    }
+
+    fn session_dir_with_buffers(session: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let buffers = dir.path().join("buffers");
+        std::fs::create_dir(&buffers).unwrap();
+        std::fs::write(buffers.join("ta.txt"), "text of a").unwrap();
+        std::fs::write(buffers.join("tb.txt"), "text of b").unwrap();
+        std::fs::write(buffers.join("tc.pieces.json"), "{}").unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, session).unwrap();
+        (dir, path, buffers)
+    }
+
+    #[test]
+    fn a_session_file_with_one_damaged_entry_keeps_every_unsaved_text() {
+        let (_d, path, buffers) = session_dir_with_buffers(br#"{"tabs":[{"id":"ta","path":"C:/x/a.txt","kind":"memory","dirty":true},{"id":"bad","kind":null}],"active":"ta","next_untitled":3}"#);
+        let (s, complete) = load_session_from(&path, &buffers);
+        assert!(!complete);
+        assert_eq!(s.tabs.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["ta", "tb"], "the readable entry stays and the other text comes back");
+        assert_eq!(s.tabs[1].extra.get("dirty"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(s.next_untitled, 3);
+        let mut kept = path.as_os_str().to_owned();
+        kept.push(".unreadable");
+        assert!(PathBuf::from(kept).is_file(), "the damaged file is kept for inspection");
+    }
+
+    #[test]
+    fn an_unreadable_session_file_brings_back_all_unsaved_text() {
+        let (_d, path, buffers) = session_dir_with_buffers(b"\x00 not json");
+        let (s, complete) = load_session_from(&path, &buffers);
+        assert!(!complete);
+        assert_eq!(s.tabs.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["ta", "tb"]);
+    }
+
+    #[test]
+    fn a_missing_session_file_is_a_normal_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, complete) = load_session_from(&dir.path().join("session.json"), &dir.path().join("buffers"));
+        assert!(complete && s.tabs.is_empty());
+    }
+
+    #[test]
+    fn unsaved_text_that_cannot_be_read_is_an_error_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t1.txt");
+        assert_eq!(load_buffer_from(&p), Ok(None));
+        std::fs::write(&p, [0xff, 0xfe, 0x41]).unwrap();
+        assert!(load_buffer_from(&p).is_err());
+        std::fs::write(&p, "fine").unwrap();
+        assert_eq!(load_buffer_from(&p), Ok(Some("fine".to_string())));
     }
 
     #[test]

@@ -432,6 +432,60 @@ test("a kept entry that is lost when its file is opened is reported and not put 
   assert.ok(messages.some((m) => /could not be restored, because/.test(m) && /big\.log/.test(m)));
 });
 
+test("saving also tells the backend the file size it read, except after Keep mine and for Save As", async () => {
+  const sizes = [];
+  backend.saveText = async (p, text, enc, eol, lossy, expectedMtime, expectedSize) => {
+    sizes.push(expectedSize);
+    return { size: 3, mtime: 9000, name: "test.txt", path: p };
+  };
+  backend.sessionDropBuffer = async () => {};
+  const tab = memoryTab({ mtime: 1234, size: 77 });
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "abc" }) });
+  await app.save(tab);
+  tab.externalAck = 5678;
+  await app.save(tab);
+  await app.writeTab(tab, "other.txt", true);
+  assert.deepEqual(sizes, [77, null, null]);
+});
+
+test("a tab with unsaved changes whose stored text is missing is reported, not shown as clean", async () => {
+  backend.sessionLoadBuffer = async () => null;
+  backend.pathExists = async () => false;
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.lostEdits = [];
+  await app.restoreTab({ id: "x", path: "C:/data/notes.txt", kind: "memory", dirty: true });
+  assert.deepEqual(app.lostEdits, ["C:/data/notes.txt"]);
+});
+
+test("a kept entry whose restore fails does not open a second tab beside it", async () => {
+  messages.length = 0;
+  const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
+  const kept = { id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: Date.now() };
+  app.keptMetas = [kept];
+  app.restoreTab = async () => {
+    throw new Error("access denied");
+  };
+  app.openOne = async () => assert.fail("the file must not open beside its kept changes");
+  assert.equal(await app.openFiles(["E:/logs/big.log"], false), null);
+  assert.deepEqual(app.keptMetas, [kept]);
+  assert.ok(messages.some((m) => /cannot be restored yet/.test(m)));
+});
+
+test("the same file dropped twice at once opens in one tab", async () => {
+  const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
+  app.keptMetas = [];
+  let opened = 0;
+  app.openOne = async (p) => {
+    opened++;
+    await new Promise((r) => setTimeout(r, 5));
+    const tab = memoryTab({ id: "n" + opened, path: p, name: "dropped.txt" });
+    app.tabs.push(tab);
+    return tab;
+  };
+  await Promise.all([app.openFiles(["C:/data/dropped.txt"], false), app.openFiles(["C:/data/dropped.txt"], false)]);
+  assert.equal(opened, 1);
+});
+
 test("a kept entry that still cannot be restored when its file is opened stays only once", async () => {
   const app = fakeApp(memoryTab({ path: "other.txt" }), { state: EditorState.create({ doc: "" }) });
   const kept = { id: "big", path: "E:/logs/big.log", kind: "paged", dirty: true, keptSince: Date.now() };
