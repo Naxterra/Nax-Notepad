@@ -145,6 +145,8 @@ export interface SessionData {
   tabs: TabMeta[];
   active: string | null;
   next_untitled: number;
+  /** Edit logs of large files that no entry lists after a damaged session file (only loaded). */
+  unmatched_logs?: string[];
 }
 
 export const backend = {

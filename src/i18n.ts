@@ -140,6 +140,8 @@ const de: Record<string, string> = {
   "Nax-Notepad stopped while saving these files and could not finish the save safely, because the file was changed afterwards, is missing or is in use. Nothing was overwritten. The text you were saving and the previous content are kept in the copies listed:\n\n{files}":
     "Nax-Notepad wurde beim Speichern dieser Dateien beendet und konnte das Speichern nicht sicher abschließen, weil die Datei danach geändert wurde, fehlt oder in Benutzung ist. Es wurde nichts überschrieben. Der zu speichernde Text und der vorherige Inhalt liegen in den aufgeführten Kopien:\n\n{files}",
   "Unsaved changes kept": "Ungespeicherte Änderungen aufbewahrt",
+  "The session file was damaged. These saved changes to large files can no longer be matched to their files. They are kept for 30 days:\n\n{files}":
+    "Die Sitzungsdatei war beschädigt. Diese gespeicherten Änderungen an großen Dateien lassen sich ihren Dateien nicht mehr zuordnen. Sie werden 30 Tage aufbewahrt:\n\n{files}",
   "{file} has unsaved changes from an earlier session that cannot be restored yet ({error}). They are kept and tried again later.":
     "{file} hat ungespeicherte Änderungen aus einer früheren Sitzung, die noch nicht wiederhergestellt werden können ({error}). Sie werden aufbewahrt und später erneut versucht.",
   "Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}":

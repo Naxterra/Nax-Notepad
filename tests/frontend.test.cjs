@@ -1053,6 +1053,38 @@ test("cancelling the changed-on-disk question does not allow saving over the oth
   }
 });
 
+test("a file rewritten by another program that kept its modification time is noticed by its size", async () => {
+  const oldConfirm = dialogs.confirm3;
+  const asked = [];
+  dialogs.confirm3 = async (title) => {
+    asked.push(title);
+    return "no";
+  };
+  settings.autoReloadExternal = false;
+  try {
+    backend.pathExists = async () => true;
+    backend.fileMtime = async () => 50;
+    backend.fileSize = async () => 999;
+    const tab = memoryTab({ mtime: 50, size: 10 });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "abc" }) });
+    await app.checkExternalChange();
+    assert.deepEqual(asked, ["File changed on disk"]);
+    assert.equal(tab.externalAck, 50, "Keep mine lets the next save replace that version");
+  } finally {
+    dialogs.confirm3 = oldConfirm;
+    settings.autoReloadExternal = true;
+  }
+});
+
+test("a damaged session file's unmatched large-file logs are reported", async () => {
+  messages.length = 0;
+  backend.sessionLoad = async () => ({ tabs: [], active: null, next_untitled: 1, unmatched_logs: ["C:/data/buffers/t9.pieces.json"] });
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  await app.restoreSession();
+  assert.ok(messages.some((m) => /can no longer be matched/.test(m) && /t9\.pieces\.json/.test(m)));
+});
+
 test("the reload question mentions losing changes only when there are unsaved changes", async () => {
   const questions = [];
   const oldConfirm = dialogs.confirm3;

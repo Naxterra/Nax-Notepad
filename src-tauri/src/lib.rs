@@ -708,9 +708,10 @@ fn current_user_sid() -> Option<String> {
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return None;
         }
-        let mut buf = vec![0u8; 256];
+        // u64 elements give the alignment TOKEN_USER (which holds pointers) needs.
+        let mut buf = vec![0u64; 64];
         let mut len = 0u32;
-        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), buf.len() as u32, &mut len);
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut len);
         CloseHandle(token);
         if ok == 0 {
             return None;

@@ -372,7 +372,8 @@ async function main(): Promise<void> {
   // Unsaved text always comes back; the setting only decides about the other tabs.
   let restored = false;
   try {
-    setBufferEpoch(await backend.sessionBufferEpoch());
+    // Should the backend not answer, a number far above its own count keeps generations rising.
+    setBufferEpoch(await backend.sessionBufferEpoch().catch(() => 1_000_000));
     restored = await app.restoreSession({ onlyUnsaved: !settings.restoreSession });
   } catch (e) {
     console.warn("session restore failed", e);

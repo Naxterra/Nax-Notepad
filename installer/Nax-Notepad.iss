@@ -214,22 +214,24 @@ begin
 end;
 
 { An all-users uninstall cannot ask every account about its data, but the browser engine's
-  cache belongs to the program, so it is removed from every profile under the Users folder. }
+  cache belongs to the program, so it is removed from every profile Windows knows of (also
+  profiles outside the Users folder). A profile with its own per-user installation keeps it. }
 procedure RemoveCacheFromAllProfiles;
 var
-  Rec: TFindRec;
-  Root: string;
+  Keys: TArrayOfString;
+  I: Integer;
+  Profile: string;
 begin
-  Root := ExpandConstant('{sd}\Users\');
-  if FindFirst(Root + '*', Rec) then
-  try
-    repeat
-      if ((Rec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and (Rec.Name <> '.') and (Rec.Name <> '..') then
-        DelTree(Root + Rec.Name + '\AppData\Local\com.nax.notepad', True, True, True);
-    until not FindNext(Rec);
-  finally
-    FindClose(Rec);
-  end;
+  if not RegGetSubkeyNames(HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList', Keys) then
+    exit;
+  for I := 0 to GetArrayLength(Keys) - 1 do
+    if RegQueryStringValue(HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + Keys[I], 'ProfileImagePath', Profile) then
+    begin
+      StringChangeEx(Profile, '%SystemDrive%', ExpandConstant('{sd}'), True);
+      StringChangeEx(Profile, '%SystemRoot%', ExpandConstant('{win}'), True);
+      if DirExists(Profile + '\AppData\Local\com.nax.notepad') and not FileExists(Profile + '\AppData\Local\Programs\Nax-Notepad\nax-notepad.exe') then
+        DelTree(Profile + '\AppData\Local\com.nax.notepad', True, True, True);
+    end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

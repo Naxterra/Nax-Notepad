@@ -683,7 +683,8 @@ export class App {
           await message(t("{file} has unsaved changes from an earlier session that cannot be restored yet ({error}). They are kept and tried again later.", { file: p, error: errorText(e) }), { title: t("Unsaved changes kept"), kind: "warning" });
           continue;
         }
-        this.reportRestoreProblems();
+        // While the session is still being restored, its own report shows everything at the end.
+        if (!this.restoring) this.reportRestoreProblems();
         if (tab) {
           this.keptMetas = this.keptMetas.filter((m) => m.id !== kept.id);
           last = tab;
@@ -1208,7 +1209,9 @@ export class App {
       } else {
         if (!(await backend.pathExists(tab.path))) return;
         mtime = await backend.fileMtime(tab.path);
-        changed = !sameMtime(mtime, tab.mtime);
+        // Some programs keep the modification time when they write; the size still differs.
+        const size = tab.size ? await backend.fileSize(tab.path).catch(() => tab.size) : tab.size;
+        changed = !sameMtime(mtime, tab.mtime) || size !== tab.size;
       }
       if (!changed || tab.externalAck === mtime) return;
       if (!tab.dirty && settings.autoReloadExternal) {
@@ -1735,8 +1738,11 @@ export class App {
     this.lostEdits = [];
     this.keptMetas = [];
     this.notRestored = [];
+    let unmatched: string[] = [];
     try {
       const s = await backend.sessionLoad();
+      unmatched = s.unmatched_logs ?? [];
+      delete s.unmatched_logs;
       if (opts.onlyUnsaved) s.tabs = s.tabs.filter((m) => (m as { dirty?: boolean }).dirty);
       this.nextUntitled = Math.max(1, s.next_untitled || 1);
       let activeTab: Tab | null = null;
@@ -1772,6 +1778,12 @@ export class App {
       this.sessionHeld = false;
       this.scheduleSessionSave();
       this.reportRestoreProblems();
+      if (unmatched.length) {
+        void message(t("The session file was damaged. These saved changes to large files can no longer be matched to their files. They are kept for 30 days:\n\n{files}", { files: unmatched.join("\n") }), {
+          title: t("Unsaved changes kept"),
+          kind: "warning",
+        });
+      }
     }
   }
 

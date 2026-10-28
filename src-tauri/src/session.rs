@@ -673,18 +673,47 @@ pub struct Session {
     pub active: Option<String>,
     #[serde(default)]
     pub next_untitled: u32,
+    /// Edit logs of large files that no entry lists after a damaged session file (shown to the
+    /// user; only sent to the frontend, never stored).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_logs: Vec<String>,
 }
 
 /// Set when this start could not read the session file completely. Buffers are then not
-/// pruned during this run, because the session may not list every tab they belong to.
+/// pruned during this run (the recovery hold below keeps them for the following starts too).
 static SESSION_INCOMPLETE: AtomicBool = AtomicBool::new(false);
+/// Set when the session file existed but could not be read: it is copied aside before it is
+/// overwritten for the first time.
+static SESSION_READ_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// How long recovery data that no session entry lists is kept after a damaged session file.
+const RECOVERY_HOLD_SECS: u64 = 30 * 24 * 3600;
+
+/// While this file exists (for 30 days after a session file could not be read completely),
+/// recovery data that no session entry lists is never deleted.
+fn recovery_hold_marker() -> PathBuf {
+    data_dir().join("recovery-hold")
+}
+
+/// True while the recovery hold lasts; an expired hold is removed.
+fn recovery_hold_active(marker: &Path) -> bool {
+    let Ok(age) = fs::metadata(marker).and_then(|m| m.modified()) else { return false };
+    if age.elapsed().is_ok_and(|a| a.as_secs() > RECOVERY_HOLD_SECS) {
+        let _ = fs::remove_file(marker);
+        return false;
+    }
+    true
+}
 
 pub fn load_session() -> Session {
-    let (session, complete) = load_session_from(&data_dir().join("session.json"), &buffers_dir());
-    if !complete {
+    let loaded = load_session_from(&data_dir().join("session.json"), &buffers_dir(), &recovery_hold_marker());
+    if !loaded.complete {
         SESSION_INCOMPLETE.store(true, Ordering::Relaxed);
     }
-    session
+    if loaded.read_failed {
+        SESSION_READ_FAILED.store(true, Ordering::Relaxed);
+    }
+    loaded.session
 }
 
 /// Read a file, trying again a few times when another program (a virus scanner, a backup
@@ -702,16 +731,29 @@ fn read_patiently(path: &Path) -> std::io::Result<Vec<u8>> {
     Err(last.unwrap_or_else(|| std::io::Error::other("cannot read")))
 }
 
+struct LoadedSession {
+    session: Session,
+    /// Every entry of the file could be read.
+    complete: bool,
+    /// The file exists but could not be read at all.
+    read_failed: bool,
+}
+
 /// Read a session file. An entry that cannot be read is skipped instead of dropping the whole
-/// session. If anything could not be read, the file is kept as `session.json.unreadable`, and
-/// every unsaved text in `buffers` that the session does not mention comes back as a
-/// recovered tab, so no unsaved text is lost. Returns the session and whether it was complete.
-fn load_session_from(path: &Path, buffers: &Path) -> (Session, bool) {
+/// session. If anything could not be read, the file is kept as `session.json.unreadable` and a
+/// recovery hold starts (`marker`). While it lasts, every unsaved text in `buffers` that the
+/// session does not list comes back as a recovered tab, and edit logs of large files that no
+/// entry lists are reported, because without their entry nothing says which file they belong to.
+fn load_session_from(path: &Path, buffers: &Path, marker: &Path) -> LoadedSession {
     let mut session = Session::default();
     let mut complete = true;
+    let mut read_failed = false;
     match read_patiently(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (session, true),
-        Err(_) => complete = false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            complete = false;
+            read_failed = true;
+        }
         Ok(bytes) => {
             match serde_json::from_slice::<serde_json::Value>(&bytes) {
                 Ok(v) => {
@@ -733,35 +775,47 @@ fn load_session_from(path: &Path, buffers: &Path) -> (Session, bool) {
                 Err(_) => complete = false,
             }
             if !complete {
-                let mut keep = path.as_os_str().to_owned();
-                keep.push(".unreadable");
-                let _ = fs::write(PathBuf::from(keep), &bytes);
+                let _ = fs::write(unreadable_copy(path), &bytes);
             }
         }
     }
-    if !complete {
+    if !complete && !marker.exists() {
+        if let Some(dir) = marker.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(marker, b"Recovery data that no session entry lists is kept while this file exists.");
+    }
+    if !complete || recovery_hold_active(marker) {
         let known: std::collections::HashSet<String> = session.tabs.iter().map(|t| sanitize(&t.id)).collect();
-        let mut found: Vec<String> = fs::read_dir(buffers)
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".txt")).map(String::from))
-                    .filter(|stem| !stem.contains('.') && !known.contains(stem))
-                    .collect()
-            })
-            .unwrap_or_default();
-        found.sort();
-        for (n, id) in found.into_iter().enumerate() {
+        let names: Vec<String> = fs::read_dir(buffers).map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect()).unwrap_or_default();
+        let mut texts: Vec<String> = names.iter().filter_map(|n| n.strip_suffix(".txt")).filter(|stem| !stem.contains('.') && !known.contains(*stem)).map(String::from).collect();
+        texts.sort();
+        for (n, id) in texts.into_iter().enumerate() {
             let mut extra = serde_json::Map::new();
             extra.insert("dirty".into(), true.into());
             extra.insert("name".into(), format!("recovered {}", n + 1).into());
             session.tabs.push(TabMeta { id, path: None, kind: "memory".into(), extra });
         }
+        let mut logs: Vec<String> = names.iter().filter(|n| n.strip_suffix(".pieces.json").is_some_and(|stem| !known.contains(stem))).map(|n| buffers.join(n).display().to_string()).collect();
+        logs.sort();
+        session.unmatched_logs = logs;
     }
-    (session, complete)
+    LoadedSession { session, complete, read_failed }
+}
+
+fn unreadable_copy(path: &Path) -> PathBuf {
+    let mut keep = path.as_os_str().to_owned();
+    keep.push(".unreadable");
+    PathBuf::from(keep)
 }
 
 pub fn save_session(s: &Session) -> Result<(), String> {
     ensure_dirs()?;
+    // A session file that could not be read at start is kept before it is replaced.
+    if SESSION_READ_FAILED.swap(false, Ordering::Relaxed) {
+        let p = data_dir().join("session.json");
+        let _ = fs::copy(&p, unreadable_copy(&p));
+    }
     let bytes = serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?;
     write_atomic(&data_dir().join("session.json"), &bytes)
 }
@@ -860,7 +914,7 @@ fn load_buffer_from(path: &Path) -> Result<Option<String>, String> {
 /// be in progress are left alone unless they are older than an hour.
 pub fn prune_buffers(s: &Session) {
     // After an incomplete session load, buffers may belong to tabs the session does not list.
-    if SESSION_INCOMPLETE.load(Ordering::Relaxed) {
+    if SESSION_INCOMPLETE.load(Ordering::Relaxed) || recovery_hold_active(&recovery_hold_marker()) {
         return;
     }
     let keep: std::collections::HashSet<String> = s.tabs.iter().map(|t| sanitize(&t.id)).collect();
@@ -1211,6 +1265,11 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &target_lock(&fresh)));
     }
 
+    fn load(path: &Path, buffers: &Path) -> (Session, bool) {
+        let l = load_session_from(path, buffers, &path.with_file_name("recovery-hold"));
+        (l.session, l.complete)
+    }
+
     fn session_dir_with_buffers(session: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let buffers = dir.path().join("buffers");
@@ -1226,7 +1285,7 @@ mod tests {
     #[test]
     fn a_session_file_with_one_damaged_entry_keeps_every_unsaved_text() {
         let (_d, path, buffers) = session_dir_with_buffers(br#"{"tabs":[{"id":"ta","path":"C:/x/a.txt","kind":"memory","dirty":true},{"id":"bad","kind":null}],"active":"ta","next_untitled":3}"#);
-        let (s, complete) = load_session_from(&path, &buffers);
+        let (s, complete) = load(&path, &buffers);
         assert!(!complete);
         assert_eq!(s.tabs.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["ta", "tb"], "the readable entry stays and the other text comes back");
         assert_eq!(s.tabs[1].extra.get("dirty"), Some(&serde_json::Value::Bool(true)));
@@ -1239,7 +1298,7 @@ mod tests {
     #[test]
     fn an_unreadable_session_file_brings_back_all_unsaved_text() {
         let (_d, path, buffers) = session_dir_with_buffers(b"\x00 not json");
-        let (s, complete) = load_session_from(&path, &buffers);
+        let (s, complete) = load(&path, &buffers);
         assert!(!complete);
         assert_eq!(s.tabs.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["ta", "tb"]);
     }
@@ -1247,8 +1306,28 @@ mod tests {
     #[test]
     fn a_missing_session_file_is_a_normal_first_start() {
         let dir = tempfile::tempdir().unwrap();
-        let (s, complete) = load_session_from(&dir.path().join("session.json"), &dir.path().join("buffers"));
+        let (s, complete) = load(&dir.path().join("session.json"), &dir.path().join("buffers"));
         assert!(complete && s.tabs.is_empty());
+    }
+
+    #[test]
+    fn after_a_damaged_session_unlisted_recovery_data_is_kept_and_reported_for_30_days() {
+        let (_d, path, buffers) = session_dir_with_buffers(b"not json");
+        let marker = path.with_file_name("recovery-hold");
+        let first = load_session_from(&path, &buffers, &marker);
+        assert!(marker.is_file(), "the hold starts");
+        assert_eq!(first.session.unmatched_logs, vec![buffers.join("tc.pieces.json").display().to_string()]);
+        // The next start reads a complete session that does not list those files: still held.
+        std::fs::write(&path, br#"{"tabs":[{"id":"ta","kind":"memory"},{"id":"tb","kind":"memory"}]}"#).unwrap();
+        let second = load_session_from(&path, &buffers, &marker);
+        assert!(second.complete);
+        assert_eq!(second.session.unmatched_logs.len(), 1, "the large-file log is still reported");
+        assert!(recovery_hold_active(&marker));
+        // After 30 days the hold ends.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(RECOVERY_HOLD_SECS + 60);
+        std::fs::File::options().write(true).open(&marker).unwrap().set_modified(old).unwrap();
+        assert!(!recovery_hold_active(&marker));
+        assert!(!marker.exists());
     }
 
     #[test]
