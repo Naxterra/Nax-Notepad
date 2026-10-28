@@ -740,10 +740,11 @@ struct LoadedSession {
 }
 
 /// Read a session file. An entry that cannot be read is skipped instead of dropping the whole
-/// session. If anything could not be read, the file is kept as `session.json.unreadable` and a
-/// recovery hold starts (`marker`). While it lasts, every unsaved text in `buffers` that the
-/// session does not list comes back as a recovered tab, and edit logs of large files that no
-/// entry lists are reported, because without their entry nothing says which file they belong to.
+/// session. If anything could not be read, the file is kept as `session.json.unreadable`, every
+/// unsaved text in `buffers` that the session does not list comes back as a recovered tab, edit
+/// logs of large files that no entry lists are reported (without their entry nothing says
+/// which file they belong to), and a 30-day recovery hold starts or starts over (`marker`).
+/// While it lasts, nothing in `buffers` is deleted, so the reported logs stay available.
 fn load_session_from(path: &Path, buffers: &Path, marker: &Path) -> LoadedSession {
     let mut session = Session::default();
     let mut complete = true;
@@ -779,13 +780,16 @@ fn load_session_from(path: &Path, buffers: &Path, marker: &Path) -> LoadedSessio
             }
         }
     }
-    if !complete && !marker.exists() {
+    if !complete {
+        // Written again on every damaged load, so the 30 days always count from the latest one.
         if let Some(dir) = marker.parent() {
             let _ = fs::create_dir_all(dir);
         }
         let _ = fs::write(marker, b"Recovery data that no session entry lists is kept while this file exists.");
     }
-    if !complete || recovery_hold_active(marker) {
+    // Only a damaged load brings unlisted data back or reports it, so each case comes up once;
+    // the hold alone just keeps the files.
+    if !complete {
         let known: std::collections::HashSet<String> = session.tabs.iter().map(|t| sanitize(&t.id)).collect();
         let names: Vec<String> = fs::read_dir(buffers).map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect()).unwrap_or_default();
         let mut texts: Vec<String> = names.iter().filter_map(|n| n.strip_suffix(".txt")).filter(|stem| !stem.contains('.') && !known.contains(*stem)).map(String::from).collect();
@@ -1317,12 +1321,22 @@ mod tests {
         let first = load_session_from(&path, &buffers, &marker);
         assert!(marker.is_file(), "the hold starts");
         assert_eq!(first.session.unmatched_logs, vec![buffers.join("tc.pieces.json").display().to_string()]);
-        // The next start reads a complete session that does not list those files: still held.
+        // The next start reads a complete session that does not list those files: they are still
+        // kept, but not reported or brought back a second time.
         std::fs::write(&path, br#"{"tabs":[{"id":"ta","kind":"memory"},{"id":"tb","kind":"memory"}]}"#).unwrap();
         let second = load_session_from(&path, &buffers, &marker);
         assert!(second.complete);
-        assert_eq!(second.session.unmatched_logs.len(), 1, "the large-file log is still reported");
+        assert!(second.session.unmatched_logs.is_empty(), "reported once");
+        assert_eq!(second.session.tabs.len(), 2, "no recovered tab comes back again");
         assert!(recovery_hold_active(&marker));
+        // A new damage on day 29 starts the 30 days over.
+        let day29 = std::time::SystemTime::now() - std::time::Duration::from_secs(RECOVERY_HOLD_SECS - 24 * 3600);
+        std::fs::File::options().write(true).open(&marker).unwrap().set_modified(day29).unwrap();
+        std::fs::write(&path, b"damaged again").unwrap();
+        let third = load_session_from(&path, &buffers, &marker);
+        assert_eq!(third.session.unmatched_logs.len(), 1);
+        let age = std::fs::metadata(&marker).unwrap().modified().unwrap().elapsed().unwrap();
+        assert!(age.as_secs() < 3600, "the hold counts from the latest damage");
         // After 30 days the hold ends.
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(RECOVERY_HOLD_SECS + 60);
         std::fs::File::options().write(true).open(&marker).unwrap().set_modified(old).unwrap();
