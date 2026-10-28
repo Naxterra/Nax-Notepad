@@ -23,6 +23,21 @@ pub fn portable_dir() -> Option<PathBuf> {
     .clone()
 }
 
+/// Lock `dir` for this process: the returned file stays open, and while it is open a second
+/// copy of the app cannot lock the same folder. Two copies sharing one data folder would delete
+/// each other's unsaved text when they save their sessions.
+pub fn lock_data_dir(dir: &Path) -> std::io::Result<File> {
+    fs::create_dir_all(dir)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    options.open(dir.join("instance.lock"))
+}
+
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = portable_dir() {
         return dir;
@@ -111,6 +126,10 @@ pub fn replace_atomic(path: &Path, write: impl FnOnce(&mut File) -> std::io::Res
 /// that keeps its attributes (such as Hidden) and its permissions.
 fn replace_atomic_locked(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
     let target = resolve_links(path);
+    // Hard links and symbolic links give one file several paths; saves through any of them
+    // must not run at the same time. This lock is always taken last, so it cannot deadlock.
+    let file_lock = file_lock(&target);
+    let _file_guard = file_lock.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
     if hard_link_count(&target) > 1 {
         return rewrite_in_place(&target, write);
     }
@@ -164,7 +183,7 @@ fn rewrites_dir() -> PathBuf {
 }
 
 /// Identity of a file (volume and file index); every hard link of a file has the same one.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct FileId {
     volume: u64,
     index: u64,
@@ -249,7 +268,9 @@ fn rewrite_in_place_noted(target: &Path, write: impl FnOnce(&mut File) -> std::i
                 remove_temps();
                 Err(format!("Cannot write {}: {e}", target.display()))
             } else {
-                // The note stays: the next start finishes the save from the new content.
+                // The user is told about this failure and where both versions are, so the note
+                // goes: a later start must not finish a save that was reported as failed.
+                let _ = fs::remove_file(&note_path);
                 drop(note_file);
                 Err(format!("Cannot write {}: {e}. The new content is kept in {} and the previous content in {}", target.display(), new.display(), backup.display()))
             }
@@ -311,8 +332,15 @@ fn recover_rewrites_in(notes: &Path) -> Vec<PathBuf> {
     let mut finished = Vec::new();
     let Ok(rd) = fs::read_dir(notes) else { return finished };
     for e in rd.flatten() {
-        // A note that cannot be read is still open: another copy of the app is saving.
-        let Ok(bytes) = fs::read(e.path()) else { continue };
+        // A note that cannot be read is still open: another copy of the app is saving. One that
+        // stays unreadable for a long time is dropped.
+        let Ok(bytes) = fs::read(e.path()) else {
+            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() > NOTE_MAX_AGE_SECS);
+            if old {
+                let _ = fs::remove_file(e.path());
+            }
+            continue;
+        };
         // A note that is not complete was never closed normally, but it is written before the
         // file is touched, so the file is unchanged.
         let Ok(note) = serde_json::from_slice::<RewriteNote>(&bytes) else {
@@ -344,6 +372,14 @@ fn recover_rewrites_in(notes: &Path) -> Vec<PathBuf> {
         finished.push(note.target);
     }
     finished
+}
+
+/// The lock shared by every path of an existing file (keyed by its identity).
+fn file_lock(target: &Path) -> Option<Arc<Mutex<()>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<FileId, Arc<Mutex<()>>>>> = OnceLock::new();
+    let (_, id) = file_info(target)?;
+    let mut map = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    Some(map.entry(id).or_insert_with(|| Arc::new(Mutex::new(()))).clone())
 }
 
 /// Number of hard links and identity of a file, if it can be opened.
@@ -791,6 +827,51 @@ mod tests {
         assert_eq!(std::fs::read(&a).unwrap(), b"a different file");
         assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0, "the note is dropped");
         assert!(new.exists(), "the content that was being saved is still there for the user");
+    }
+
+    #[test]
+    fn a_failed_save_that_was_reported_is_not_finished_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"original content").unwrap();
+        // Copying into the file fails (it is opened read-only) and so does putting it back.
+        let mut perms = std::fs::metadata(&a).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&a, perms.clone()).unwrap();
+        let result = rewrite_in_place_noted(&a, |f| f.write_all(b"v2"), &notes);
+        perms.set_readonly(false);
+        std::fs::set_permissions(&a, perms).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains("The new content is kept in"), "{err}");
+        assert_eq!(std::fs::read_dir(&notes).map(|d| d.count()).unwrap_or(0), 0, "no note may remain");
+        assert_eq!(std::fs::read(&a).unwrap(), b"original content");
+        std::fs::write(&a, b"v3 saved later").unwrap();
+        assert!(recover_rewrites_in(&notes).is_empty());
+        assert_eq!(std::fs::read(&a).unwrap(), b"v3 saved later");
+    }
+
+    #[test]
+    fn two_names_of_one_file_share_one_save_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        let c = dir.path().join("c.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        std::fs::write(&c, b"y").unwrap();
+        assert!(Arc::ptr_eq(&file_lock(&a).unwrap(), &file_lock(&b).unwrap()));
+        assert!(!Arc::ptr_eq(&file_lock(&a).unwrap(), &file_lock(&c).unwrap()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_second_copy_cannot_use_the_same_portable_data_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_data_dir(dir.path()).unwrap();
+        assert!(lock_data_dir(dir.path()).is_err(), "the folder is in use");
+        drop(first);
+        assert!(lock_data_dir(dir.path()).is_ok(), "free again after the first copy ends");
     }
 
     #[test]

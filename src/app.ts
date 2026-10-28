@@ -1160,12 +1160,14 @@ export class App {
         await this.reload(tab);
         return;
       }
-      tab.externalAck = mtime; // ask once per change
       const question = tab.dirty
         ? t('"{name}" was modified outside Nax-Notepad.\nReload it and lose your unsaved changes?', { name: tab.name })
         : t('"{name}" was modified outside Nax-Notepad.\nReload it?', { name: tab.name });
       const r = await confirm3(t("File changed on disk"), question, [t("Reload"), t("Keep mine")]);
       if (r === "yes") await this.reload(tab);
+      // "Keep mine" lets the next save replace exactly this version and stops asking about it.
+      // Cancel decides nothing: the question comes back, and saving still refuses.
+      else if (r === "no") tab.externalAck = mtime;
     } catch {
       /* ignore */
     } finally {

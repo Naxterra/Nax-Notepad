@@ -180,24 +180,34 @@ begin
 end;
 
 { Versions up to 0.5.2 made Nax-Notepad the default program by pointing the extension at its
-  ProgID. That ProgID is removed on uninstall, so such a pointer is removed too. }
-procedure RemoveOldDefault(Ext: string);
+  ProgID, without keeping the previous value. That ProgID is removed on uninstall, so the
+  pointer goes too. Per user, removing it lets the system-wide type show through again; for all
+  users, Windows' own type is put back (txtfile for .txt and .log, none for Markdown). }
+procedure RemoveOldDefault(Ext, WindowsType: string);
 var
   Value: string;
 begin
   if RegQueryStringValue(HKA, 'Software\Classes\' + Ext, '', Value) and (CompareText(Value, 'NaxNotepad.Document') = 0) then
-    RegDeleteValue(HKA, 'Software\Classes\' + Ext, '');
+  begin
+    if IsAdminInstallMode and (WindowsType <> '') then
+      RegWriteStringValue(HKA, 'Software\Classes\' + Ext, '', WindowsType)
+    else
+      RegDeleteValue(HKA, 'Software\Classes\' + Ext, '');
+  end;
+end;
+
+procedure RemoveOldDefaults;
+begin
+  RemoveOldDefault('.txt', 'txtfile');
+  RemoveOldDefault('.log', 'txtfile');
+  RemoveOldDefault('.md', '');
+  RemoveOldDefault('.markdown', '');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
-  begin
-    RemoveOldDefault('.txt');
-    RemoveOldDefault('.md');
-    RemoveOldDefault('.markdown');
-    RemoveOldDefault('.log');
-  end;
+    RemoveOldDefaults;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -207,10 +217,7 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     RemoveFromUserPath(ExpandConstant('{app}'));
-    RemoveOldDefault('.txt');
-    RemoveOldDefault('.md');
-    RemoveOldDefault('.markdown');
-    RemoveOldDefault('.log');
+    RemoveOldDefaults;
   end;
   if CurUninstallStep = usPostUninstall then
   begin

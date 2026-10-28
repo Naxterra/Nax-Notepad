@@ -132,6 +132,9 @@ const de: Record<string, string> = {
   "Unsaved changes to these large files could not be restored, because the files were changed or removed by another program:\n\n{files}":
     "Ungespeicherte Änderungen an diesen großen Dateien konnten nicht wiederhergestellt werden, weil ein anderes Programm die Dateien geändert oder entfernt hat:\n\n{files}",
   "Unsaved changes lost": "Ungespeicherte Änderungen verloren",
+  "Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}":
+    "Nax-Notepad wurde beim Speichern dieser Dateien beendet. Das Speichern wurde jetzt abgeschlossen, sie enthalten also den gespeicherten Text:\n\n{files}",
+  "Interrupted save finished": "Unterbrochenes Speichern abgeschlossen",
   "Load images from the internet in Live Preview": "Bilder aus dem Internet in der Live-Vorschau laden",
   '"{name}" is now larger than {size} MB and is shown in pages.': "„{name}“ ist jetzt größer als {size} MB und wird seitenweise angezeigt.",
   '"{name}" was modified outside Nax-Notepad.\nReload it?': "„{name}“ wurde außerhalb von Nax-Notepad geändert.\nNeu laden?",

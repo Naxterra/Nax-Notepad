@@ -356,6 +356,10 @@ async function main(): Promise<void> {
   } catch (e) {
     console.warn("session restore failed", e);
   }
+  const finished = await backend.finishedSaves().catch(() => [] as string[]);
+  if (finished.length) {
+    void message(t("Interrupted save finished"), t("Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}", { files: finished.join("\n") }));
+  }
   const startup = await backend.startupFiles().catch(() => [] as string[]);
   if (startup.length) await app.openFiles(startup);
   else if (!restored) app.newTab();

@@ -67,7 +67,7 @@ export function imageSource(src: string, docPath: string | null, remote: boolean
     // A document that itself lives on a share may show images from the same share.
     const share = docPath ? /^[\\/]{2}[^\\/?.][^\\/]*[\\/][^\\/]+/.exec(docPath)?.[0] : undefined;
     const sameShare = share && path.toLowerCase().replace(/\//g, "\\").startsWith(share.toLowerCase().replace(/\//g, "\\") + "\\");
-    return sameShare && !path.includes("..") ? { path } : null;
+    return sameShare && !path.split(/[\\/]/).includes("..") ? { path } : null;
   }
   return DRIVE_PATH.test(path) ? { path } : null;
 }

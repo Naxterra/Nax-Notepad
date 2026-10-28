@@ -68,9 +68,13 @@ if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
 Write-Host "   $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
 $latin1 = [System.Text.Encoding]::GetEncoding(28591)
 $binary = $latin1.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $exe).Path))
-foreach ($needle in @($env:USERPROFILE, $env:USERPROFILE.Replace("\", "/"), $env:USERPROFILE.Replace("\", "\\"))) {
-    if ($binary.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-        throw "$exe contains the local profile path; it must not be published."
+# The installer and the zip contain only this program, LICENSE and README.md, so checking the
+# program covers them. Neither the profile folder nor the project folder may appear in it.
+foreach ($local in @($env:USERPROFILE, $PSScriptRoot)) {
+    foreach ($needle in @($local, $local.Replace("\", "/"), $local.Replace("\", "\\"))) {
+        if ($binary.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "$exe contains a local path; it must not be published."
+        }
     }
 }
 New-Item -ItemType Directory -Force artifacts | Out-Null

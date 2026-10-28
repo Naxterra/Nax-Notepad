@@ -820,6 +820,34 @@ test("with restoring all tabs switched off, tabs with unsaved text still come ba
   assert.deepEqual(seen, ["saved", "draft"]);
 });
 
+test("cancelling the changed-on-disk question does not allow saving over the other program's changes", async () => {
+  const oldConfirm = dialogs.confirm3;
+  dialogs.confirm3 = async () => "cancel";
+  settings.autoReloadExternal = false;
+  try {
+    backend.pathExists = async () => true;
+    backend.fileMtime = async () => 100;
+    const expected = [];
+    backend.saveText = async (p, text, enc, eol, lossy, expectedMtime) => {
+      expected.push(expectedMtime);
+      throw new Error("E_EXTERNAL_CHANGE:" + p);
+    };
+    const tab = memoryTab({ mtime: 50 });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "abc" }) });
+    await app.checkExternalChange();
+    assert.equal(tab.externalAck, undefined);
+    await app.save(tab);
+    assert.deepEqual(expected, [50], "the save must still compare with the version that was read");
+    // "Keep mine" allows replacing exactly that version.
+    dialogs.confirm3 = async (title) => (title === "File changed on disk" ? "no" : "cancel");
+    await app.checkExternalChange();
+    assert.equal(tab.externalAck, 100);
+  } finally {
+    dialogs.confirm3 = oldConfirm;
+    settings.autoReloadExternal = true;
+  }
+});
+
 test("the reload question mentions losing changes only when there are unsaved changes", async () => {
   const questions = [];
   const oldConfirm = dialogs.confirm3;
@@ -859,6 +887,11 @@ test("letter shortcuts follow the keyboard layout (AZERTY), digits stay by posit
   assert.equal(eventKey({ key: "с", code: "KeyC", ctrlKey: true, shiftKey: false, altKey: false }), "c");
   assert.equal(eventKey({ key: "&", code: "Digit1", ctrlKey: true, shiftKey: false, altKey: false }), "1");
   assert.deepEqual(stepForKey(azertyA), { type: "cmd", id: "edit.selectAll" });
+  // AZERTY's "," sits where M is on US keyboards: Ctrl+, opens Settings, not Ctrl+M.
+  const azertyComma = { key: ",", code: "KeyM", ctrlKey: true, shiftKey: false, altKey: false };
+  assert.equal(eventKey(azertyComma), ",");
+  assert.equal(matchesKey(parseChord("Ctrl+,"), azertyComma), true);
+  assert.equal(matchesKey(parseChord("Ctrl+M"), azertyComma), false);
 });
 
 test("text typed through an input method is recorded in a macro", () => {
@@ -895,6 +928,7 @@ test("Live Preview never loads images from network shares and loads internet ima
   assert.equal(imageSource("\\\\other\\s\\x.png", shared, false), null);
   assert.deepEqual(imageSource("..\\..\\other\\x.png", shared, false), { path: "\\\\srv\\docs\\other\\x.png" }, "\"..\" never leaves the share");
   assert.equal(imageSource("\\\\srv\\docs\\..\\..\\other\\x.png", shared, false), null);
+  assert.deepEqual(imageSource("\\\\srv\\docs\\a..b.png", shared, false), { path: "\\\\srv\\docs\\a..b.png" }, "two dots inside a file name are fine");
   assert.equal(safeDecode("100%"), "100%");
   const { joinPath } = load("paths");
   assert.equal(joinPath("\\\\srv\\docs", "notes.md"), "\\\\srv\\docs\\notes.md", "links in documents on a share open on that share");

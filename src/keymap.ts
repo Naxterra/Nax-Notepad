@@ -105,11 +105,13 @@ interface KeyLike {
 /**
  * The letter of a letter key as the keyboard layout labels it: AZERTY's A key (physical KeyQ)
  * is "a". Layouts without Latin letters (Cyrillic, Greek, ...) fall back to the physical key,
- * so Ctrl+C still copies there. Null when the key is not a letter key.
+ * so Ctrl+C still copies there. Null when the key is not a letter key, including a key that
+ * sits where a letter is on US keyboards but types punctuation (AZERTY's "," on KeyM).
  */
 export function letterOf(e: KeyLike): string | null {
   const k = e.key ?? "";
   if (/^[a-zA-Z]$/.test(k)) return k.toLowerCase();
+  if (k.length === 1 && !/^\p{L}$/u.test(k)) return null;
   const code = e.code ?? "";
   return /^Key[A-Z]$/.test(code) ? code.slice(3).toLowerCase() : null;
 }
