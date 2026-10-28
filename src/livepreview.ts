@@ -6,8 +6,8 @@ import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, WidgetTy
 import type { SyntaxNode, SyntaxNodeRef } from "@lezer/common";
 
 export interface LivePreviewConfig {
-  /** Resolve an image source (relative or absolute) to a URL the webview can load. */
-  resolveImage: (src: string) => string;
+  /** Resolve an image source (relative or absolute) to a URL the webview can load; null when it must not be loaded. */
+  resolveImage: (src: string) => string | null;
   openLink: (href: string) => void;
 }
 
@@ -77,7 +77,7 @@ class LangBadgeWidget extends WidgetType {
 }
 
 class ImageWidget extends WidgetType {
-  constructor(readonly src: string, readonly alt: string) {
+  constructor(readonly src: string | null, readonly alt: string) {
     super();
   }
   eq(o: ImageWidget) {
@@ -86,6 +86,12 @@ class ImageWidget extends WidgetType {
   toDOM() {
     const wrap = document.createElement("span");
     wrap.className = "cm-lp-image";
+    if (this.src === null) {
+      // Not loaded on purpose (an internet image while that is off, or a network share).
+      wrap.textContent = `🖼 ${this.alt}`;
+      wrap.classList.add("cm-lp-image-missing");
+      return wrap;
+    }
     const img = document.createElement("img");
     img.src = this.src;
     img.alt = this.alt;

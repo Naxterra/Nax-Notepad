@@ -17,6 +17,22 @@ import { t } from "./i18n";
 /** Kept for callers that check for page loads; same as `systemChange`. */
 export const pagedLoad = systemChange;
 
+/**
+ * Line handling of a paged window. The backend counts lines at "\n" only, so the editor must
+ * too: a lone "\r" inside a line stays part of that line instead of becoming a line break that
+ * would shift every following line. Pasted or dropped text is normalized to "\n", because a
+ * "\r" left before a line break would be written in addition to the file's line ending.
+ */
+export const pagedLineExtensions = [
+  EditorState.lineSeparator.of("\n"),
+  EditorView.clipboardInputFilter.of((text) => text.replace(/\r\n?/g, "\n")),
+];
+
+/** A window as the editor shows it: "\r\n" line ends become "\n" (the line ending is the file's). */
+export function windowText(text: string): string {
+  return text.replace(/\r\n/g, "\n");
+}
+
 export interface PagedHost {
   /** Current window state, whether or not the tab is visible. */
   state(): EditorState;
@@ -120,7 +136,7 @@ export class PagedController {
         this.windowReadOnly = w.truncated || w.lossy;
         const doc = this.host.state().doc;
         this.host.dispatch({
-          changes: { from: 0, to: doc.length, insert: w.text },
+          changes: { from: 0, to: doc.length, insert: windowText(w.text) },
           annotations: [systemChange.of(true), Transaction.addToHistory.of(false)],
           effects: compartments.lineNumbers.reconfigure(lineNumbersExt(settings.lineNumbers, this.firstLine)),
         });

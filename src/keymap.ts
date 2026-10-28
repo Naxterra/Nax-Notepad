@@ -102,9 +102,23 @@ interface KeyLike {
   getModifierState?: (k: string) => boolean;
 }
 
-/** Layout-independent key name of an event (letters and digits by position, like the menus). */
+/**
+ * The letter of a letter key as the keyboard layout labels it: AZERTY's A key (physical KeyQ)
+ * is "a". Layouts without Latin letters (Cyrillic, Greek, ...) fall back to the physical key,
+ * so Ctrl+C still copies there. Null when the key is not a letter key.
+ */
+export function letterOf(e: KeyLike): string | null {
+  const k = e.key ?? "";
+  if (/^[a-zA-Z]$/.test(k)) return k.toLowerCase();
+  const code = e.code ?? "";
+  return /^Key[A-Z]$/.test(code) ? code.slice(3).toLowerCase() : null;
+}
+
+/** Key name of an event: letters as the layout labels them (like the menus), digits and punctuation by position. */
 export function eventKey(e: KeyLike): string {
   const code = e.code ?? "";
+  const letter = letterOf(e);
+  if (letter) return letter;
   if (code.startsWith("Digit")) return code.slice(5);
   if (code.startsWith("Numpad") && /^Numpad\d$/.test(code)) return code.slice(6);
   if (code === "Equal") return "=";
@@ -119,7 +133,6 @@ export function eventKey(e: KeyLike): string {
   if (code === "BracketRight") return "]";
   if (code === "Backquote") return "`";
   if (code === "Space") return "space";
-  if (code.startsWith("Key")) return code.slice(3).toLowerCase();
   return e.key.toLowerCase();
 }
 

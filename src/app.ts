@@ -11,13 +11,14 @@ import { LanguageDescription } from "@codemirror/language";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog, message } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { backend, E_EXTERNAL_CHANGE, E_READ_ONLY_ENCODING, E_UNREPRESENTABLE, Eol, errorText, SaveResult, SessionData, TabMeta } from "./backend";
+import { backend, E_EXTERNAL_CHANGE, E_HARD_LINKS, E_READ_ONLY_ENCODING, E_UNREPRESENTABLE, Eol, errorText, OpenResult, SaveResult, SessionData, TabMeta } from "./backend";
 import { bookmarkLines, setBookmarks } from "./bookmarks";
 import { compartments, createState, indentExt, languageByName, languageForFile, loadLanguage, systemChange } from "./editor";
 import { HexBuffer } from "./hexbuffer";
 import { detectIndent, IndentInfo } from "./indentdetect";
 import { livePreview, LivePreviewConfig } from "./livepreview";
-import { PagedController, PagedHost } from "./paged";
+import { PagedController, PagedHost, pagedLineExtensions, windowText } from "./paged";
+import { basename, dirname, imageSource, joinPath, safeDecode } from "./paths";
 import { settings, updateSettings } from "./settings";
 import { whitespaceExt } from "./whitespace";
 import { confirm3, confirmDialog, toast } from "./ui/dialogs";
@@ -121,24 +122,13 @@ const mirrored = Annotation.define<boolean>();
 type AppEvent = "tabs" | "status" | "active" | "layout" | "doc";
 type Listener = () => void;
 
-function dirname(p: string): string {
-  const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
-  return i >= 0 ? p.slice(0, i) : "";
-}
-function basename(p: string): string {
-  const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
-  return i >= 0 ? p.slice(i + 1) : p;
-}
-function joinPath(dir: string, rel: string): string {
-  if (/^[a-zA-Z]:[\\/]/.test(rel) || rel.startsWith("\\\\") || rel.startsWith("/")) return rel;
-  const sep = dir.includes("/") && !dir.includes("\\") ? "/" : "\\";
-  const parts = (dir + sep + rel).split(/[\\/]+/);
-  const out: string[] = [];
-  for (const part of parts) {
-    if (part === "..") out.pop();
-    else if (part !== ".") out.push(part);
-  }
-  return out.join(sep);
+/**
+ * Generation of the recovery buffer that holds revision `rev` of a tab. The backend ignores a
+ * store whose generation is not above the last dropped one, so a store that finishes after the
+ * save of the same revision cannot bring the old text back.
+ */
+export function bufferGeneration(rev: number): number {
+  return rev + 1;
 }
 
 /** Display name of an untitled tab in the current UI language. */
@@ -169,6 +159,8 @@ export class App {
   private listeners = new Map<AppEvent, Set<Listener>>();
   private sessionTimer: number | undefined;
   private restoring = false;
+  /** Large files whose unsaved changes could not be restored during the current session restore. */
+  private lostEdits: string[] = [];
   private cursorSaveTimer: number | undefined;
   private scrollSyncing = false;
   private syncOffset = 0;
@@ -473,16 +465,14 @@ export class App {
   private lpConfig(tab: Tab): LivePreviewConfig {
     return {
       resolveImage: (src) => {
-        if (/^(https?:|data:|file:|asset:)/i.test(src)) return src;
-        const path = this.owner(tab).path;
-        const base = path ? dirname(path) : "";
-        const abs = base ? joinPath(base, decodeURIComponent(src)) : src;
-        return convertFileSrc(abs);
+        const s = imageSource(src, this.owner(tab).path, settings.remoteImages);
+        if (!s) return null;
+        return "url" in s ? s.url : convertFileSrc(s.path);
       },
       openLink: (href) => {
         const path = this.owner(tab).path;
         if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) void openUrl(href);
-        else if (path) void this.openFiles([joinPath(dirname(path), decodeURIComponent(href.split("#")[0]))]);
+        else if (path) void this.openFiles([joinPath(dirname(path), safeDecode(href.split("#")[0]))]);
       },
     };
   }
@@ -555,7 +545,7 @@ export class App {
       firstLineOffset,
       indent: tab.indent ?? undefined,
       eol: () => this.owner(tab).eol,
-      extra: [this.listenerExt(tab)],
+      extra: [this.listenerExt(tab), tab.kind === "paged" ? pagedLineExtensions : []],
     });
   }
 
@@ -712,7 +702,7 @@ export class App {
         tab.dirty = true;
         tab.revision = 1;
       }
-      tab.state = this.buildState(tab, w.text, langExt, 0);
+      tab.state = this.buildState(tab, windowText(w.text), langExt, 0);
     } else {
       const text = res.text ?? "";
       if (settings.detectIndent) {
@@ -805,7 +795,7 @@ export class App {
     tab.tail = undefined;
     tab.paged?.dispose();
     if (tab.kind === "paged") void backend.pagedClose(tab.id);
-    void backend.sessionDropBuffer(tab.id);
+    void backend.sessionDropBuffer(tab.id, bufferGeneration(tab.revision));
     this.removeTab(tab);
     if (this.tabs.length === 0) this.newTab();
     this.scheduleSessionSave();
@@ -890,7 +880,11 @@ export class App {
       } else {
         this.applySaveTransforms(tab);
         rev = tab.revision;
-        r = await backend.saveText(target, this.docText(tab), tab.encoding, tab.eol, opts.lossy ?? false);
+        // Save As writes a new file (overwriting one was already confirmed). A normal save
+        // refuses when another program changed the file since it was read, unless the user
+        // chose "Keep mine" for exactly that change.
+        const expected = isSaveAs ? null : (tab.externalAck ?? (tab.mtime || null));
+        r = await backend.saveText(target, this.docText(tab), tab.encoding, tab.eol, opts.lossy ?? false, expected);
       }
       tab.path = r.path;
       tab.name = r.name;
@@ -926,7 +920,7 @@ export class App {
     if (clean) {
       if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
       tab.bufferTimer = undefined;
-      void backend.sessionDropBuffer(tab.id);
+      void backend.sessionDropBuffer(tab.id, bufferGeneration(rev));
     } else if (tab.kind === "memory") {
       this.scheduleBufferStore(tab);
     }
@@ -966,6 +960,13 @@ export class App {
         return this.writeTab(tab, other, true, opts);
       }
       if (r === "no") await this.reload(tab);
+      return false;
+    }
+    if (msg.startsWith(E_HARD_LINKS)) {
+      await message(t('"{name}" has several names (hard links). A file this large cannot be saved without separating them, so it was not saved. Use Save As to save a copy.', { name: tab.name }), {
+        title: t("Save failed"),
+        kind: "error",
+      });
       return false;
     }
     if (msg.startsWith(E_READ_ONLY_ENCODING)) {
@@ -1023,9 +1024,10 @@ export class App {
     tab.hex = undefined;
     tab.hexKey = undefined;
     if (tab.kind === "paged" && tab.paged) {
-      tab.paged.resetRevisions();
-      await backend.pagedClose(tab.id);
+      // Opening under the same id replaces the document only when the file could be opened, so
+      // a failed reload keeps the current one.
       const res = await backend.openPath(tab.id, tab.path, true, encoding);
+      tab.paged.resetRevisions();
       tab.paged.totalLines = res.lineCount ?? 1;
       tab.mtime = res.mtime;
       tab.size = res.size;
@@ -1038,6 +1040,12 @@ export class App {
       this.applyReadOnly(tab);
     } else {
       const res = await backend.openPath(tab.id, tab.path, false, encoding);
+      if (res.kind === "paged") {
+        await this.becomePaged(tab, res);
+        this.finishReload(tab);
+        if (tab.tail) await this.restartFollow(tab);
+        return;
+      }
       const state = this.stateOf(tab);
       const head = state.selection.main.head;
       this.dispatchTo(tab, {
@@ -1056,13 +1064,50 @@ export class App {
         toast(t('"{name}" contains bytes that are not valid {encoding}. It was opened read-only so saving cannot change them. Use the tab menu to allow editing.', { name: tab.name, encoding: res.encoding }), 8000);
       }
     }
+    this.finishReload(tab);
+    if (tab.tail) await this.restartFollow(tab);
+  }
+
+  private finishReload(tab: Tab): void {
     tab.savedRevision = tab.revision;
     tab.dirty = false;
     tab.externalAck = undefined;
-    void backend.sessionDropBuffer(tab.id);
-    if (tab.tail) await this.restartFollow(tab);
+    void backend.sessionDropBuffer(tab.id, bufferGeneration(tab.revision));
     this.emit("tabs");
     this.emit("status");
+  }
+
+  /**
+   * Turn a memory tab into a paged one after its file grew beyond the size limit; `res` is the
+   * paged document the backend opened. The text is never loaded into a JS string.
+   */
+  private async becomePaged(tab: Tab, res: OpenResult): Promise<void> {
+    for (const c of this.clonesOf(tab)) this.removeTab(c);
+    if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
+    tab.bufferTimer = undefined;
+    tab.kind = "paged";
+    tab.encoding = res.encoding;
+    tab.eol = res.eol;
+    tab.mtime = res.mtime;
+    tab.size = res.size;
+    tab.lockedReadOnly = res.readOnlyReason === "encoding" ? t("Large files in {encoding} can be viewed but not edited yet.", { encoding: res.encoding }) : undefined;
+    if (tab.lockedReadOnly) tab.readOnly = true;
+    tab.paged = new PagedController(tab.id, res.lineCount ?? 1, this.pagedHost(tab));
+    const w = await backend.pagedWindow(tab.id, 0, Math.max(500, settings.pagedWindowLines));
+    tab.paged.firstLine = w.firstLine;
+    tab.paged.count = w.count;
+    tab.paged.totalLines = w.totalLines;
+    tab.paged.windowReadOnly = w.truncated || w.lossy;
+    const desc = tab.languageName ? languageByName(tab.languageName) : null;
+    const langExt: Extension = desc ? await loadLanguage(desc) : [];
+    tab.state = this.buildState(tab, windowText(w.text), langExt, 0);
+    const view = this.viewOf(tab);
+    if (view) {
+      view.setState(tab.state);
+      tab.paged.attach(view);
+    }
+    this.applyReadOnly(tab);
+    toast(t('"{name}" is now larger than {size} MB and is shown in pages.', { name: tab.name, size: 48 }), 6000);
   }
 
   /** "Reopen with Encoding": decode the file again with `encoding`, discarding edits after asking. */
@@ -1107,7 +1152,10 @@ export class App {
         return;
       }
       tab.externalAck = mtime; // ask once per change
-      const r = await confirm3(t("File changed on disk"), t('"{name}" was modified outside Nax-Notepad.\nReload it and lose your unsaved changes?', { name: tab.name }), [t("Reload"), t("Keep mine")]);
+      const question = tab.dirty
+        ? t('"{name}" was modified outside Nax-Notepad.\nReload it and lose your unsaved changes?', { name: tab.name })
+        : t('"{name}" was modified outside Nax-Notepad.\nReload it?', { name: tab.name });
+      const r = await confirm3(t("File changed on disk"), question, [t("Reload"), t("Keep mine")]);
       if (r === "yes") await this.reload(tab);
     } catch {
       /* ignore */
@@ -1502,7 +1550,7 @@ export class App {
     tab.bufferTimer = window.setTimeout(() => {
       tab.bufferTimer = undefined;
       if (!tab.dirty || tab.kind !== "memory") return;
-      backend.sessionStoreBuffer(tab.id, this.docText(tab)).catch((e) => this.reportBackgroundError(tab, e));
+      backend.sessionStoreBuffer(tab.id, this.docText(tab), bufferGeneration(tab.revision)).catch((e) => this.reportBackgroundError(tab, e));
     }, delay);
   }
 
@@ -1586,7 +1634,7 @@ export class App {
       }
       if (tab.hex?.dirty) errors.push(`${tab.name}: ${t("byte changes in the hex view cannot be kept for recovery. Save them first.")}`);
       try {
-        if (tab.revision !== tab.savedRevision && tab.kind === "memory") await backend.sessionStoreBuffer(tab.id, this.docText(tab));
+        if (tab.revision !== tab.savedRevision && tab.kind === "memory") await backend.sessionStoreBuffer(tab.id, this.docText(tab), bufferGeneration(tab.revision));
         if (tab.kind === "paged" && tab.paged) {
           await tab.paged.commit();
           if (tab.dirty) await backend.pagedStoreEdits(tab.id);
@@ -1603,10 +1651,16 @@ export class App {
     if (errors.length) throw new Error(errors.join("\n"));
   }
 
-  async restoreSession(): Promise<boolean> {
+  /**
+   * Reopen the tabs of the last session. With `onlyUnsaved`, only tabs with unsaved changes come
+   * back: their text exists nowhere else, and saving the session prunes what is not reopened.
+   */
+  async restoreSession(opts: { onlyUnsaved?: boolean } = {}): Promise<boolean> {
     this.restoring = true;
+    this.lostEdits = [];
     try {
       const s = await backend.sessionLoad();
+      if (opts.onlyUnsaved) s.tabs = s.tabs.filter((m) => (m as { dirty?: boolean }).dirty);
       this.nextUntitled = Math.max(1, s.next_untitled || 1);
       let activeTab: Tab | null = null;
       let shownOther: Tab | null = null;
@@ -1638,6 +1692,12 @@ export class App {
     } finally {
       this.restoring = false;
       this.scheduleSessionSave();
+      if (this.lostEdits.length) {
+        void message(t("Unsaved changes to these large files could not be restored, because the files were changed or removed by another program:\n\n{files}", { files: this.lostEdits.join("\n") }), {
+          title: t("Unsaved changes lost"),
+          kind: "warning",
+        });
+      }
     }
   }
 
@@ -1664,8 +1724,13 @@ export class App {
     const pane: 0 | 1 = m.pane === 1 && this.splitOn ? 1 : 0;
     let tab: Tab | null = null;
     if (meta.kind === "paged" && meta.path) {
-      if (!(await backend.pathExists(meta.path))) return null;
+      // The recovery log of a large file only describes changes to the file it was made for.
+      if (!(await backend.pathExists(meta.path))) {
+        if (m.dirty) this.lostEdits.push(meta.path);
+        return null;
+      }
       tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView, pane });
+      if (m.dirty && !tab.dirty) this.lostEdits.push(meta.path);
     } else {
       const buffer = await backend.sessionLoadBuffer(meta.id);
       if (buffer !== null) {

@@ -127,6 +127,14 @@ const de: Record<string, string> = {
   "Save changes?": "Änderungen speichern?",
   'Save changes to "{name}" before closing?': "Änderungen an „{name}“ vor dem Schließen speichern?",
   "File changed on disk": "Datei auf dem Datenträger geändert",
+  '"{name}" has several names (hard links). A file this large cannot be saved without separating them, so it was not saved. Use Save As to save a copy.':
+    "„{name}“ hat mehrere Namen (Hardlinks). Eine so große Datei kann nicht gespeichert werden, ohne sie zu trennen, deshalb wurde sie nicht gespeichert. Speichern Sie mit „Speichern unter“ eine Kopie.",
+  "Unsaved changes to these large files could not be restored, because the files were changed or removed by another program:\n\n{files}":
+    "Ungespeicherte Änderungen an diesen großen Dateien konnten nicht wiederhergestellt werden, weil ein anderes Programm die Dateien geändert oder entfernt hat:\n\n{files}",
+  "Unsaved changes lost": "Ungespeicherte Änderungen verloren",
+  "Load images from the internet in Live Preview": "Bilder aus dem Internet in der Live-Vorschau laden",
+  '"{name}" is now larger than {size} MB and is shown in pages.': "„{name}“ ist jetzt größer als {size} MB und wird seitenweise angezeigt.",
+  '"{name}" was modified outside Nax-Notepad.\nReload it?': "„{name}“ wurde außerhalb von Nax-Notepad geändert.\nNeu laden?",
   '"{name}" was modified outside Nax-Notepad.\nReload it and lose your unsaved changes?':
     "„{name}“ wurde außerhalb von Nax-Notepad geändert.\nNeu laden und ungespeicherte Änderungen verwerfen?",
   "Save failed": "Speichern fehlgeschlagen",
@@ -228,7 +236,7 @@ const de: Record<string, string> = {
   "Trim trailing whitespace on save": "Leerzeichen am Zeilenende beim Speichern entfernen",
   "Ensure final newline on save": "Beim Speichern abschließenden Zeilenumbruch sicherstellen",
   "Reload unmodified files changed on disk": "Unveränderte Dateien bei externer Änderung neu laden",
-  "Restore tabs and unsaved text on start": "Tabs und ungespeicherten Text beim Start wiederherstellen",
+  "Restore all tabs on start (unsaved text always comes back)": "Beim Start alle Tabs wiederherstellen (ungespeicherter Text kommt immer zurück)",
   "Lines per page for huge files": "Zeilen pro Seite bei riesigen Dateien",
   Markdown: "Markdown",
   "Open Markdown files in Live Preview": "Markdown-Dateien in der Live-Vorschau öffnen",

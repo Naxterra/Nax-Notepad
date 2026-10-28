@@ -34,6 +34,9 @@ const settings = {
 };
 const toasts = [];
 const dialogs = { toast: (msg) => toasts.push(msg), confirm3: async () => "cancel", message: async () => {}, pickList: async () => null, prompt: async () => null };
+// Native message boxes shown through the Tauri dialog plugin.
+const messages = [];
+const tauriDialog = { message: async (text) => messages.push(text), save: async () => null, open: async () => null };
 
 const cache = {};
 function load(name) {
@@ -86,8 +89,10 @@ function load(name) {
       case "hexbuffer":
       case "bytemap":
       case "signature":
+      case "paths":
         return load(id);
     }
+    if (id === "@tauri-apps/plugin-dialog") return tauriDialog;
     if (id.startsWith("@tauri") || !id.startsWith("@")) return {};
     return require(id);
   };
@@ -258,6 +263,70 @@ test("a save without later edits marks the tab clean", async () => {
   assert.equal(await app.save(tab), true);
   assert.equal(tab.dirty, false);
   assert.equal(dropped, true);
+});
+
+test("saving tells the backend which file version it replaces so another program's changes are not overwritten", async () => {
+  const expected = [];
+  backend.saveText = async (p, text, enc, eol, lossy, expectedMtime) => {
+    expected.push(expectedMtime);
+    return { size: 3, mtime: 9000, name: "test.txt", path: p };
+  };
+  backend.sessionDropBuffer = async () => {};
+  const tab = memoryTab({ mtime: 1234 });
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "abc" }) });
+  assert.equal(await app.save(tab), true);
+  // After "Keep mine" for a change on disk, the save may replace exactly that version.
+  tab.externalAck = 5678;
+  assert.equal(await app.save(tab), true);
+  // Save As writes a file the user picked, so there is no version to compare with.
+  assert.equal(await app.writeTab(tab, "other.txt", true), true);
+  assert.deepEqual(expected, [1234, 5678, null]);
+});
+
+test("a recovery write that finishes after the save cannot bring the old text back", async () => {
+  const stores = [];
+  const drops = [];
+  backend.sessionStoreBuffer = async (id, text, generation) => stores.push(generation);
+  backend.sessionDropBuffer = async (id, generation) => drops.push(generation);
+  backend.sessionSave = async () => {};
+  backend.saveText = async (p) => ({ size: 3, mtime: 1, name: "test.txt", path: p });
+  const tab = memoryTab();
+  const view = { state: EditorState.create({ doc: "abc" }) };
+  const app = fakeApp(tab, view);
+  await app.flushAll();
+  assert.equal(await app.save(tab), true);
+  // The backend ignores a store whose generation is not above the dropped one.
+  assert.equal(drops.length, 1);
+  assert.ok(stores[0] <= drops[0], "the store of the saved text must count as outdated");
+  view.state = EditorState.create({ doc: "abcd" });
+  app.noteUserEdit(tab);
+  await app.flushAll();
+  assert.ok(stores[1] > drops[0], "text typed after the save must be stored again");
+});
+
+test("unsaved changes to a large file that was removed are reported after restoring the session", async () => {
+  messages.length = 0;
+  backend.sessionLoad = async () => ({ tabs: [{ id: "big", path: "C:/logs/big.log", kind: "paged", dirty: true }], active: null, next_untitled: 1 });
+  backend.pathExists = async () => false;
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  assert.equal(await app.restoreSession(), false);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /could not be restored/);
+  assert.match(messages[0], /big\.log/);
+});
+
+test("saving a large file with several hard links explains why it was not saved", async () => {
+  messages.length = 0;
+  backend.pagedSave = async () => {
+    throw new Error("E_HARD_LINKS:C:/logs/big.log");
+  };
+  const tab = memoryTab({ kind: "paged", name: "big.log", paged: { commit: async () => {} } });
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "x" }) });
+  assert.equal(await app.save(tab), false);
+  assert.equal(tab.dirty, true);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /hard links/);
 });
 
 test("overlapping saves of one tab run one after another", async () => {
@@ -668,6 +737,149 @@ test("reopen with encoding decodes again and keeps the tab clean", async () => {
   assert.equal(tab.state.doc.toString(), "Grüße");
   assert.equal(tab.encoding, "windows-1252");
   assert.equal(tab.dirty, false);
+});
+
+// ---- 0.5.3: release review fixes ----------------------------------------------------------------
+
+test("a file that grew past the size limit is reloaded in pages instead of being emptied", async () => {
+  toasts.length = 0;
+  const tab = { ...memoryTab({ dirty: false, revision: 0 }), state: EditorState.create({ doc: "old text" }) };
+  const app = Object.create(App.prototype);
+  Object.assign(app, { tabs: [tab], panes: [], splitOn: false, emit() {}, scheduleSessionSave() {} });
+  backend.openPath = async (id, path) => ({ kind: "paged", path, name: "test.txt", text: null, encoding: "UTF-8", eol: "CRLF", size: 60 << 20, lineCount: 1000, hadErrors: false, readOnly: false, readOnlyReason: null, mtime: 3, binary: false });
+  backend.pagedWindow = async () => ({ text: "line1\r\nline2", firstLine: 0, count: 2, totalLines: 1000, truncated: false, lossy: false, dirty: false });
+  backend.sessionDropBuffer = async () => {};
+  await app.reload(tab);
+  assert.equal(tab.kind, "paged");
+  assert.equal(tab.paged.totalLines, 1000);
+  assert.equal(tab.size, 60 << 20);
+  assert.equal(tab.dirty, false);
+  assert.ok(toasts.some((m) => /shown in pages/.test(m)));
+});
+
+test("a large file whose reload fails keeps the open document", async () => {
+  let closed = false;
+  const paged = { resetRevisions() {}, load: async () => {}, firstLine: 0, cursorLine: () => 0 };
+  const tab = { ...memoryTab({ kind: "paged", dirty: false, revision: 0 }), paged, state: EditorState.create({ doc: "window" }) };
+  const app = Object.create(App.prototype);
+  Object.assign(app, { tabs: [tab], panes: [], splitOn: false, emit() {}, scheduleSessionSave() {} });
+  backend.pagedClose = async () => {
+    closed = true;
+  };
+  backend.openPath = async () => {
+    throw new Error("sharing violation");
+  };
+  await assert.rejects(app.reload(tab), /sharing violation/);
+  assert.equal(closed, false, "the open document must stay in the backend");
+  assert.equal(tab.paged, paged);
+});
+
+test("a large file's window keeps a lone carriage return inside its line", () => {
+  const { pagedLineExtensions, windowText } = load("paged");
+  const { EditorView } = require("@codemirror/view");
+  const state = EditorState.create({ doc: windowText("a\rb\r\nc"), extensions: pagedLineExtensions });
+  assert.equal(state.doc.lines, 2, "the backend counts lines at \\n only");
+  assert.equal(state.doc.toString(), "a\rb\nc");
+  // Pasted Windows text must not leave a \r before the line break that the file adds itself.
+  const pasted = state.facet(EditorView.clipboardInputFilter).reduce((text, f) => f(text, state), "x\r\ny\rz");
+  assert.equal(pasted, "x\ny\nz");
+});
+
+test("with restoring all tabs switched off, tabs with unsaved text still come back", async () => {
+  backend.sessionLoad = async () => ({
+    tabs: [
+      { id: "saved", path: "a.txt", kind: "memory", dirty: false },
+      { id: "draft", path: null, kind: "memory", dirty: true },
+    ],
+    active: null,
+    next_untitled: 1,
+  });
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  const seen = [];
+  app.restoreTab = async (meta) => {
+    seen.push(meta.id);
+    return null;
+  };
+  await app.restoreSession({ onlyUnsaved: true });
+  assert.deepEqual(seen, ["draft"]);
+  seen.length = 0;
+  await app.restoreSession();
+  assert.deepEqual(seen, ["saved", "draft"]);
+});
+
+test("the reload question mentions losing changes only when there are unsaved changes", async () => {
+  const questions = [];
+  const oldConfirm = dialogs.confirm3;
+  dialogs.confirm3 = async (title, text) => {
+    questions.push(text);
+    return "cancel";
+  };
+  settings.autoReloadExternal = false;
+  try {
+    backend.pathExists = async () => true;
+    let mtime = 100;
+    backend.fileMtime = async () => mtime;
+    const tab = memoryTab({ dirty: false, mtime: 50 });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "abc" }) });
+    await app.checkExternalChange();
+    tab.dirty = true;
+    mtime = 200;
+    await app.checkExternalChange();
+    assert.equal(questions.length, 2);
+    assert.doesNotMatch(questions[0], /lose/);
+    assert.match(questions[1], /lose your unsaved changes/);
+  } finally {
+    dialogs.confirm3 = oldConfirm;
+    settings.autoReloadExternal = true;
+  }
+});
+
+test("letter shortcuts follow the keyboard layout (AZERTY), digits stay by position", () => {
+  const { eventKey, matchesKey, parseChord } = load("keymap");
+  const { stepForKey } = load("macros");
+  const azertyA = { key: "a", code: "KeyQ", ctrlKey: true, shiftKey: false, altKey: false };
+  assert.equal(eventKey(azertyA), "a");
+  assert.equal(matchesKey(parseChord("Ctrl+A"), azertyA), true);
+  assert.equal(matchesKey(parseChord("Ctrl+Q"), azertyA), false, "the A key must not comment lines");
+  assert.equal(eventKey({ ...azertyA, key: "A", shiftKey: true }), "a");
+  // Layouts without Latin letters keep the physical key, so Ctrl+C still copies.
+  assert.equal(eventKey({ key: "с", code: "KeyC", ctrlKey: true, shiftKey: false, altKey: false }), "c");
+  assert.equal(eventKey({ key: "&", code: "Digit1", ctrlKey: true, shiftKey: false, altKey: false }), "1");
+  assert.deepEqual(stepForKey(azertyA), { type: "cmd", id: "edit.selectAll" });
+});
+
+test("text typed through an input method is recorded in a macro", () => {
+  const { MacroRecorder } = load("commands");
+  const r = new MacroRecorder();
+  r.start();
+  r.composed("日本");
+  r.composed("");
+  r.stop();
+  assert.deepEqual(r.last, [{ type: "text", text: "日本" }]);
+});
+
+test("Live Preview never loads images from network shares and loads internet images only when allowed", () => {
+  const { imageSource, safeDecode } = load("paths");
+  const doc = "C:\\notes\\a.md";
+  assert.deepEqual(imageSource("pic.png", doc, false), { path: "C:\\notes\\pic.png" });
+  assert.deepEqual(imageSource("my%20pic.png", doc, false), { path: "C:\\notes\\my pic.png" });
+  assert.deepEqual(imageSource("100%.png", doc, false), { path: "C:\\notes\\100%.png" }, "invalid percent-encoding is kept as text");
+  assert.deepEqual(imageSource("file:///C:/pics/x.png", doc, false), { path: "C:/pics/x.png" });
+  for (const blocked of ["\\\\server\\share\\x.png", "//server/share/x.png", "file://server/share/x.png", "\\\\?\\C:\\x.png", "\\\\.\\pipe\\x", "asset://localhost/x.png", "javascript:alert(1)", "https://example.com/x.png"]) {
+    assert.equal(imageSource(blocked, doc, false), null, blocked);
+  }
+  assert.deepEqual(imageSource("https://example.com/x.png", doc, true), { url: "https://example.com/x.png" });
+  assert.deepEqual(imageSource("data:image/png;base64,AAAA", doc, false), { url: "data:image/png;base64,AAAA" });
+  // A document on a share may show images from the same share, but not from other computers.
+  const shared = "\\\\srv\\docs\\a.md";
+  assert.deepEqual(imageSource("img/x.png", shared, false), { path: "\\\\srv\\docs\\img\\x.png" });
+  assert.equal(imageSource("\\\\other\\s\\x.png", shared, false), null);
+  assert.deepEqual(imageSource("..\\..\\other\\x.png", shared, false), { path: "\\\\srv\\docs\\other\\x.png" }, "\"..\" never leaves the share");
+  assert.equal(imageSource("\\\\srv\\docs\\..\\..\\other\\x.png", shared, false), null);
+  assert.equal(safeDecode("100%"), "100%");
+  const { joinPath } = load("paths");
+  assert.equal(joinPath("\\\\srv\\docs", "notes.md"), "\\\\srv\\docs\\notes.md", "links in documents on a share open on that share");
 });
 
 test("settings: wrong types are ignored", () => {

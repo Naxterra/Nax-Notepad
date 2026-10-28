@@ -19,6 +19,8 @@ export interface Settings {
   defaultEol: Eol;
   defaultEncoding: string;
   livePreviewDefault: boolean;
+  /** Live Preview loads images from the internet (each load tells the server the document was opened). */
+  remoteImages: boolean;
   restoreSession: boolean;
   trimTrailingOnSave: boolean;
   ensureFinalNewline: boolean;
@@ -65,6 +67,7 @@ export const DEFAULTS: Settings = {
   defaultEol: "CRLF",
   defaultEncoding: "UTF-8",
   livePreviewDefault: true,
+  remoteImages: false,
   restoreSession: true,
   trimTrailingOnSave: false,
   ensureFinalNewline: false,

@@ -348,13 +348,12 @@ async function main(): Promise<void> {
   });
 
   // Restore session, then open files from the command line
+  // Unsaved text always comes back; the setting only decides about the other tabs.
   let restored = false;
-  if (settings.restoreSession) {
-    try {
-      restored = await app.restoreSession();
-    } catch (e) {
-      console.warn("session restore failed", e);
-    }
+  try {
+    restored = await app.restoreSession({ onlyUnsaved: !settings.restoreSession });
+  } catch (e) {
+    console.warn("session restore failed", e);
   }
   const startup = await backend.startupFiles().catch(() => [] as string[]);
   if (startup.length) await app.openFiles(startup);

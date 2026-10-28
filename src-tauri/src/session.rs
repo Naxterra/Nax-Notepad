@@ -89,8 +89,8 @@ pub fn target_lock(target: &Path) -> Arc<Mutex<()>> {
     map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
-/// Atomic write: write a unique sibling temp file, flush it to disk, then rename it over the
-/// target. On any failure the target is untouched and the temp file is removed.
+/// Atomic write: write a unique sibling temp file, flush it to disk, then put it in place of
+/// the target. On any failure the target is untouched and the temp file is removed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     replace_atomic(path, |file| file.write_all(bytes))
 }
@@ -100,18 +100,280 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 pub fn replace_atomic(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
     let lock = target_lock(path);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let (tmp, mut file) = create_temp_sibling(path)?;
+    replace_atomic_locked(path, write)
+}
+
+/// [`replace_atomic`] for a caller that already holds the target lock.
+///
+/// A symbolic link is followed, so the file it points to is updated and the link stays. A file
+/// with several hard links is rewritten in place (after a backup copy), because replacing it
+/// would leave the other names with the old content. Otherwise the file is replaced in a way
+/// that keeps its attributes (such as Hidden) and its permissions.
+fn replace_atomic_locked(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
+    let target = resolve_links(path);
+    if hard_link_count(&target) > 1 {
+        return rewrite_in_place(&target, write);
+    }
+    let (tmp, mut file) = create_temp_sibling(&target)?;
     let written = write(&mut file).and_then(|_| file.sync_all());
     drop(file);
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err(format!("Cannot write {}: {e}", path.display()));
     }
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("Cannot replace {}: {e}", path.display()));
+    if let Err(e) = replace_file(&tmp, &target) {
+        return Err(failed_replace_message(path, &target, &tmp, &e));
     }
     Ok(())
+}
+
+/// Clean up after `replace_file(tmp, target)` failed and describe the failure. ReplaceFile can
+/// fail after it already moved the original away; then the temporary file holds the only copy
+/// of the content and is kept.
+pub fn failed_replace_message(shown: &Path, target: &Path, tmp: &Path, e: &std::io::Error) -> String {
+    if target.exists() {
+        let _ = fs::remove_file(tmp);
+        format!("Cannot replace {}: {e}", shown.display())
+    } else {
+        format!("Cannot replace {}: {e}. The saved content is kept in {}", shown.display(), tmp.display())
+    }
+}
+
+/// The file a path finally refers to, following symbolic links (at most 32 steps).
+pub fn resolve_links(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    for _ in 0..32 {
+        match fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => match fs::read_link(&p) {
+                Ok(t) if t.is_absolute() => p = t,
+                Ok(t) => p = p.parent().map(|d| d.join(&t)).unwrap_or(t),
+                Err(_) => break,
+            },
+            _ => break,
+        }
+    }
+    p
+}
+
+/// Folder with one note per in-place rewrite that is in progress (see [`rewrite_in_place`]).
+fn rewrites_dir() -> PathBuf {
+    #[cfg(test)]
+    return std::env::temp_dir().join("nax-notepad-test-rewrites");
+    #[cfg(not(test))]
+    data_dir().join("rewrites")
+}
+
+/// Where the previous content of a file that is being rewritten in place is kept.
+#[derive(Serialize, Deserialize)]
+struct RewriteNote {
+    target: PathBuf,
+    backup: PathBuf,
+}
+
+/// Rewrite a file in place, keeping a backup copy until the new content is on disk. Used for
+/// files with several hard links, which a replacement would separate.
+fn rewrite_in_place(target: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
+    rewrite_in_place_noted(target, write, &rewrites_dir())
+}
+
+fn rewrite_in_place_noted(target: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>, notes: &Path) -> Result<(), String> {
+    let (backup, f) = create_temp_sibling(target)?;
+    drop(f);
+    let copied = fs::copy(target, &backup).and_then(|_| OpenOptions::new().write(true).open(&backup)?.sync_all());
+    if let Err(e) = copied {
+        let _ = fs::remove_file(&backup);
+        return Err(format!("Cannot back up {}: {e}", target.display()));
+    }
+    // Until the new content is on disk, a note says where the previous content is, so the next
+    // start puts it back if the app or the computer stops in the middle of the write.
+    let note = match write_rewrite_note(notes, target, &backup) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = fs::remove_file(&backup);
+            return Err(format!("Cannot prepare saving {}: {e}", target.display()));
+        }
+    };
+    let result = OpenOptions::new().write(true).truncate(true).open(target).and_then(|mut f| {
+        write(&mut f)?;
+        f.sync_all()
+    });
+    match result {
+        Ok(()) => {
+            let _ = fs::remove_file(&note);
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            // Put the original content back; if even that fails, the note stays and the next
+            // start tries again.
+            if put_back(&backup, target).is_ok() {
+                let _ = fs::remove_file(&note);
+                let _ = fs::remove_file(&backup);
+                Err(format!("Cannot write {}: {e}", target.display()))
+            } else {
+                Err(format!("Cannot write {}: {e}. The previous content is kept in {}", target.display(), backup.display()))
+            }
+        }
+    }
+}
+
+fn write_rewrite_note(notes: &Path, target: &Path, backup: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(notes).map_err(|e| e.to_string())?;
+    let (path, mut f) = create_temp_sibling(&notes.join("rewrite.json"))?;
+    let note = RewriteNote { target: target.to_path_buf(), backup: backup.to_path_buf() };
+    let json = serde_json::to_vec(&note).map_err(|e| e.to_string())?;
+    if let Err(e) = f.write_all(&json).and_then(|_| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(&path);
+        return Err(e.to_string());
+    }
+    Ok(path)
+}
+
+/// Copy `backup` over the content of `target` without replacing the file, so every hard link
+/// sees it.
+fn put_back(backup: &Path, target: &Path) -> std::io::Result<()> {
+    let mut src = File::open(backup)?;
+    let mut dst = OpenOptions::new().write(true).truncate(true).open(target)?;
+    std::io::copy(&mut src, &mut dst)?;
+    dst.sync_all()
+}
+
+/// Put back the previous content of files whose in-place rewrite was interrupted (the app or
+/// the computer stopped in the middle of a save). Returns the files that were put back.
+pub fn recover_interrupted_rewrites() -> Vec<PathBuf> {
+    recover_rewrites_in(&rewrites_dir())
+}
+
+fn recover_rewrites_in(notes: &Path) -> Vec<PathBuf> {
+    let mut restored = Vec::new();
+    let Ok(rd) = fs::read_dir(notes) else { return restored };
+    for e in rd.flatten() {
+        let note = fs::read(e.path()).ok().and_then(|b| serde_json::from_slice::<RewriteNote>(&b).ok());
+        if let Some(note) = note {
+            if note.backup.is_file() {
+                if put_back(&note.backup, &note.target).is_err() {
+                    continue; // keep the note and try again at the next start
+                }
+                let _ = fs::remove_file(&note.backup);
+                restored.push(note.target);
+            }
+        }
+        // A note that cannot be read was never completed, so the target was not touched yet.
+        let _ = fs::remove_file(e.path());
+    }
+    restored
+}
+
+/// Number of directory entries (hard links) that refer to the file; 1 if unknown.
+#[cfg(windows)]
+pub fn hard_link_count(path: &Path) -> u32 {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let Ok(f) = File::open(path) else { return 1 };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle belongs to `f`, which lives until the end of this function.
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
+        1
+    } else {
+        info.nNumberOfLinks.max(1)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn hard_link_count(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).map(|m| m.nlink() as u32).unwrap_or(1)
+}
+
+#[cfg(windows)]
+fn wide(p: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// File attributes (Hidden, System, ...) of a file, if it exists.
+#[cfg(windows)]
+pub fn file_attributes(path: &Path) -> Option<u32> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+    // SAFETY: the path is a NUL-terminated wide string.
+    let a = unsafe { GetFileAttributesW(wide(path).as_ptr()) };
+    (a != INVALID_FILE_ATTRIBUTES).then_some(a)
+}
+
+#[cfg(not(windows))]
+pub fn file_attributes(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Give `path` the attributes a previous file had (only the ones a user can set).
+#[cfg(windows)]
+pub fn restore_attributes(path: &Path, attrs: Option<u32>) {
+    use windows_sys::Win32::Storage::FileSystem::{
+        SetFileAttributesW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_SYSTEM,
+    };
+    if let Some(a) = attrs {
+        let keep = a & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+        if keep != 0 {
+            // SAFETY: the path is a NUL-terminated wide string.
+            unsafe { SetFileAttributesW(wide(path).as_ptr(), keep) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn restore_attributes(_path: &Path, _attrs: Option<u32>) {}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: `replace_file` behaves like ReplaceFile failing after it moved the target away.
+    pub static FAIL_REPLACE_AFTER_MOVING_TARGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Put `tmp` in place of `target`. An existing target keeps its attributes and permissions
+/// (Windows ReplaceFile); a new target is created by renaming. When this fails, the caller must
+/// check whether `target` still exists before removing `tmp` ([`failed_replace_message`]).
+pub fn replace_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_REPLACE_AFTER_MOVING_TARGET.with(|f| f.get()) {
+        let _ = fs::remove_file(target);
+        return Err(std::io::Error::other("simulated ERROR_UNABLE_TO_MOVE_REPLACEMENT"));
+    }
+    replace_file_os(tmp, target)
+}
+
+#[cfg(windows)]
+fn replace_file_os(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS};
+    let attrs = file_attributes(target);
+    if attrs.is_none() {
+        return fs::rename(tmp, target);
+    }
+    // SAFETY: both paths are NUL-terminated wide strings; the optional pointers are null.
+    let ok = unsafe {
+        ReplaceFileW(
+            wide(target).as_ptr(),
+            wide(tmp).as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        // ReplaceFile can refuse on some file systems; a plain rename still replaces atomically.
+        // It can also fail after moving the target away (ERROR_UNABLE_TO_MOVE_REPLACEMENT); the
+        // rename then puts the new content in place, and if that fails too the caller keeps tmp.
+        fs::rename(tmp, target)?;
+    }
+    restore_attributes(target, attrs);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_os(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    fs::rename(tmp, target)
 }
 
 /// Everything the frontend needs to rebuild a tab. Opaque to Rust apart from `id`, `path`
@@ -169,20 +431,53 @@ fn sanitize(id: &str) -> String {
         .collect()
 }
 
-pub fn store_buffer(id: &str, text: &str) -> Result<(), String> {
+/// Highest generation dropped per buffer id. A store with an older generation started before
+/// the drop (the document was saved meanwhile) and must not bring the buffer back.
+fn dropped_generations() -> &'static Mutex<HashMap<String, u64>> {
+    static MAP: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+/// Store unsaved text unless the buffer was dropped with this or a newer generation.
+pub fn store_buffer_gen(id: &str, text: &str, generation: Option<u64>) -> Result<(), String> {
     ensure_dirs()?;
-    write_atomic(&buffer_path(id), text.as_bytes())
+    store_generation(&buffer_path(id), id, text, generation)
+}
+
+fn store_generation(path: &Path, id: &str, text: &str, generation: Option<u64>) -> Result<(), String> {
+    let lock = target_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(g) = generation {
+        let dropped = dropped_generations().lock().unwrap_or_else(|e| e.into_inner()).get(id).copied().unwrap_or(0);
+        if g <= dropped {
+            return Ok(());
+        }
+    }
+    replace_atomic_locked(path, |f| f.write_all(text.as_bytes()))
+}
+
+/// Delete the stored buffer and edit log; stores of `generation` or older are ignored afterwards.
+pub fn drop_buffer_gen(id: &str, generation: Option<u64>) {
+    let (pieces, add) = edits_paths(id);
+    drop_generation(&buffer_path(id), &[&pieces, &add], id, generation);
+}
+
+fn drop_generation(path: &Path, extra: &[&Path], id: &str, generation: Option<u64>) {
+    let lock = target_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(g) = generation {
+        let mut map = dropped_generations().lock().unwrap_or_else(|e| e.into_inner());
+        let e = map.entry(id.to_string()).or_insert(0);
+        *e = (*e).max(g);
+    }
+    let _ = fs::remove_file(path);
+    for p in extra {
+        let _ = fs::remove_file(p);
+    }
 }
 
 pub fn load_buffer(id: &str) -> Option<String> {
     fs::read_to_string(buffer_path(id)).ok()
-}
-
-pub fn drop_buffer(id: &str) {
-    let _ = fs::remove_file(buffer_path(id));
-    let (p, a) = edits_paths(id);
-    let _ = fs::remove_file(p);
-    let _ = fs::remove_file(a);
 }
 
 /// Remove buffer files that belong to no tab in `s`. Temporary files of writes that may still
@@ -258,6 +553,107 @@ mod tests {
         write_atomic(&b, b"md").unwrap();
         assert_eq!(std::fs::read(&a).unwrap(), b"txt");
         assert_eq!(std::fs::read(&b).unwrap(), b"md");
+    }
+
+    #[test]
+    fn late_recovery_write_after_save_does_not_bring_old_text_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tab1.txt");
+        store_generation(&p, "late-write-test", "typed before saving", Some(1)).unwrap();
+        // The document is saved: the buffer is dropped with the current generation.
+        drop_generation(&p, &[], "late-write-test", Some(2));
+        assert!(!p.exists());
+        // A write that started before the save finishes afterwards: it must be ignored.
+        store_generation(&p, "late-write-test", "typed before saving", Some(2)).unwrap();
+        assert!(!p.exists(), "a stale write must not leave a buffer behind");
+        // New edits after the save are stored again.
+        store_generation(&p, "late-write-test", "typed after saving", Some(3)).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "typed after saving");
+    }
+
+    #[test]
+    fn saving_updates_every_hard_link_name_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"old").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        write_atomic(&a, b"new content").unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"new content");
+        assert_eq!(std::fs::read(&b).unwrap(), b"new content", "the other name must see the saved text");
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(TEMP_SUFFIX)).count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saving_keeps_the_hidden_attribute() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("secret.txt");
+        std::fs::write(&p, b"old").unwrap();
+        restore_attributes(&p, Some(FILE_ATTRIBUTE_HIDDEN));
+        assert!(file_attributes(&p).unwrap() & FILE_ATTRIBUTE_HIDDEN != 0);
+        write_atomic(&p, b"new").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        assert!(file_attributes(&p).unwrap() & FILE_ATTRIBUTE_HIDDEN != 0, "the file must stay hidden");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs permission to create symbolic links (Windows Developer Mode); run with --ignored"]
+    fn saving_through_a_symbolic_link_updates_the_linked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&real, b"old").unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(&real, &link) {
+            panic!("this test needs permission to create symbolic links (Developer Mode): {e}");
+        }
+        write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link must stay a link");
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+    }
+
+    #[test]
+    fn failed_replace_after_the_original_was_moved_away_keeps_the_new_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.txt");
+        std::fs::write(&p, b"old").unwrap();
+        FAIL_REPLACE_AFTER_MOVING_TARGET.with(|f| f.set(true));
+        let result = write_atomic(&p, b"new content");
+        FAIL_REPLACE_AFTER_MOVING_TARGET.with(|f| f.set(false));
+        let err = result.unwrap_err();
+        assert!(!p.exists());
+        let kept: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with(TEMP_SUFFIX)).collect();
+        assert_eq!(kept.len(), 1, "the only copy of the new content must stay");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), b"new content");
+        assert!(err.contains(&kept[0].display().to_string()), "the message must say where it is: {err}");
+    }
+
+    #[test]
+    fn interrupted_save_of_a_hard_linked_file_is_put_back_at_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"original content").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        // The state a crash leaves: backup and note written, the target half rewritten.
+        let backup = dir.path().join(".a.txt.backup.naxtmp");
+        std::fs::copy(&a, &backup).unwrap();
+        write_rewrite_note(&notes, &a, &backup).unwrap();
+        std::fs::OpenOptions::new().write(true).truncate(true).open(&a).unwrap().write_all(b"new con").unwrap();
+        let restored = recover_rewrites_in(&notes);
+        assert_eq!(restored, vec![a.clone()]);
+        assert_eq!(std::fs::read(&a).unwrap(), b"original content");
+        assert_eq!(std::fs::read(&b).unwrap(), b"original content", "both names must show the previous content");
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
+        // A completed save leaves no note behind.
+        rewrite_in_place_noted(&a, |f| f.write_all(b"saved"), &notes).unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), b"saved");
+        assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 0);
     }
 
     #[test]

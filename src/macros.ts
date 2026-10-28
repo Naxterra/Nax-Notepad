@@ -2,7 +2,7 @@
 // editor's own key handling, so undo, read-only mode and auto-closing brackets apply as if
 // the keys were typed.
 import { EditorView, runScopeHandlers } from "@codemirror/view";
-import { isAltGr } from "./keymap";
+import { isAltGr, letterOf } from "./keymap";
 
 export type MacroStep =
   | { type: "text"; text: string }
@@ -38,7 +38,7 @@ export function stepForKey(e: KeyLike): MacroStep | null {
   const alt = e.altKey && !altGr;
   if (!ctrl && !alt && e.key.length === 1) return { type: "text", text: e.key };
   if (ctrl && !alt) {
-    const k = e.code.startsWith("Key") ? e.code.slice(3).toLowerCase() : e.key.toLowerCase();
+    const k = letterOf(e) ?? e.key.toLowerCase();
     if (!e.shiftKey && NATIVE_CMDS[k]) return { type: "cmd", id: NATIVE_CMDS[k] };
     if (e.shiftKey && k === "z") return { type: "cmd", id: "edit.redo" };
   }

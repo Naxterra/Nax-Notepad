@@ -1,7 +1,10 @@
 # Builds Nax-Notepad in release mode and packages it with Inno Setup 7.
-# Usage:  powershell -ExecutionPolicy Bypass -File build.ps1 [-SkipInstaller]
+# Usage:  powershell -ExecutionPolicy Bypass -File build.ps1 [-SkipInstaller] [-AllowDirty]
+# A release is built only from committed code that passes the tests. -AllowDirty builds from
+# uncommitted changes for a local try-out; such a build must not be published.
 param(
-    [switch]$SkipInstaller
+    [switch]$SkipInstaller,
+    [switch]$AllowDirty
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -18,10 +21,36 @@ foreach ($tool in @("node", "npm", "cargo")) {
 $version = (Get-Content package.json | ConvertFrom-Json).version
 Write-Host "== Nax-Notepad $version ==" -ForegroundColor Cyan
 
+# The version lives in three files; they must agree, or the update check and the installer lie.
+$confVersion = (Get-Content src-tauri\tauri.conf.json | ConvertFrom-Json).version
+$cargoVersion = (Select-String -Path src-tauri\Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+if ($confVersion -ne $version -or $cargoVersion -ne $version) {
+    throw "Version mismatch: package.json $version, tauri.conf.json $confVersion, Cargo.toml $cargoVersion"
+}
+
+if (-not $AllowDirty) {
+    $changes = git status --porcelain --untracked-files=no
+    if ($LASTEXITCODE) { throw "git status failed" }
+    if ($changes) { throw "The working tree has uncommitted changes. Commit them first, or pass -AllowDirty for a local build that is not published." }
+}
+
 if (-not (Test-Path node_modules)) {
     Write-Host "-- npm install"
     npm install
     if ($LASTEXITCODE) { throw "npm install failed" }
+}
+
+Write-Host "-- tests"
+npx tsc --noEmit
+if ($LASTEXITCODE) { throw "type check failed" }
+npm test
+if ($LASTEXITCODE) { throw "frontend tests failed" }
+Push-Location src-tauri
+try {
+    cargo test --lib
+    if ($LASTEXITCODE) { throw "backend tests failed" }
+} finally {
+    Pop-Location
 }
 
 # Release binaries must not contain local paths: panic messages of dependencies name their source
@@ -36,6 +65,13 @@ if ($LASTEXITCODE) { throw "tauri build failed" }
 $exe = "src-tauri\target\release\nax-notepad.exe"
 if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
 Write-Host "   $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
+$latin1 = [System.Text.Encoding]::GetEncoding(28591)
+$binary = $latin1.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $exe).Path))
+foreach ($needle in @($env:USERPROFILE, $env:USERPROFILE.Replace("\", "/"), $env:USERPROFILE.Replace("\", "\\"))) {
+    if ($binary.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw "$exe contains the local profile path; it must not be published."
+    }
+}
 New-Item -ItemType Directory -Force artifacts | Out-Null
 
 # Portable package: portable.txt next to the program keeps settings, session and the browser

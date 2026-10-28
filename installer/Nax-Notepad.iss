@@ -2,7 +2,7 @@
 ; Build with: powershell -File build.ps1   (compiles the app, then runs ISCC on this file)
 
 #ifndef AppVersion
-  #define AppVersion "0.5.2"
+  #define AppVersion "0.5.3"
 #endif
 #ifndef SourceExe
   #define SourceExe "..\src-tauri\target\release\nax-notepad.exe"
@@ -56,16 +56,16 @@ english.Integration=Integration:
 german.Integration=Integration:
 english.Assoc=File associations:
 german.Assoc=Dateizuordnungen:
-english.AssocTxt=Make Nax-Notepad the default editor for .txt files
-german.AssocTxt=Nax-Notepad als Standardeditor für .txt-Dateien festlegen
-english.AssocMd=Make Nax-Notepad the default editor for Markdown files (.md, .markdown)
-german.AssocMd=Nax-Notepad als Standardeditor für Markdown-Dateien (.md, .markdown) festlegen
-english.AssocLog=Make Nax-Notepad the default editor for .log files
-german.AssocLog=Nax-Notepad als Standardeditor für .log-Dateien festlegen
+english.AssocTxt=Offer Nax-Notepad under "Open with" for .txt files
+german.AssocTxt=Nax-Notepad unter "Öffnen mit" für .txt-Dateien anbieten
+english.AssocMd=Offer Nax-Notepad under "Open with" for Markdown files (.md, .markdown)
+german.AssocMd=Nax-Notepad unter "Öffnen mit" für Markdown-Dateien (.md, .markdown) anbieten
+english.AssocLog=Offer Nax-Notepad under "Open with" for .log files
+german.AssocLog=Nax-Notepad unter "Öffnen mit" für .log-Dateien anbieten
 english.AddToPath=Add the installation folder to the user PATH
 german.AddToPath=Installationsordner zum Benutzer-PATH hinzufügen
-english.RemoveData=Also remove settings, session and unsaved text (%APPDATA%\Nax-Notepad)?
-german.RemoveData=Auch Einstellungen, Sitzung und ungespeicherten Text (%APPDATA%\Nax-Notepad) entfernen?
+english.RemoveData=Also remove settings, session, unsaved text and the window position (%APPDATA%\Nax-Notepad)?
+german.RemoveData=Auch Einstellungen, Sitzung, ungespeicherten Text und die Fensterposition (%APPDATA%\Nax-Notepad) entfernen?
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -96,10 +96,12 @@ Root: HKA; Subkey: "Software\Classes\*\shell\Nax-Notepad\command"; ValueType: st
 Root: HKA; Subkey: "Software\Classes\NaxNotepad.Document"; ValueType: string; ValueName: ""; ValueData: "Text Document"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\NaxNotepad.Document\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\nax-notepad.exe"",0"
 Root: HKA; Subkey: "Software\Classes\NaxNotepad.Document\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\nax-notepad.exe"" ""%1"""
-Root: HKA; Subkey: "Software\Classes\.txt"; ValueType: string; ValueName: ""; ValueData: "NaxNotepad.Document"; Tasks: assoc_txt
-Root: HKA; Subkey: "Software\Classes\.md"; ValueType: string; ValueName: ""; ValueData: "NaxNotepad.Document"; Tasks: assoc_md
-Root: HKA; Subkey: "Software\Classes\.markdown"; ValueType: string; ValueName: ""; ValueData: "NaxNotepad.Document"; Tasks: assoc_md
-Root: HKA; Subkey: "Software\Classes\.log"; ValueType: string; ValueName: ""; ValueData: "NaxNotepad.Document"; Tasks: assoc_log
+; The default program for a file type stays the user's choice (Windows asks or Settings > Default
+; apps); the installer only adds Nax-Notepad to the "Open with" list and removes it again.
+Root: HKA; Subkey: "Software\Classes\.txt\OpenWithProgids"; ValueType: string; ValueName: "NaxNotepad.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: assoc_txt
+Root: HKA; Subkey: "Software\Classes\.md\OpenWithProgids"; ValueType: string; ValueName: "NaxNotepad.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: assoc_md
+Root: HKA; Subkey: "Software\Classes\.markdown\OpenWithProgids"; ValueType: string; ValueName: "NaxNotepad.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: assoc_md
+Root: HKA; Subkey: "Software\Classes\.log\OpenWithProgids"; ValueType: string; ValueName: "NaxNotepad.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: assoc_log
 ; Register as an "Open with" candidate for text-like files
 Root: HKA; Subkey: "Software\Classes\Applications\nax-notepad.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "Nax-Notepad"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\nax-notepad.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\nax-notepad.exe"" ""%1"""
@@ -133,15 +135,91 @@ begin
   Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
 end;
 
+{ Remove every entry that is exactly Dir from a ';'-separated path list. }
+function WithoutPathEntry(List, Dir: string): string;
+var
+  Rest, Part: string;
+  P: Integer;
+begin
+  Result := '';
+  Rest := List;
+  while Rest <> '' do
+  begin
+    P := Pos(';', Rest);
+    if P = 0 then
+    begin
+      Part := Rest;
+      Rest := '';
+    end
+    else
+    begin
+      Part := Copy(Rest, 1, P - 1);
+      Rest := Copy(Rest, P + 1, Length(Rest));
+    end;
+    if (Part <> '') and (CompareText(RemoveBackslashUnlessRoot(Part), RemoveBackslashUnlessRoot(Dir)) <> 0) then
+    begin
+      if Result <> '' then
+        Result := Result + ';';
+      Result := Result + Part;
+    end;
+  end;
+end;
+
+procedure RemoveFromUserPath(Dir: string);
+var
+  OldPath, NewPath: string;
+begin
+  if RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', OldPath) then
+  begin
+    NewPath := WithoutPathEntry(OldPath, Dir);
+    if NewPath <> OldPath then
+      RegWriteExpandStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', NewPath);
+  end;
+end;
+
+{ Versions up to 0.5.2 made Nax-Notepad the default program by pointing the extension at its
+  ProgID. That ProgID is removed on uninstall, so such a pointer is removed too. }
+procedure RemoveOldDefault(Ext: string);
+var
+  Value: string;
+begin
+  if RegQueryStringValue(HKA, 'Software\Classes\' + Ext, '', Value) and (CompareText(Value, 'NaxNotepad.Document') = 0) then
+    RegDeleteValue(HKA, 'Software\Classes\' + Ext, '');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    RemoveOldDefault('.txt');
+    RemoveOldDefault('.md');
+    RemoveOldDefault('.markdown');
+    RemoveOldDefault('.log');
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: string;
 begin
+  if CurUninstallStep = usUninstall then
+  begin
+    RemoveFromUserPath(ExpandConstant('{app}'));
+    RemoveOldDefault('.txt');
+    RemoveOldDefault('.md');
+    RemoveOldDefault('.markdown');
+    RemoveOldDefault('.log');
+  end;
   if CurUninstallStep = usPostUninstall then
   begin
+    // The browser engine's cache belongs to the program, not to the user.
+    DelTree(ExpandConstant('{localappdata}\com.nax.notepad'), True, True, True);
     DataDir := ExpandConstant('{userappdata}\Nax-Notepad');
-    if DirExists(DataDir) then
-      if MsgBox(ExpandConstant('{cm:RemoveData}'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    if DirExists(DataDir) or DirExists(ExpandConstant('{userappdata}\com.nax.notepad')) then
+      if SuppressibleMsgBox(ExpandConstant('{cm:RemoveData}'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
+      begin
         DelTree(DataDir, True, True, True);
+        DelTree(ExpandConstant('{userappdata}\com.nax.notepad'), True, True, True);
+      end;
   end;
 end;

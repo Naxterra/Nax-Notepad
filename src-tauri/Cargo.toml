@@ -1,6 +1,6 @@
 [package]
 name = "nax-notepad"
-version = "0.5.2"
+version = "0.5.3"
 description = "Nax-Notepad - fast tabbed text editor with Markdown live preview and large-file support"
 authors = ["Naxterra"]
 edition = "2021"
@@ -30,6 +30,9 @@ log = "0.4"
 env_logger = "0.11"
 walkdir = "2"
 tauri-plugin-clipboard-manager = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

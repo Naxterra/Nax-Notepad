@@ -8,6 +8,7 @@
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { writeClipboard } from "../clipboard";
 import { HexBuffer, parseHex, textBytes, toHex } from "../hexbuffer";
+import { letterOf } from "../keymap";
 import { t } from "../i18n";
 import { contextMenu, h, prompt, toast } from "./dialogs";
 
@@ -419,13 +420,13 @@ export class HexView {
       e.stopPropagation();
     };
     if (ctrl && !e.altKey) {
-      const c = e.code;
-      if (c === "KeyC") return handled(), void this.copy();
-      if (c === "KeyX") return handled(), void this.copy(true);
-      if (c === "KeyV") return handled(), void this.paste();
-      if (c === "KeyA") return handled(), this.selectAll();
-      if (c === "KeyZ" && !shift) return handled(), this.undo();
-      if (c === "KeyY" || (c === "KeyZ" && shift)) return handled(), this.redo();
+      const c = letterOf(e);
+      if (c === "c") return handled(), void this.copy();
+      if (c === "x") return handled(), void this.copy(true);
+      if (c === "v") return handled(), void this.paste();
+      if (c === "a") return handled(), this.selectAll();
+      if (c === "z" && !shift) return handled(), this.undo();
+      if (c === "y" || (c === "z" && shift)) return handled(), this.redo();
       if (k === "Home") return handled(), this.moveTo(0, shift), this.userMoved();
       if (k === "End") return handled(), this.moveTo(this.maxCursor(), shift), this.userMoved();
       return; // other shortcuts are app commands

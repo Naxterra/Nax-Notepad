@@ -23,7 +23,6 @@ use memmap2::Mmap;
 use regex::bytes::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +40,8 @@ const ENCODING_SAMPLE: usize = 1 << 20;
 pub const E_EXTERNAL_CHANGE: &str = "E_EXTERNAL_CHANGE:";
 /// Error prefix for edits to a document opened read-only because of its encoding.
 pub const E_READ_ONLY_ENCODING: &str = "E_READ_ONLY_ENCODING:";
+/// Error prefix for saving a large file that has several hard links.
+pub const E_HARD_LINKS: &str = "E_HARD_LINKS:";
 /// Error prefix for scoped operations without a scope.
 pub const E_NO_SCOPE: &str = "E_NO_SCOPE:";
 /// Error prefix for operations stopped by the user.
@@ -99,6 +100,10 @@ pub struct DiskState {
 
 impl DiskState {
     pub fn read(path: &Path) -> std::io::Result<DiskState> {
+        Self::read_with(path, hash_bytes)
+    }
+
+    fn read_with(path: &Path, hash: fn(&[u8]) -> u64) -> std::io::Result<DiskState> {
         let mut f = File::open(path)?;
         let meta = f.metadata()?;
         let len = meta.len();
@@ -110,13 +115,24 @@ impl DiskState {
             .unwrap_or(0);
         let mut buf = vec![0u8; FINGERPRINT_BYTES.min(len) as usize];
         f.read_exact(&mut buf)?;
-        let head = hash_bytes(&buf);
+        let head = hash(&buf);
         let tail_len = FINGERPRINT_BYTES.min(len);
         f.seek(SeekFrom::Start(len - tail_len))?;
         let mut tbuf = vec![0u8; tail_len as usize];
         f.read_exact(&mut tbuf)?;
-        let tail = hash_bytes(&tbuf);
+        let tail = hash(&tbuf);
         Ok(DiskState { len, mtime_ns, head, tail })
+    }
+
+    /// The fingerprint of a file whose complete content is `bytes`.
+    fn from_bytes(bytes: &[u8], mtime_ns: u64) -> DiskState {
+        let n = (FINGERPRINT_BYTES as usize).min(bytes.len());
+        DiskState {
+            len: bytes.len() as u64,
+            mtime_ns,
+            head: hash_bytes(&bytes[..n]),
+            tail: hash_bytes(&bytes[bytes.len() - n..]),
+        }
     }
 
     pub fn mtime_ms(&self) -> u64 {
@@ -125,9 +141,27 @@ impl DiskState {
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
+    stable_hash(b)
+}
+
+/// The fingerprint hash of version 0.5.2 and earlier (the standard library hasher), kept only
+/// to accept recovery logs those versions wrote.
+fn legacy_hash(b: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     b.hash(&mut h);
     h.finish()
+}
+
+/// FNV-1a. Unlike the standard library hasher its result never changes between Rust versions,
+/// so recovery logs written by one version of the app stay valid in the next.
+pub fn stable_hash(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in b {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -138,6 +172,12 @@ fn same_path(a: &Path, b: &Path) -> bool {
             .to_lowercase()
     };
     norm(a) == norm(b)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests set this to simulate a saved file that cannot be opened again.
+    static FAIL_REOPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub struct PagedDoc {
@@ -381,6 +421,12 @@ impl PagedDoc {
     }
 
     /// True when the file at `path` no longer matches what was opened (or last saved).
+    /// True when `d` is how version 0.5.2 and earlier fingerprinted the unchanged backing file,
+    /// so a recovery log written by those versions can still be restored.
+    pub fn matches_legacy_fingerprint(&self, d: &DiskState) -> bool {
+        d.len == self.disk.len && d.mtime_ns == self.disk.mtime_ns && DiskState::read_with(&self.path, legacy_hash).is_ok_and(|old| old == *d)
+    }
+
     pub fn disk_changed(&self) -> bool {
         match DiskState::read(&self.path) {
             Ok(now) => now != self.disk,
@@ -860,6 +906,14 @@ impl PagedDoc {
     /// `overwrite_external` skips the check for changes made by other programs.
     pub fn save_to_opts(&mut self, target: &Path, overwrite_external: bool) -> Result<(), String> {
         self.ensure_editable()?;
+        // Save into the file a symbolic link points to, so the link stays a link.
+        let resolved = session::resolve_links(target);
+        let target = resolved.as_path();
+        // Replacing a file with several hard links would leave the other names with the old
+        // content, and a file this large is not rewritten in place.
+        if session::hard_link_count(target) > 1 {
+            return Err(format!("{E_HARD_LINKS}{}", target.display()));
+        }
         let in_place = same_path(target, &self.path);
         if in_place && !overwrite_external && self.disk_changed() {
             return Err(format!("{E_EXTERNAL_CHANGE}{}", self.path.display()));
@@ -886,26 +940,73 @@ impl PagedDoc {
                 }
             };
             drop(std::mem::replace(&mut self.mmap, tmp_map));
-            if let Err(e) = std::fs::rename(&tmp, target) {
+            if let Err(e) = session::replace_file(&tmp, target) {
                 return Err(self.recover_after_failed_replace(&mapped, mapped_len, &tmp, target, e));
             }
-        } else if let Err(e) = std::fs::rename(&tmp, target) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("Cannot replace {}: {e}", target.display()));
+        } else if let Err(e) = session::replace_file(&tmp, target) {
+            return Err(session::failed_replace_message(target, target, &tmp, &e));
         }
         let eol = self.eol;
-        match PagedDoc::open(target) {
+        match Self::reopen_after_save(target) {
             Ok(mut fresh) => {
                 fresh.eol = eol;
                 fresh.file_eol = eol;
                 *self = fresh;
             }
+            // The mapping already shows the saved file (the temporary copy that was renamed).
+            // The pieces still describe the old file, so start over from the new content.
+            Err(_) if in_place => self.adopt_saved_mapping(target),
             Err(e) => return Err(format!("Saved {}, but could not reopen it: {e}", target.display())),
         }
         if let Some(p) = old_backing {
             let _ = std::fs::remove_file(p);
         }
         Ok(())
+    }
+
+    fn reopen_after_save(target: &Path) -> Result<PagedDoc, String> {
+        #[cfg(test)]
+        if FAIL_REOPEN.with(|f| f.get()) {
+            return Err("simulated sharing violation".into());
+        }
+        PagedDoc::open(target)
+    }
+
+    /// Make the document consist of exactly the current mapping, which holds the file that was
+    /// just saved (used when the saved file cannot be opened again).
+    fn adopt_saved_mapping(&mut self, target: &Path) {
+        self.path = target.to_path_buf();
+        self.body_start = if self.bom == Bom::Utf8 { 3 } else { 0 };
+        self.add.clear();
+        self.lines_before.clear();
+        self.build_index();
+        let body_len = self.mmap.len().saturating_sub(self.body_start);
+        self.pieces = vec![Piece {
+            src: Src::Orig,
+            start: self.body_start,
+            len: body_len,
+            newlines: self.orig_newlines,
+        }];
+        self.total_len = body_len;
+        self.total_newlines = self.orig_newlines;
+        self.file_eol = self.eol;
+        self.backing_temp = None;
+        self.scope = None;
+        // The mapping is the saved file, so its fingerprint comes from the mapping; only the time
+        // is read from the file system, which works even while the file cannot be opened.
+        let mtime_ns = std::fs::metadata(target)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64);
+        match mtime_ns {
+            Some(m) => self.disk = DiskState::from_bytes(&self.mmap, m),
+            None => {
+                if let Ok(d) = DiskState::read(target) {
+                    self.disk = d;
+                }
+            }
+        }
     }
 
     /// The target was not replaced. Map the previous backing file again so every piece stays
@@ -922,8 +1023,13 @@ impl PagedDoc {
         match File::open(mapped).and_then(|f| unsafe { Mmap::map(&f) }) {
             Ok(m) if m.len() == mapped_len => {
                 self.mmap = m;
-                let _ = std::fs::remove_file(tmp);
-                format!("{msg}. Your changes are kept.")
+                if target.exists() {
+                    let _ = std::fs::remove_file(tmp);
+                    format!("{msg}. Your changes are kept.")
+                } else {
+                    // The original was moved away before the replace failed; tmp is the file now.
+                    format!("{msg}. Your changes are kept, and the saved content is in {}.", tmp.display())
+                }
             }
             _ => match PagedDoc::open(tmp) {
                 Ok(mut d) => {
@@ -1307,23 +1413,28 @@ impl PagedDoc {
         self.backing_temp.is_none()
     }
 
-    pub fn import_edits(&mut self, pieces: Vec<Piece>, add: Vec<u8>) -> Result<(), String> {
+    pub fn import_edits(&mut self, mut pieces: Vec<Piece>, add: Vec<u8>) -> Result<(), String> {
         let mut len = 0usize;
         let mut nl = 0usize;
-        for p in &pieces {
-            match p.src {
+        for p in &mut pieces {
+            let end = p.start.checked_add(p.len).ok_or("edit log is corrupt")?;
+            let bytes: &[u8] = match p.src {
                 Src::Orig => {
-                    if p.start + p.len > self.mmap.len() {
+                    if p.start < self.body_start || end > self.mmap.len() {
                         return Err("edit log does not match file".into());
                     }
+                    &self.mmap[p.start..end]
                 }
                 Src::Add => {
-                    if p.start + p.len > add.len() {
+                    if end > add.len() {
                         return Err("edit log is corrupt".into());
                     }
+                    &add[p.start..end]
                 }
-            }
-            len += p.len;
+            };
+            // The stored count is not trusted: a wrong value would corrupt every line lookup.
+            p.newlines = memchr_iter(b'\n', bytes).count();
+            len = len.checked_add(p.len).ok_or("edit log is corrupt")?;
             nl += p.newlines;
         }
         self.pieces = pieces;
@@ -1337,6 +1448,88 @@ impl PagedDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_log_fingerprints_do_not_change_between_versions() {
+        // FNV-1a test vectors: these values must never change, or old recovery logs are lost.
+        assert_eq!(stable_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(stable_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(stable_hash(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn corrupt_recovery_log_is_rejected_and_line_counts_are_recomputed() {
+        let (_d, mut doc) = make(b"one\ntwo\n");
+        let bad = vec![Piece { src: Src::Add, start: usize::MAX, len: 2, newlines: 0 }];
+        assert!(doc.import_edits(bad, b"xx".to_vec()).is_err(), "overflowing range");
+        let outside = vec![Piece { src: Src::Orig, start: 0, len: 100, newlines: 0 }];
+        assert!(doc.import_edits(outside, vec![]).is_err(), "range beyond the file");
+        // A log that lies about line breaks is corrected from the bytes themselves.
+        let lying = vec![Piece { src: Src::Orig, start: 0, len: 8, newlines: 1000 }, Piece { src: Src::Add, start: 0, len: 6, newlines: 0 }];
+        doc.import_edits(lying, b"three\n".to_vec()).unwrap();
+        assert_eq!(doc.line_count(), 4);
+        assert_eq!(doc.read_lines(0, 3).0, "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn saved_large_file_that_cannot_be_reopened_keeps_showing_the_saved_text() {
+        let (dir, mut doc) = make(b"first line\nsecond line\n");
+        let p = dir.path().join("t.txt");
+        doc.replace_lines(0, 1, "edited first line").unwrap();
+        FAIL_REOPEN.with(|f| f.set(true));
+        let result = doc.save_to(&p);
+        FAIL_REOPEN.with(|f| f.set(false));
+        result.unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"edited first line\nsecond line\n");
+        assert!(!doc.is_dirty());
+        assert!(!doc.disk_changed(), "the saved file must not look changed by another program");
+        assert_eq!(doc.read_lines(0, 2).0, "edited first line\nsecond line");
+        // Saving again writes the same, uncorrupted content.
+        doc.replace_lines(1, 1, "second line!").unwrap();
+        doc.save_to(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"edited first line\nsecond line!\n");
+    }
+
+    #[test]
+    fn recovery_log_from_version_0_5_2_is_still_restored() {
+        let (dir, doc) = make(b"one\ntwo\n");
+        let old = DiskState::read_with(&dir.path().join("t.txt"), legacy_hash).unwrap();
+        assert_ne!(old, doc.disk_state());
+        assert!(doc.matches_legacy_fingerprint(&old));
+        let other = DiskState { head: old.head ^ 1, ..old };
+        assert!(!doc.matches_legacy_fingerprint(&other), "a different file must not match");
+    }
+
+    #[test]
+    fn large_file_with_several_hard_links_is_not_split_by_saving() {
+        let (dir, mut doc) = make(b"one\ntwo\n");
+        let p = dir.path().join("t.txt");
+        let other = dir.path().join("other-name.txt");
+        std::fs::hard_link(&p, &other).unwrap();
+        doc.replace_lines(0, 1, "changed").unwrap();
+        let err = doc.save_to(&p).unwrap_err();
+        assert!(err.starts_with(E_HARD_LINKS), "{err}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\ntwo\n");
+        assert_eq!(std::fs::read(&other).unwrap(), b"one\ntwo\n");
+        assert!(doc.is_dirty(), "the edit must still be there");
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(session::TEMP_SUFFIX)).count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn large_file_save_as_that_loses_the_target_keeps_the_new_content() {
+        let (dir, mut doc) = make(b"one\ntwo\n");
+        let target = dir.path().join("copy.txt");
+        std::fs::write(&target, b"old copy").unwrap();
+        session::FAIL_REPLACE_AFTER_MOVING_TARGET.with(|f| f.set(true));
+        let result = doc.save_to(&target);
+        session::FAIL_REPLACE_AFTER_MOVING_TARGET.with(|f| f.set(false));
+        let err = result.unwrap_err();
+        let kept: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with(session::TEMP_SUFFIX)).collect();
+        assert_eq!(kept.len(), 1, "{err}");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), b"one\ntwo\n");
+        assert!(err.contains(&kept[0].display().to_string()), "{err}");
+    }
 
     fn make(content: &[u8]) -> (tempfile::TempDir, PagedDoc) {
         let dir = tempfile::tempdir().unwrap();

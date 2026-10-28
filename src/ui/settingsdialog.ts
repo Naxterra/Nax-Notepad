@@ -48,7 +48,7 @@ const sections: { title: string; fields: Field[] }[] = [
       { key: "trimTrailingOnSave", label: "Trim trailing whitespace on save", type: "bool" },
       { key: "ensureFinalNewline", label: "Ensure final newline on save", type: "bool" },
       { key: "autoReloadExternal", label: "Reload unmodified files changed on disk", type: "bool" },
-      { key: "restoreSession", label: "Restore tabs and unsaved text on start", type: "bool" },
+      { key: "restoreSession", label: "Restore all tabs on start (unsaved text always comes back)", type: "bool" },
       { key: "pagedWindowLines", label: "Lines per page for huge files", type: "number", min: 500, max: 50000 },
     ],
   },
@@ -56,6 +56,7 @@ const sections: { title: string; fields: Field[] }[] = [
     title: "Markdown",
     fields: [
       { key: "livePreviewDefault", label: "Open Markdown files in Live Preview", type: "bool" },
+      { key: "remoteImages", label: "Load images from the internet in Live Preview", type: "bool" },
       { key: "previewMaxWidth", label: "Readable line width in px (0 = full width)", type: "number", min: 0, max: 5000 },
     ],
   },

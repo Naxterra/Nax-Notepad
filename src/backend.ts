@@ -49,6 +49,7 @@ export interface DiskCheck {
 export const E_UNREPRESENTABLE = "E_UNREPRESENTABLE:";
 export const E_EXTERNAL_CHANGE = "E_EXTERNAL_CHANGE:";
 export const E_READ_ONLY_ENCODING = "E_READ_ONLY_ENCODING:";
+export const E_HARD_LINKS = "E_HARD_LINKS:";
 export const E_SEARCH_ENCODING = "E_SEARCH_ENCODING:";
 export const E_NO_SCOPE = "E_NO_SCOPE:";
 export const E_CANCELLED = "E_CANCELLED:";
@@ -142,8 +143,9 @@ export interface SessionData {
 export const backend = {
   openPath: (id: string, path: string, forcePaged = false, encoding: string | null = null) =>
     invoke<OpenResult>("open_path", { id, path, forcePaged, encoding }),
-  saveText: (path: string, text: string, encoding: string, eol: Eol, lossy = false) =>
-    invoke<SaveResult>("save_text", { path, text, encoding, eol, lossy }),
+  /** `expectedMtime`: the time the file had when it was read; the save fails with E_EXTERNAL_CHANGE if it differs. */
+  saveText: (path: string, text: string, encoding: string, eol: Eol, lossy = false, expectedMtime: number | null = null) =>
+    invoke<SaveResult>("save_text", { path, text, encoding, eol, lossy, expectedMtime }),
   fileMtime: (path: string) => invoke<number>("file_mtime", { path }),
   encodings: () => invoke<string[]>("encodings"),
 
@@ -169,9 +171,10 @@ export const backend = {
 
   sessionLoad: () => invoke<SessionData>("session_load"),
   sessionSave: (s: SessionData) => invoke<void>("session_save", { s }),
-  sessionStoreBuffer: (id: string, text: string) => invoke<void>("session_store_buffer", { id, text }),
+  /** Stores whose `generation` is not above the last dropped one are ignored (late writes after a save). */
+  sessionStoreBuffer: (id: string, text: string, generation: number) => invoke<void>("session_store_buffer", { id, text, generation }),
   sessionLoadBuffer: (id: string) => invoke<string | null>("session_load_buffer", { id }),
-  sessionDropBuffer: (id: string) => invoke<void>("session_drop_buffer", { id }),
+  sessionDropBuffer: (id: string, generation: number) => invoke<void>("session_drop_buffer", { id, generation }),
   settingsLoad: () => invoke<Record<string, unknown>>("settings_load"),
   settingsSave: (value: Record<string, unknown>) => invoke<void>("settings_save", { value }),
   startupFiles: () => invoke<string[]>("startup_files"),

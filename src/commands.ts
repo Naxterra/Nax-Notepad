@@ -29,7 +29,7 @@ import { diffLines } from "./diff";
 import { ENCODINGS } from "./encodings";
 import { lang, t } from "./i18n";
 import { detectIndent } from "./indentdetect";
-import { applyKeymap, displayChord, matchesKey, ParsedKey, parseChord } from "./keymap";
+import { applyKeymap, displayChord, letterOf, matchesKey, ParsedKey, parseChord } from "./keymap";
 import { addStep, describeSteps, MacroStep, playSteps, stepForKey } from "./macros";
 import { checkForUpdates, ISSUES_URL, REPO_URL } from "./update";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -107,6 +107,10 @@ export class MacroRecorder {
     if (!this.recording) return;
     const s = stepForKey(e);
     if (s) addStep(this.steps, s);
+  }
+  /** Text that an input method (IME) committed; its key presses are not recorded. */
+  composed(text: string): void {
+    if (this.recording && text) addStep(this.steps, { type: "text", text });
   }
 }
 
@@ -749,15 +753,23 @@ export function installKeybindings(getCmds: () => Command[], opts: { isBlocked: 
     },
     { capture: true }
   );
+  window.addEventListener(
+    "compositionend",
+    (e) => {
+      if (recorder.recording && opts.isEditorTarget(e.target)) recorder.composed(e.data ?? "");
+    },
+    { capture: true }
+  );
   return { rebuild };
 }
 
 function isBrowserShortcut(e: KeyboardEvent): boolean {
   const ctrl = e.ctrlKey || e.metaKey;
   const k = e.key.toLowerCase();
+  const letter = letterOf(e);
   if (k === "f12") return true;
-  if (ctrl && e.shiftKey && (e.code === "KeyJ" || e.code === "KeyR" || e.code === "KeyI")) return true;
-  if (ctrl && !e.shiftKey && !e.altKey && e.code === "KeyR") return true;
+  if (ctrl && e.shiftKey && (letter === "j" || letter === "r" || letter === "i")) return true;
+  if (ctrl && !e.shiftKey && !e.altKey && letter === "r") return true;
   if (k === "f5" && ctrl) return true;
   if (k === "f7") return true; // caret browsing prompt
   return false;

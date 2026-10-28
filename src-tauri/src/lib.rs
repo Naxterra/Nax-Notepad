@@ -6,6 +6,7 @@ use paged::{DiskState, Match, PagedDoc, Piece};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{Emitter, Manager, State};
@@ -30,8 +31,14 @@ const PAGED_THRESHOLD: u64 = 48 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct AppState {
-    paged: Mutex<HashMap<String, PagedDoc>>,
+    /// Open large documents. The map lock is held only to look a document up; each document has
+    /// its own lock, so a long save or search in one file does not block the others.
+    paged: Mutex<HashMap<String, Arc<Mutex<PagedDoc>>>>,
     startup_files: Mutex<Vec<String>>,
+}
+
+fn doc_handle(state: &AppState, id: &str) -> Result<Arc<Mutex<PagedDoc>>, String> {
+    state.paged.lock().get(id).cloned().ok_or_else(|| "document not open".to_string())
 }
 
 #[derive(Serialize)]
@@ -111,7 +118,7 @@ async fn open_path(
             mtime: doc.file_mtime_ms(),
             binary,
         };
-        state.paged.lock().insert(id, doc);
+        state.paged.lock().insert(id, Arc::new(Mutex::new(doc)));
         return Ok(res);
     }
     let bytes = std::fs::read(&p).map_err(|e| format!("Cannot read {}: {e}", p.display()))?;
@@ -152,8 +159,14 @@ async fn save_text(
     encoding: String,
     eol: Eol,
     lossy: Option<bool>,
+    expected_mtime: Option<u64>,
 ) -> Result<SaveResult, String> {
     let p = PathBuf::from(&path);
+    // The modification time the editor knows; a different one means another program wrote the
+    // file after it was opened or saved.
+    if p.exists() {
+        ensure_unchanged(&p, expected_mtime, None)?;
+    }
     // Refuses characters the encoding cannot represent unless the user confirmed a lossy save.
     let bytes = textfmt::encode_with(&text, &encoding, eol, lossy.unwrap_or(false)).map_err(|e| e.to_message())?;
     if let Some(dir) = p.parent() {
@@ -203,8 +216,8 @@ async fn paged_window(
     first_line: usize,
     count: usize,
 ) -> Result<Window, String> {
-    let docs = state.paged.lock();
-    let doc = docs.get(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let doc = handle.lock();
     let w = doc.read_window(first_line, count, paged::MAX_WINDOW_BYTES);
     Ok(Window {
         text: w.text,
@@ -225,8 +238,8 @@ async fn paged_commit(
     count: usize,
     text: String,
 ) -> Result<usize, String> {
-    let mut docs = state.paged.lock();
-    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let mut doc = handle.lock();
     doc.replace_lines(first_line, count, &text)
 }
 
@@ -237,8 +250,8 @@ async fn paged_save(
     path: Option<String>,
     overwrite_external: Option<bool>,
 ) -> Result<SaveResult, String> {
-    let mut docs = state.paged.lock();
-    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let mut doc = handle.lock();
     let target = path.map(PathBuf::from).unwrap_or_else(|| doc.path.clone());
     doc.save_to_opts(&target, overwrite_external.unwrap_or(false))?;
     Ok(SaveResult {
@@ -256,8 +269,8 @@ fn paged_close(state: State<'_, AppState>, id: String) {
 
 #[tauri::command]
 fn paged_set_eol(state: State<'_, AppState>, id: String, eol: Eol) -> Result<(), String> {
-    let mut docs = state.paged.lock();
-    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let mut doc = handle.lock();
     if !doc.is_editable() {
         return Err(format!("{}{}", paged::E_READ_ONLY_ENCODING, doc.encoding_label()));
     }
@@ -275,8 +288,8 @@ struct DiskCheck {
 /// Whether the backing file of a paged document changed on disk since it was opened or saved.
 #[tauri::command]
 async fn paged_disk_state(state: State<'_, AppState>, id: String) -> Result<DiskCheck, String> {
-    let docs = state.paged.lock();
-    let doc = docs.get(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let doc = handle.lock();
     let now = DiskState::read(&doc.path).ok();
     Ok(DiskCheck {
         changed: now.map_or(true, |n| n != doc.disk_state()),
@@ -295,8 +308,8 @@ async fn paged_set_scope(
     end_line: usize,
     end_col: usize,
 ) -> Result<bool, String> {
-    let mut docs = state.paged.lock();
-    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let mut doc = handle.lock();
     let a = doc.line_start(start_line) + start_col;
     let b = doc.line_start(end_line) + end_col;
     Ok(doc.set_scope(a, b))
@@ -304,9 +317,8 @@ async fn paged_set_scope(
 
 #[tauri::command]
 async fn paged_clear_scope(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let mut docs = state.paged.lock();
-    if let Some(doc) = docs.get_mut(&id) {
-        doc.clear_scope();
+    if let Ok(handle) = doc_handle(&state, &id) {
+        handle.lock().clear_scope();
     }
     Ok(())
 }
@@ -415,9 +427,9 @@ async fn paged_find(
     scoped: Option<bool>,
 ) -> Result<Option<Match>, String> {
     let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
-    let docs = state.paged.lock();
-    let doc = docs.get(&id).ok_or("document not open")?;
-    ensure_searchable(doc)?;
+    let handle = doc_handle(&state, &id)?;
+    let doc = handle.lock();
+    ensure_searchable(&doc)?;
     let from = doc.line_start(from_line).saturating_add(from_col);
     doc.find_in_c(&re, from, backwards, scoped.unwrap_or(false), &cancel_token())
 }
@@ -425,9 +437,9 @@ async fn paged_find(
 #[tauri::command]
 async fn paged_count(state: State<'_, AppState>, id: String, opts: FindOpts, scoped: Option<bool>) -> Result<usize, String> {
     let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
-    let docs = state.paged.lock();
-    let doc = docs.get(&id).ok_or("document not open")?;
-    ensure_searchable(doc)?;
+    let handle = doc_handle(&state, &id)?;
+    let doc = handle.lock();
+    ensure_searchable(&doc)?;
     doc.count_in_c(&re, 1_000_000, scoped.unwrap_or(false), &cancel_token())
 }
 
@@ -447,9 +459,9 @@ async fn paged_find_all(
     max: Option<usize>,
 ) -> Result<FindAllResult, String> {
     let re = build_regex(&opts.pattern, opts.regex, opts.case_sensitive, opts.whole_word)?;
-    let docs = state.paged.lock();
-    let doc = docs.get(&id).ok_or("document not open")?;
-    ensure_searchable(doc)?;
+    let handle = doc_handle(&state, &id)?;
+    let doc = handle.lock();
+    ensure_searchable(&doc)?;
     let (hits, truncated) = doc.find_all_c(&re, scoped.unwrap_or(false), max.unwrap_or(10_000), &cancel_token())?;
     Ok(FindAllResult { hits, truncated })
 }
@@ -457,8 +469,8 @@ async fn paged_find_all(
 /// Pick up data appended to a large file by another program (follow / tail mode).
 #[tauri::command]
 async fn paged_tail_check(state: State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
-    let mut docs = state.paged.lock();
-    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let mut doc = handle.lock();
     if doc.is_dirty() {
         return Ok(serde_json::json!({ "status": "dirty", "totalLines": doc.line_count() }));
     }
@@ -485,15 +497,15 @@ async fn paged_replace_all(
     } else {
         replacement.replace('$', "$$")
     };
-    let mut docs = state.paged.lock();
-    let doc = docs.get_mut(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let mut doc = handle.lock();
     doc.replace_all_in_c(&re, rep.as_bytes(), scoped.unwrap_or(false), &cancel_token())
 }
 
 #[tauri::command]
 async fn paged_store_edits(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let docs = state.paged.lock();
-    let doc = docs.get(&id).ok_or("document not open")?;
+    let handle = doc_handle(&state, &id)?;
+    let doc = handle.lock();
     let (pieces_path, add_path) = session::edits_paths(&id);
     if !doc.is_dirty() {
         let _ = std::fs::remove_file(&pieces_path);
@@ -548,11 +560,11 @@ async fn paged_restore(state: State<'_, AppState>, id: String, path: String) -> 
     }
     if let (Ok(pj), Ok(add)) = (std::fs::read(&pieces_path), std::fs::read(&add_path)) {
         if let Ok(log) = serde_json::from_slice::<Log>(&pj) {
-            let mut docs = state.paged.lock();
-            if let Some(doc) = docs.get_mut(&id) {
+            if let Ok(handle) = doc_handle(&state, &id) {
+                let mut doc = handle.lock();
                 let disk = doc.disk_state();
                 let unchanged = match log.disk {
-                    Some(d) => d == disk,
+                    Some(d) => d == disk || doc.matches_legacy_fingerprint(&d),
                     None => log.file_len == disk.len && log.file_mtime == disk.mtime_ns / 1_000_000_000,
                 };
                 if unchanged && doc.is_editable() && doc.import_edits(log.pieces, add).is_ok() {
@@ -583,8 +595,8 @@ fn session_save(s: session::Session) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn session_store_buffer(id: String, text: String) -> Result<(), String> {
-    session::store_buffer(&id, &text)
+async fn session_store_buffer(id: String, text: String, generation: Option<u64>) -> Result<(), String> {
+    session::store_buffer_gen(&id, &text, generation)
 }
 
 #[tauri::command]
@@ -593,8 +605,8 @@ fn session_load_buffer(id: String) -> Option<String> {
 }
 
 #[tauri::command]
-fn session_drop_buffer(id: String) {
-    session::drop_buffer(&id)
+fn session_drop_buffer(id: String, generation: Option<u64>) {
+    session::drop_buffer_gen(&id, generation)
 }
 
 #[tauri::command]
@@ -837,7 +849,10 @@ async fn read_bytes(path: String, offset: u64, len: u64) -> Result<tauri::ipc::R
 /// Fails with E_EXTERNAL_CHANGE when the file is no longer what the editor loaded.
 fn ensure_unchanged(p: &Path, expected_mtime: Option<u64>, expected_len: Option<u64>) -> Result<(), String> {
     let meta = std::fs::metadata(p).map_err(|e| format!("Cannot read {}: {e}", p.display()))?;
-    let changed = expected_mtime.is_some_and(|m| m != 0 && mtime_of(p) != m) || expected_len.is_some_and(|l| l != meta.len());
+    let now = mtime_of(p);
+    // Sessions of old versions stored whole seconds; accept those when the seconds agree.
+    let same_time = |m: u64| m == 0 || now == m || (m < 100_000_000_000 && now / 1000 == m);
+    let changed = expected_mtime.is_some_and(|m| !same_time(m)) || expected_len.is_some_and(|l| l != meta.len());
     if changed {
         return Err(format!("{}{}", paged::E_EXTERNAL_CHANGE, p.display()));
     }
@@ -1039,15 +1054,42 @@ async fn write_text_file(path: String, text: String) -> Result<(), String> {
     session::write_atomic(Path::new(&path), text.as_bytes())
 }
 
+/// Decode `buf` as far as it ends with a complete character. Data written by another program
+/// can stop in the middle of a character; its first bytes are left for the next read instead of
+/// being turned into a replacement character.
+fn decode_complete(buf: &[u8], label: &str) -> (String, usize) {
+    let enc = match label {
+        "UTF-8" | "UTF-8-BOM" => encoding_rs::UTF_8,
+        "UTF-16LE" => encoding_rs::UTF_16LE,
+        "UTF-16BE" => encoding_rs::UTF_16BE,
+        other => encoding_rs::Encoding::for_label(other.as_bytes()).unwrap_or(encoding_rs::UTF_8),
+    };
+    let unit = if enc == encoding_rs::UTF_16LE || enc == encoding_rs::UTF_16BE { 2 } else { 1 };
+    let whole = buf.len() - buf.len() % unit;
+    let (text, errors) = enc.decode_without_bom_handling(&buf[..whole]);
+    if !errors {
+        return (text.into_owned(), whole);
+    }
+    // Try leaving the last few bytes (an incomplete character) for later.
+    for keep in (unit..=4).step_by(unit) {
+        if keep > whole {
+            break;
+        }
+        let (t, e) = enc.decode_without_bom_handling(&buf[..whole - keep]);
+        if !e {
+            return (t.into_owned(), whole - keep);
+        }
+    }
+    // The bytes are invalid, not just incomplete: show them with replacement characters.
+    (text.into_owned(), whole)
+}
+
 fn head_hash(path: &Path, len: u64) -> std::io::Result<u64> {
-    use std::hash::{Hash, Hasher};
     use std::io::Read;
     let mut buf = vec![0u8; len as usize];
     std::fs::File::open(path)?.read_exact(&mut buf)?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    buf.hash(&mut h);
     // 53 bits, so the value survives a round trip through a JavaScript number.
-    Ok(h.finish() & ((1u64 << 53) - 1))
+    Ok(paged::stable_hash(&buf) & ((1u64 << 53) - 1))
 }
 
 #[derive(Serialize)]
@@ -1107,25 +1149,7 @@ async fn tail_check(path: String, offset: u64, head_hash_value: u64, head_len: u
     f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; (size - offset) as usize];
     f.read_exact(&mut buf).map_err(|e| e.to_string())?;
-    let consumed = match encoding.as_str() {
-        "UTF-8" | "UTF-8-BOM" => match std::str::from_utf8(&buf) {
-            Ok(_) => buf.len(),
-            Err(e) if e.error_len().is_none() => e.valid_up_to(),
-            Err(_) => buf.len(),
-        },
-        "UTF-16LE" | "UTF-16BE" => buf.len() - buf.len() % 2,
-        _ => buf.len(),
-    };
-    buf.truncate(consumed);
-    let text = match encoding.as_str() {
-        "UTF-8" | "UTF-8-BOM" => String::from_utf8_lossy(&buf).into_owned(),
-        "UTF-16LE" => encoding_rs::UTF_16LE.decode_without_bom_handling(&buf).0.into_owned(),
-        "UTF-16BE" => encoding_rs::UTF_16BE.decode_without_bom_handling(&buf).0.into_owned(),
-        label => match encoding_rs::Encoding::for_label(label.as_bytes()) {
-            Some(enc) => enc.decode_without_bom_handling(&buf).0.into_owned(),
-            None => String::from_utf8_lossy(&buf).into_owned(),
-        },
-    };
+    let (text, consumed) = decode_complete(&buf, &encoding);
     Ok(out("appended", text, offset + consumed as u64))
 }
 
@@ -1158,7 +1182,7 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
 
 fn collect_file_args<I: Iterator<Item = String>>(args: I, cwd: &Path) -> Vec<String> {
     args.skip(1)
-        .filter(|a| !a.starts_with('-'))
+        .filter(|a| is_file_argument(a, cwd))
         .map(|a| {
             let p = PathBuf::from(&a);
             if p.is_absolute() {
@@ -1171,6 +1195,13 @@ fn collect_file_args<I: Iterator<Item = String>>(args: I, cwd: &Path) -> Vec<Str
         .collect()
 }
 
+/// Arguments that name files. Options start with "-", but an existing file whose name starts
+/// with "-" is still opened. Relative names are looked up in `cwd`, the folder of the instance
+/// that received them.
+fn is_file_argument(a: &str, cwd: &Path) -> bool {
+    !a.starts_with('-') || cwd.join(a).is_file()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -1178,22 +1209,31 @@ pub fn run() {
     if let Some(dir) = session::portable_dir() {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview"));
     }
+    for path in session::recover_interrupted_rewrites() {
+        log::warn!("an interrupted save was undone, the previous content is back in {}", path.display());
+    }
     let cwd = std::env::current_dir().unwrap_or_default();
     let initial = collect_file_args(std::env::args(), &cwd);
     let state = AppState {
         paged: Mutex::new(HashMap::new()),
         startup_files: Mutex::new(initial),
     };
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-            let files = collect_file_args(argv.into_iter(), Path::new(&cwd));
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
-            let _ = app.emit("open-files", files);
-        }))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+    let mut builder = tauri::Builder::default();
+    // A portable copy runs on its own: it must not hand its files to an installed copy (both
+    // would share one single-instance lock), and it must not write window state to %APPDATA%.
+    if session::portable_dir().is_none() {
+        builder = builder
+            .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+                let files = collect_file_args(argv.into_iter(), Path::new(&cwd));
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+                let _ = app.emit("open-files", files);
+            }))
+            .plugin(tauri_plugin_window_state::Builder::default().build());
+    }
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1395,6 +1435,52 @@ mod tests {
     fn percent_decoding_of_paths() {
         assert_eq!(percent_decode("C%3A%5CData%20Files%5C%C3%BC.bin"), r"C:\Data Files\ü.bin");
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn saving_refuses_to_overwrite_a_file_another_program_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"from another program").unwrap();
+        let known = mtime_of(&p) - 5_000; // the editor loaded an older version
+        let save = |m: Option<u64>| tauri::async_runtime::block_on(save_text(p.display().to_string(), "mine".into(), "UTF-8".into(), Eol::Lf, None, m));
+        let err = save(Some(known)).err().expect("must refuse");
+        assert!(err.starts_with(paged::E_EXTERNAL_CHANGE), "{err}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"from another program");
+        // With the current time (or no known time, for Save As) the save goes through.
+        save(Some(mtime_of(&p))).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"mine");
+        // Sessions of old versions stored seconds; those still match.
+        save(Some(mtime_of(&p) / 1000)).unwrap();
+    }
+
+    #[test]
+    fn follow_mode_leaves_an_incomplete_character_for_the_next_read() {
+        // UTF-8: "Aü" with the second byte of ü still missing.
+        assert_eq!(decode_complete(&[0x41, 0xc3], "UTF-8"), ("A".to_string(), 1));
+        // UTF-16LE: "A" followed by only the high surrogate of an emoji.
+        assert_eq!(decode_complete(&[0x41, 0x00, 0x3d, 0xd8], "UTF-16LE"), ("A".to_string(), 2));
+        // UTF-16 with an odd trailing byte.
+        assert_eq!(decode_complete(&[0x41, 0x00, 0x42], "UTF-16LE"), ("A".to_string(), 2));
+        // GBK: "A" and the first byte of a two-byte character.
+        assert_eq!(decode_complete(&[0x41, 0xd6], "GBK"), ("A".to_string(), 1));
+        // Complete data is consumed entirely; genuinely invalid data is not held back forever.
+        assert_eq!(decode_complete("Grüße\n".as_bytes(), "UTF-8").1, 8);
+        assert_eq!(decode_complete(&[0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0x41], "UTF-8").1, 6);
+    }
+
+    #[test]
+    fn file_names_starting_with_a_dash_are_opened_from_the_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("-notes.txt");
+        std::fs::write(&p, b"x").unwrap();
+        let elsewhere = Path::new("C:\\");
+        assert!(is_file_argument(&p.display().to_string(), elsewhere));
+        // A relative name is looked up in the folder of the instance that received it.
+        assert!(is_file_argument("-notes.txt", dir.path()));
+        assert!(!is_file_argument("-notes.txt", elsewhere));
+        assert!(is_file_argument("plain.txt", elsewhere));
+        assert!(!is_file_argument("--some-option", dir.path()));
     }
 
     #[test]
