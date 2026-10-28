@@ -35,8 +35,16 @@ pub struct AppState {
     /// its own lock, so a long save or search in one file does not block the others.
     paged: Mutex<HashMap<String, Arc<Mutex<PagedDoc>>>>,
     startup_files: Mutex<Vec<String>>,
-    /// Files whose interrupted save was finished at this start (shown to the user once).
-    finished_saves: Mutex<Vec<String>>,
+    /// Files whose interrupted save was dealt with at this start (shown to the user once).
+    finished_saves: Mutex<FinishedSaves>,
+}
+
+#[derive(Serialize, Default)]
+struct FinishedSaves {
+    /// The file got the content that was being saved.
+    finished: Vec<String>,
+    /// The content being saved was missing, so the file got its previous content back.
+    undone: Vec<String>,
 }
 
 fn doc_handle(state: &AppState, id: &str) -> Result<Arc<Mutex<PagedDoc>>, String> {
@@ -632,7 +640,7 @@ fn startup_files(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-fn finished_saves(state: State<'_, AppState>) -> Vec<String> {
+fn finished_saves(state: State<'_, AppState>) -> FinishedSaves {
     std::mem::take(&mut *state.finished_saves.lock())
 }
 
@@ -1238,22 +1246,30 @@ pub fn run() {
     if let Some(dir) = session::portable_dir() {
         match session::lock_data_dir(&dir) {
             Ok(f) => _data_lock = Some(f),
-            Err(_) => {
+            // ERROR_SHARING_VIOLATION: another copy holds the lock.
+            Err(e) if e.raw_os_error() == Some(32) => {
                 show_startup_error(
                     "Nax-Notepad is already running from this folder. Use the open window, or copy the program to another folder to run it twice.\n\nNax-Notepad läuft bereits aus diesem Ordner. Verwenden Sie das geöffnete Fenster, oder kopieren Sie das Programm in einen anderen Ordner, um es zweimal zu starten.",
                 );
                 return;
             }
+            Err(e) => {
+                show_startup_error(&format!(
+                    "Nax-Notepad cannot use its data folder {}: {e}\n\nNax-Notepad kann seinen Datenordner {} nicht verwenden: {e}",
+                    dir.display(),
+                    dir.display()
+                ));
+                return;
+            }
         }
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview"));
     }
-    let finished: Vec<String> = session::recover_interrupted_rewrites().iter().map(|p| p.display().to_string()).collect();
     let cwd = std::env::current_dir().unwrap_or_default();
     let initial = collect_file_args(std::env::args(), &cwd);
     let state = AppState {
         paged: Mutex::new(HashMap::new()),
         startup_files: Mutex::new(initial),
-        finished_saves: Mutex::new(finished),
+        finished_saves: Mutex::new(FinishedSaves::default()),
     };
     let mut builder = tauri::Builder::default();
     // A portable copy runs on its own: it must not hand its files to an installed copy (both
@@ -1275,6 +1291,21 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(state)
+        // Runs after the single-instance plugin, so only the copy that stays open finishes
+        // interrupted saves, and before the page can ask for them.
+        .setup(|app| {
+            let mut report = FinishedSaves::default();
+            for r in session::recover_interrupted_rewrites() {
+                let path = r.target.display().to_string();
+                if r.finished {
+                    report.finished.push(path);
+                } else {
+                    report.undone.push(path);
+                }
+            }
+            *app.state::<AppState>().finished_saves.lock() = report;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             open_path,
             save_text,

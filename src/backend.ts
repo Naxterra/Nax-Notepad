@@ -180,8 +180,8 @@ export const backend = {
   settingsLoad: () => invoke<Record<string, unknown>>("settings_load"),
   settingsSave: (value: Record<string, unknown>) => invoke<void>("settings_save", { value }),
   startupFiles: () => invoke<string[]>("startup_files"),
-  /** Files whose interrupted save (hard-linked files) was finished when the app started. */
-  finishedSaves: () => invoke<string[]>("finished_saves"),
+  /** Files whose interrupted save (hard-linked files) was finished, or undone, when the app started. */
+  finishedSaves: () => invoke<{ finished: string[]; undone: string[] }>("finished_saves"),
 
   findInFiles: (root: string, opts: FindOpts, include: string, maxHits = 5000) =>
     invoke<FindInFilesResult>("find_in_files", { root, opts, include, maxHits }),

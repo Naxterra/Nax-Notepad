@@ -356,7 +356,14 @@ async function main(): Promise<void> {
   } catch (e) {
     console.warn("session restore failed", e);
   }
-  const finished = await backend.finishedSaves().catch(() => [] as string[]);
+  const saves = await backend.finishedSaves().catch(() => ({ finished: [] as string[], undone: [] as string[] }));
+  if (saves.undone.length) {
+    void message(
+      t("Interrupted save undone"),
+      t("Nax-Notepad stopped while saving these files, and the text being saved was no longer there. They have their previous content again. Your text may still be in the tab:\n\n{files}", { files: saves.undone.join("\n") })
+    );
+  }
+  const finished = saves.finished;
   if (finished.length) {
     void message(t("Interrupted save finished"), t("Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}", { files: finished.join("\n") }));
   }

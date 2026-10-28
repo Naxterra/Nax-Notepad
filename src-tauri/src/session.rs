@@ -113,7 +113,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Like [`write_atomic`], but the new content is produced by `write` (for streaming large files).
 /// The target is only replaced when `write` and the flush to disk succeeded.
 pub fn replace_atomic(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
-    let lock = target_lock(path);
+    // Keyed on the file a symbolic link points to, so saves through the link and through the
+    // file itself wait for each other.
+    let lock = target_lock(&resolve_links(path));
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     replace_atomic_locked(path, write)
 }
@@ -126,11 +128,12 @@ pub fn replace_atomic(path: &Path, write: impl FnOnce(&mut File) -> std::io::Res
 /// that keeps its attributes (such as Hidden) and its permissions.
 fn replace_atomic_locked(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<(), String> {
     let target = resolve_links(path);
-    // Hard links and symbolic links give one file several paths; saves through any of them
-    // must not run at the same time. This lock is always taken last, so it cannot deadlock.
-    let file_lock = file_lock(&target);
-    let _file_guard = file_lock.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
     if hard_link_count(&target) > 1 {
+        // Hard links give one file several paths, so the path lock is not enough: these saves
+        // also lock the file itself. Its identity stays the same, because it is rewritten in
+        // place. This lock is always taken last, so it cannot deadlock.
+        let file_lock = file_lock(&target);
+        let _file_guard = file_lock.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
         return rewrite_in_place(&target, write);
     }
     let (tmp, mut file) = create_temp_sibling(&target)?;
@@ -215,6 +218,10 @@ fn rewrite_in_place(target: &Path, write: impl FnOnce(&mut File) -> std::io::Res
 }
 
 fn rewrite_in_place_noted(target: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>, notes: &Path) -> Result<(), String> {
+    // The new content and a backup are written next to the file before it is rewritten, which
+    // needs about twice its size in free space.
+    let size = fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+    ensure_free_space(target, size.saturating_mul(2).saturating_add(1 << 20))?;
     // The new content is written to a temporary copy first. The file itself is not touched yet,
     // so `write` may still read from it (a hex patch streams the file it patches).
     let (new, mut f) = create_temp_sibling(target)?;
@@ -278,6 +285,34 @@ fn rewrite_in_place_noted(target: &Path, write: impl FnOnce(&mut File) -> std::i
     }
 }
 
+/// Refuse with a clear message when the drive of `target` has less than `needed` bytes free.
+fn ensure_free_space(target: &Path, needed: u64) -> Result<(), String> {
+    let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    match free_space(dir) {
+        Some(free) if free < needed => Err(format!(
+            "Not enough free space to save {} safely: about {} MB are needed next to it, {} MB are free.",
+            target.display(),
+            needed.div_ceil(1 << 20),
+            free / (1 << 20)
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut free: u64 = 0;
+    // SAFETY: the path is a NUL-terminated wide string; the other pointers may be null.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide(dir).as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(windows))]
+fn free_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
 /// Write `note` into a new file in `notes` and keep that file open. On Windows nobody else can
 /// read it while it is open, which is how a second start of the app knows the save is running.
 fn write_rewrite_note(notes: &Path, note: &RewriteNote) -> Result<(PathBuf, File), String> {
@@ -322,13 +357,23 @@ fn copy_into(src: &Path, dst: &Path) -> std::io::Result<()> {
     d.sync_all()
 }
 
+/// A file whose interrupted in-place rewrite was dealt with at start.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Recovered {
+    pub target: PathBuf,
+    /// True when the file got the content that was being saved; false when that copy was gone
+    /// and the previous content was put back instead.
+    pub finished: bool,
+}
+
 /// Finish in-place rewrites that were interrupted (the app or the computer stopped in the
-/// middle of a save): the file gets the content that was being saved. Returns those files.
-pub fn recover_interrupted_rewrites() -> Vec<PathBuf> {
+/// middle of a save): the file gets the content that was being saved, or its previous content
+/// when the new content is missing.
+pub fn recover_interrupted_rewrites() -> Vec<Recovered> {
     recover_rewrites_in(&rewrites_dir())
 }
 
-fn recover_rewrites_in(notes: &Path) -> Vec<PathBuf> {
+fn recover_rewrites_in(notes: &Path) -> Vec<Recovered> {
     let mut finished = Vec::new();
     let Ok(rd) = fs::read_dir(notes) else { return finished };
     for e in rd.flatten() {
@@ -362,19 +407,21 @@ fn recover_rewrites_in(notes: &Path) -> Vec<PathBuf> {
             }
             Some(_) => {}
         }
-        let source = if note.new.is_file() { &note.new } else { &note.backup };
+        let finished_save = note.new.is_file();
+        let source = if finished_save { &note.new } else { &note.backup };
         if !source.is_file() || copy_into(source, &note.target).is_err() {
             continue;
         }
         let _ = fs::remove_file(e.path());
         let _ = fs::remove_file(&note.new);
         let _ = fs::remove_file(&note.backup);
-        finished.push(note.target);
+        finished.push(Recovered { target: note.target, finished: finished_save });
     }
     finished
 }
 
-/// The lock shared by every path of an existing file (keyed by its identity).
+/// The lock shared by every path of an existing file (keyed by its identity). Only used for
+/// files with several hard links, so the map stays small.
 fn file_lock(target: &Path) -> Option<Arc<Mutex<()>>> {
     static LOCKS: OnceLock<Mutex<HashMap<FileId, Arc<Mutex<()>>>>> = OnceLock::new();
     let (_, id) = file_info(target)?;
@@ -783,7 +830,7 @@ mod tests {
         let (new, backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
         drop(handle); // the process that was saving is gone
         let finished = recover_rewrites_in(&notes);
-        assert_eq!(finished, vec![a.clone()]);
+        assert_eq!(finished, vec![Recovered { target: a.clone(), finished: true }]);
         assert_eq!(std::fs::read(&a).unwrap(), b"new content");
         assert_eq!(std::fs::read(&b).unwrap(), b"new content", "both names must show the saved content");
         assert!(!backup.exists() && !new.exists());
@@ -872,6 +919,29 @@ mod tests {
         assert!(lock_data_dir(dir.path()).is_err(), "the folder is in use");
         drop(first);
         assert!(lock_data_dir(dir.path()).is_ok(), "free again after the first copy ends");
+    }
+
+    #[test]
+    fn an_interrupted_save_whose_new_content_is_gone_is_reported_as_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"original content").unwrap();
+        let (new, _backup, handle) = crashed_rewrite(dir.path(), &notes, &a);
+        drop(handle);
+        std::fs::remove_file(&new).unwrap();
+        assert_eq!(recover_rewrites_in(&notes), vec![Recovered { target: a.clone(), finished: false }]);
+        assert_eq!(std::fs::read(&a).unwrap(), b"original content");
+    }
+
+    #[test]
+    fn a_hard_linked_save_without_enough_free_space_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"content").unwrap();
+        let err = ensure_free_space(&a, u64::MAX / 2).unwrap_err();
+        assert!(err.contains("Not enough free space"), "{err}");
+        assert!(ensure_free_space(&a, 1).is_ok());
     }
 
     #[test]

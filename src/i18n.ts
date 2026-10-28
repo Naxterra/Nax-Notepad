@@ -135,6 +135,9 @@ const de: Record<string, string> = {
   "Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}":
     "Nax-Notepad wurde beim Speichern dieser Dateien beendet. Das Speichern wurde jetzt abgeschlossen, sie enthalten also den gespeicherten Text:\n\n{files}",
   "Interrupted save finished": "Unterbrochenes Speichern abgeschlossen",
+  "Interrupted save undone": "Unterbrochenes Speichern zurückgenommen",
+  "Nax-Notepad stopped while saving these files, and the text being saved was no longer there. They have their previous content again. Your text may still be in the tab:\n\n{files}":
+    "Nax-Notepad wurde beim Speichern dieser Dateien beendet, und der zu speichernde Text war nicht mehr vorhanden. Sie haben wieder ihren vorherigen Inhalt. Ihr Text ist eventuell noch im Tab:\n\n{files}",
   "Load images from the internet in Live Preview": "Bilder aus dem Internet in der Live-Vorschau laden",
   '"{name}" is now larger than {size} MB and is shown in pages.': "„{name}“ ist jetzt größer als {size} MB und wird seitenweise angezeigt.",
   '"{name}" was modified outside Nax-Notepad.\nReload it?': "„{name}“ wurde außerhalb von Nax-Notepad geändert.\nNeu laden?",
