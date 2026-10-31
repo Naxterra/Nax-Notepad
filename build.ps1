@@ -68,7 +68,7 @@ if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
 Write-Host "   $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
 $latin1 = [System.Text.Encoding]::GetEncoding(28591)
 $binary = $latin1.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $exe).Path))
-# The installer and the zip contain only this program, LICENSE and README.md, so checking the
+# The installer and the zip contain only this program, LICENSE, THIRD-PARTY-NOTICES.txt and README.md, so checking the
 # program covers them. Neither the profile folder nor the project folder may appear in it.
 foreach ($local in @($env:USERPROFILE, $PSScriptRoot)) {
     foreach ($text in @($local, $local.Replace("\", "/"), $local.Replace("\", "\\"))) {
@@ -91,7 +91,7 @@ $stage = Join-Path ([System.IO.Path]::GetTempPath()) "nax-notepad-portable-$vers
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item $exe (Join-Path $stage "nax-notepad.exe")
-Copy-Item LICENSE, README.md $stage
+Copy-Item LICENSE, THIRD-PARTY-NOTICES.txt, README.md $stage
 Set-Content -Path (Join-Path $stage "portable.txt") -Encoding UTF8 -Value @(
     "Nax-Notepad portable mode.",
     "While this file is next to nax-notepad.exe, settings, session and unsaved text are stored in the data folder here.",

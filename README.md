@@ -65,3 +65,7 @@ The test `saving_through_a_symbolic_link_updates_the_linked_file` needs permissi
 - `src/paged.ts` handles windowed editing of paged documents.
 - `src/ui/*` holds the tab bar, status bar, find panel, menus, dialogs and settings.
 - `installer/Nax-Notepad.iss` is the Inno Setup script.
+
+## License
+
+This software is under the Nax Source-Available License 1.0. You may install and use the official release builds, privately and at work, and you may read the source code. Modifying the software, redistributing it and selling it need the written permission of the owner. See [LICENSE](LICENSE).

@@ -32,7 +32,7 @@ export function openAboutDialog(): void {
       { class: "modal-text" },
       t("A fast tabbed editor with Markdown Live Preview and support for multi-gigabyte files."),
       h("br"),
-      t("Built with Tauri 2 and CodeMirror 6. MIT License."),
+      t("Built with Tauri 2 and CodeMirror 6. Nax Source-Available License 1.0."),
       h("br"),
       h("br"),
       t("Settings, session and unsaved text are stored in"),

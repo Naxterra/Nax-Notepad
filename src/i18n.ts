@@ -263,7 +263,7 @@ const de: Record<string, string> = {
   Version: "Version",
   "A fast tabbed editor with Markdown Live Preview and support for multi-gigabyte files.":
     "Ein schneller Editor mit Tabs, Markdown-Live-Vorschau und Unterstützung für Dateien mit mehreren Gigabyte.",
-  "Built with Tauri 2 and CodeMirror 6. MIT License.": "Erstellt mit Tauri 2 und CodeMirror 6. MIT-Lizenz.",
+  "Built with Tauri 2 and CodeMirror 6. Nax Source-Available License 1.0.": "Erstellt mit Tauri 2 und CodeMirror 6. Nax Source-Available License 1.0.",
   "Settings, session and unsaved text are stored in": "Einstellungen, Sitzung und ungespeicherter Text liegen in",
   "Check for updates": "Nach Updates suchen",
   "Checking for updates…": "Suche nach Updates…",

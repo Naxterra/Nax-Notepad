@@ -1,21 +1,19 @@
-MIT License
+Nax Source-Available License 1.0
 
-Copyright (c) 2026 Naxterra
+Copyright (c) 2026 Naxterra. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Permitted use. You may download, install and run the official release builds of this software for any purpose, including commercial use, on any number of devices you control. You may read and study the source code.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. Reserved rights. Except as stated in section 1, you may not copy, modify, adapt, translate, decompile, create derivative works of, redistribute, sublicense, rent, lease, sell or otherwise commercially exploit the software or its source code, in whole or in part, without the prior written permission of the copyright holder. Linking to the official release page is permitted; redistributing the files themselves is not.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+3. Contributions. If you send changes to the copyright holder, you grant the copyright holder the right to use them under any terms.
+
+4. Trademarks. The names Nax, Naxterra and the names of the individual apps may not be used to promote derived or competing products.
+
+5. Mandatory rights. Nothing in this license limits rights that applicable law grants and that cannot be waived by contract, such as the right in the European Union to decompile for interoperability or to make a backup copy.
+
+6. No warranty. The software is provided "as is", without warranty of any kind, express or implied. In no event shall the copyright holder be liable for any claim, damages or other liability arising from the software or its use.
+
+7. Termination. Any breach of this license ends your rights under it automatically.
+
+8. Third-party components. Components from other authors that are included with the software, such as the .NET runtime and the Windows App SDK, are not covered by this license. They remain under their own licenses, whose texts and notices are included with the software.
