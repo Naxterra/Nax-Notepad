@@ -4,11 +4,21 @@
 // deleted. Larger files are read in chunks on demand and edited by overwriting bytes only. The
 // changes are kept as patches and written by streaming the file through a temporary copy.
 
+import { t } from "./i18n";
+
 export interface ByteSource {
   size: number;
   read(offset: number, len: number): Promise<Uint8Array>;
-  /** Search the source itself (large files; unsaved patches are not searched). */
-  find?(pattern: Uint8Array, from: number, backwards: boolean): Promise<number | null>;
+  /** Search in bounded blocks, applying these unsaved overwrites before matching. */
+  find?(pattern: Uint8Array, from: number, backwards: boolean, patches?: [number, number][]): Promise<number | null>;
+}
+
+export interface HexSnapshot {
+  originalSize: number;
+  /** Complete edited bytes for resizable files, encoded as base64. */
+  bytes?: string;
+  /** Sparse overwrites for large files; the original must still match its recorded stamp. */
+  patches?: [number, number][];
 }
 
 export const FULL_LIMIT = 8 * 1024 * 1024;
@@ -18,6 +28,10 @@ const READ_PIECE = 4 * 1024 * 1024;
 type Op = { kind: "set"; at: number; before: Uint8Array; after: Uint8Array; modBefore?: Uint8Array } | { kind: "insert"; at: number; bytes: Uint8Array } | { kind: "remove"; at: number; bytes: Uint8Array };
 
 export class HexBuffer {
+  /** Byte edits pause while a save writes this buffer and reloads its source. */
+  saving = false;
+  /** Changes even when undo returns to an earlier state (guards asynchronous clipboard work). */
+  revision = 0;
   /** Whether bytes can be inserted and deleted (the file is held in memory). */
   readonly resizable: boolean;
   /** Size of the file when it was loaded. */
@@ -48,10 +62,40 @@ export class HexBuffer {
     if (source.size > fullLimit) return new HexBuffer(source, null);
     const data = new Uint8Array(source.size);
     for (let o = 0; o < source.size; o += READ_PIECE) {
-      const part = await source.read(o, Math.min(READ_PIECE, source.size - o));
-      data.set(part.subarray(0, Math.min(part.length, source.size - o)), o);
+      const len = Math.min(READ_PIECE, source.size - o);
+      const part = await source.read(o, len);
+      if (part.length !== len) throw new Error(t("The file changed while its bytes were being read. Reload it and try again."));
+      data.set(part, o);
     }
     return new HexBuffer(source, data);
+  }
+
+  /** Rebuild a dirty buffer without expanding a large source into memory. */
+  static restore(snapshot: HexSnapshot, source: ByteSource): HexBuffer {
+    const invalid = () => new Error(t("The saved byte changes are damaged and could not be restored."));
+    if (!Number.isSafeInteger(snapshot.originalSize) || snapshot.originalSize < 0 || snapshot.originalSize !== source.size) throw invalid();
+    if ((typeof snapshot.bytes === "string") === Array.isArray(snapshot.patches)) throw invalid();
+    let data: Uint8Array | null = null;
+    if (typeof snapshot.bytes === "string") {
+      if (snapshot.originalSize > FULL_LIMIT) throw invalid();
+      try { data = Uint8Array.from(atob(snapshot.bytes), (ch) => ch.charCodeAt(0)); }
+      catch { throw invalid(); }
+    }
+    const buffer = new HexBuffer(source, data);
+    for (const patch of snapshot.patches ?? []) {
+      if (!Array.isArray(patch) || patch.length !== 2 || !Number.isSafeInteger(patch[0]) || patch[0] < 0 || patch[0] >= source.size || !Number.isInteger(patch[1]) || patch[1] < 0 || patch[1] > 255 || buffer.patches.has(patch[0])) throw invalid();
+      buffer.patches.set(patch[0], patch[1]);
+    }
+    buffer.savedDepth = -1;
+    buffer.mod.fill(1);
+    return buffer;
+  }
+
+  snapshot(): HexSnapshot {
+    if (!this.resizable) return { originalSize: this.originalSize, patches: this.patchList() };
+    let binary = "";
+    for (let i = 0; i < this.data.length; i += 0x8000) binary += String.fromCharCode(...this.data.subarray(i, i + 0x8000));
+    return { originalSize: this.originalSize, bytes: btoa(binary) };
   }
 
   get size(): number {
@@ -80,23 +124,43 @@ export class HexBuffer {
     end = Math.min(end, this.originalSize);
     const waits: Promise<unknown>[] = [];
     for (let i = Math.floor(start / CHUNK); i * CHUNK < end; i++) {
-      if (this.cache.has(i)) continue;
-      let p = this.pending.get(i);
-      if (!p) {
-        p = this.source.read(i * CHUNK, Math.min(CHUNK, this.originalSize - i * CHUNK)).then((b) => {
-          this.cache.set(i, b);
-          this.pending.delete(i);
-          if (this.cache.size > 256) {
-            const first = this.cache.keys().next().value!;
-            if (first !== i) this.cache.delete(first);
-          }
-          return b;
-        });
-        this.pending.set(i, p);
-      }
-      waits.push(p);
+      waits.push(this.chunk(i));
     }
     await Promise.all(waits);
+  }
+
+  private chunk(i: number): Promise<Uint8Array> {
+    const cached = this.cache.get(i);
+    if (cached) return Promise.resolve(cached);
+    let p = this.pending.get(i);
+    if (!p) {
+      const len = Math.min(CHUNK, this.originalSize - i * CHUNK);
+      p = this.source.read(i * CHUNK, len).then((b) => {
+        if (b.length !== len) throw new Error(t("The file changed while its bytes were being read. Reload it and try again."));
+        this.cache.set(i, b);
+        if (this.cache.size > 256) this.cache.delete(this.cache.keys().next().value!);
+        return b;
+      }).finally(() => this.pending.delete(i));
+      this.pending.set(i, p);
+    }
+    return p;
+  }
+
+  /** Copy a range without depending on its chunks remaining in the display cache. */
+  async readSlice(start: number, end: number): Promise<Uint8Array> {
+    start = Math.max(0, Math.min(start, this.size));
+    end = Math.max(start, Math.min(end, this.size));
+    if (this.resizable) return this.data.slice(start, end);
+    const out = new Uint8Array(end - start);
+    for (let at = start; at < end;) {
+      const i = Math.floor(at / CHUNK);
+      const bytes = await this.chunk(i);
+      const to = Math.min(end, (i + 1) * CHUNK);
+      out.set(bytes.subarray(at % CHUNK, at % CHUNK + to - at), at - start);
+      at = to;
+    }
+    for (const [at, byte] of this.patches) if (at >= start && at < end) out[at - start] = byte;
+    return out;
   }
 
   /** The byte at `o`, or undefined if it is not loaded (or beyond the end). */
@@ -116,7 +180,8 @@ export class HexBuffer {
   /** Offset of the next (or previous) occurrence of `pattern` starting at `from`, or null. */
   async find(pattern: Uint8Array, from: number, backwards: boolean): Promise<number | null> {
     if (!pattern.length) return null;
-    if (!this.resizable) return this.source.find ? this.source.find(pattern, Math.max(0, from), backwards) : null;
+    if (backwards && from < 0) return null;
+    if (!this.resizable) return this.source.find ? this.source.find(pattern, Math.max(0, from), backwards, this.patchList()) : null;
     const d = this.data;
     const last = d.length - pattern.length;
     const match = (i: number) => {
@@ -177,6 +242,7 @@ export class HexBuffer {
     if (!op) return null;
     this.revert(op);
     this.redoStack.push(op);
+    this.revision++;
     return op.at;
   }
 
@@ -185,6 +251,7 @@ export class HexBuffer {
     if (!op) return null;
     this.forward(op);
     this.undoStack.push(op);
+    this.revision++;
     return op.kind === "insert" ? op.at + op.bytes.length : op.at;
   }
 
@@ -205,13 +272,14 @@ export class HexBuffer {
 
   private apply(op: Op, record: boolean): void {
     this.forward(op);
+    this.revision++;
     if (!record) return;
     // Merge consecutive single-byte overwrites of the same byte (typing two hex digits).
     const last = this.undoStack[this.undoStack.length - 1];
+    if (this.savedDepth > this.undoStack.length) this.savedDepth = -1;
     if (last && last.kind === "set" && op.kind === "set" && last.at === op.at && last.after.length === op.after.length && this.undoStack.length !== this.savedDepth) {
       last.after = op.after;
     } else {
-      if (this.savedDepth > this.undoStack.length) this.savedDepth = -1;
       this.undoStack.push(op);
     }
     this.redoStack = [];

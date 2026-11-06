@@ -4,9 +4,9 @@
   --editor-font: Cascadia Code, Consolas, monospace;
   --editor-font-size: 14px;
   --lp-font: "Segoe UI", system-ui, sans-serif;
-  --radius: 6px;
-  --radius-sm: 4px;
-  --shadow: 0 10px 32px rgba(0, 0, 0, 0.38), 0 2px 6px rgba(0, 0, 0, 0.22);
+  --radius: 8px;
+  --radius-sm: 5px;
+  --shadow: 0 16px 48px #00000030, 0 2px 8px #00000018;
   --hover: color-mix(in srgb, var(--fg) 7%, transparent);
   --hover-strong: color-mix(in srgb, var(--fg) 11%, transparent);
   --ring: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
@@ -41,6 +41,13 @@ button {
   font: inherit;
   color: inherit;
 }
+button:focus-visible,
+select:focus-visible,
+input[type="checkbox"]:focus-visible,
+[tabindex="0"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 
 .ic {
   display: inline-flex;
@@ -72,7 +79,7 @@ button {
 .titlebar {
   display: flex;
   align-items: center;
-  height: 40px;
+  height: 46px;
   flex: none;
   background: var(--chrome-bg);
   padding-left: 12px;
@@ -89,10 +96,10 @@ button {
   justify-content: flex-end;
 }
 .tb-center {
-  flex: 0 1 460px;
+  flex: 0 1 380px;
   display: flex;
   justify-content: center;
-  min-width: 160px;
+  min-width: 0;
 }
 .tb-logo {
   width: 18px;
@@ -109,10 +116,10 @@ button {
   align-items: center;
   gap: 8px;
   width: 100%;
-  height: 28px;
+  height: 30px;
   padding: 0 6px 0 10px;
   background: var(--input-bg);
-  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
   border-radius: var(--radius);
   color: var(--fg-muted);
   cursor: text;
@@ -132,6 +139,7 @@ button {
 .tb-key {
   display: flex;
   gap: 3px;
+  flex: none;
 }
 kbd {
   font: 11px var(--ui-font);
@@ -167,11 +175,14 @@ kbd {
   align-items: center;
   gap: 2px;
   background: var(--chrome-bg);
-  height: 30px;
+  height: 32px;
   flex: none;
-  padding: 0 6px;
+  padding: 0 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 .menu-btn {
+  flex: none;
   background: none;
   border: none;
   color: var(--fg);
@@ -258,6 +269,7 @@ kbd {
   display: flex;
 }
 .pane {
+  container-type: inline-size;
   flex: 1;
   min-width: 0;
   display: flex;
@@ -278,15 +290,19 @@ kbd {
   display: flex;
   background: var(--chrome-bg);
   border-bottom: 1px solid var(--border);
-  height: 38px;
+  height: 42px;
   flex: none;
   align-items: stretch;
+  padding: 5px 6px 0;
+  gap: 4px;
 }
 .tab-strip {
   display: flex;
   overflow-x: auto;
   overflow-y: hidden;
   flex: 1;
+  min-width: 0;
+  gap: 3px;
   scrollbar-width: none;
 }
 .tab-strip::-webkit-scrollbar {
@@ -300,10 +316,11 @@ kbd {
   color: var(--tab-fg);
   white-space: nowrap;
   cursor: default;
-  min-width: 110px;
+  flex: 0 0 auto;
+  min-width: 120px;
   max-width: 240px;
   position: relative;
-  border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 8px 8px 0 0;
   transition: background 0.1s, color 0.1s;
 }
 .tab:hover {
@@ -317,8 +334,8 @@ kbd {
 .tab.active::after {
   content: "";
   position: absolute;
-  left: 8px;
-  right: 8px;
+  left: 16px;
+  right: 16px;
   bottom: 0;
   height: 2px;
   border-radius: 2px 2px 0 0;
@@ -332,7 +349,7 @@ kbd {
 }
 .tab.active .tab-icon {
   opacity: 1;
-  color: var(--accent);
+  color: var(--fg-muted);
 }
 .tab.pinned .tab-name::before {
   content: "📌 ";
@@ -366,6 +383,13 @@ kbd {
 }
 .tab.dirty:hover .tab-close {
   display: inline-flex;
+}
+.tab.dirty:focus-within .tab-close {
+  display: inline-flex;
+  opacity: 1;
+}
+.tab.dirty:focus-within .tab-dot {
+  display: none;
 }
 .tab-close {
   background: none;
@@ -410,6 +434,9 @@ kbd {
   border: none;
   color: var(--tab-fg);
   width: 38px;
+  flex: none;
+  border-radius: var(--radius);
+  margin: 0 0 4px;
   cursor: default;
   display: flex;
   align-items: center;
@@ -426,10 +453,10 @@ kbd {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  height: 42px;
+  min-height: 48px;
   flex: none;
-  padding: 0 10px 0 14px;
-  border-bottom: 1px solid var(--border);
+  padding: 7px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
   background: var(--bg);
 }
 .crumbs {
@@ -477,7 +504,12 @@ kbd {
   align-items: center;
   gap: 8px;
   flex: none;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
+.doc-controls > * { flex-shrink: 0; }
 .seg {
   display: inline-flex;
   padding: 2px;
@@ -500,9 +532,9 @@ kbd {
   background: var(--hover);
 }
 .seg-btn.on {
-  background: var(--accent-soft);
+  background: var(--bg-elev2);
   color: var(--fg);
-  box-shadow: inset 0 -2px 0 var(--accent);
+  box-shadow: 0 1px 3px #00000018;
 }
 .seg.small .seg-btn {
   padding: 1px 8px;
@@ -514,8 +546,8 @@ kbd {
   gap: 6px;
   height: 30px;
   padding: 0 11px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius);
   color: var(--fg-muted);
   cursor: default;
@@ -527,7 +559,8 @@ kbd {
 }
 .tool-btn.on {
   color: var(--fg);
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 25%, transparent);
 }
 .tool-label {
   display: inline-flex;
@@ -565,6 +598,31 @@ kbd {
 .icon-btn:hover {
   background: var(--hover-strong);
   color: var(--fg);
+}
+
+/* Toolbars adapt to each pane, including two narrow panes in a wide window. */
+@container (max-width: 760px) {
+  .doc-toolbar { flex-wrap: wrap; gap: 6px; }
+  .crumbs { flex-basis: 100%; }
+  .doc-controls { width: 100%; padding-bottom: 2px; }
+}
+@media (max-width: 640px) {
+  .tb-left { flex: 0 0 auto; }
+  .tb-name, .tb-key { display: none; }
+  .tb-center { flex: 1; margin: 0 12px 0 0; }
+  .tb-right { flex: none; }
+  .sidebar { width: 36vw; }
+  .find-modes, .find-spacer { width: auto; }
+  .find-spacer { display: none; }
+  .settings-row { flex-wrap: wrap; }
+  .settings-row .input { max-width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* ---- editor ---- */
@@ -1003,18 +1061,22 @@ kbd {
   justify-content: space-between;
   background: var(--status-bg);
   color: var(--status-fg);
-  height: 28px;
+  height: 30px;
   flex: none;
   font-size: 12px;
   align-items: center;
   padding: 0 6px;
   border-top: 1px solid var(--border);
+  gap: 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 .sb-left,
 .sb-right {
   display: flex;
   align-items: center;
   height: 100%;
+  flex: none;
 }
 .sb-item {
   padding: 0 10px;
@@ -1077,12 +1139,12 @@ kbd {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(3, 8, 18, 0.45);
-  backdrop-filter: blur(2px);
+  background: #00000038;
+  backdrop-filter: blur(6px);
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 11vh;
+  padding: 8vh 16px 16px;
   z-index: 2000;
   animation: fade 0.12s ease-out;
 }
@@ -1097,16 +1159,18 @@ kbd {
   border: 1px solid var(--border);
   border-radius: 12px;
   box-shadow: var(--shadow);
-  min-width: 380px;
-  max-width: 80vw;
-  padding: 18px 20px;
+  min-width: min(380px, 100%);
+  max-width: min(760px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  padding: 24px;
   outline: none;
   animation: pop 0.12s ease-out;
 }
 .modal-title {
-  font-size: 15px;
+  font-size: 18px;
   font-weight: 600;
-  margin-bottom: 12px;
+  margin-bottom: 18px;
 }
 .modal-text {
   white-space: pre-wrap;
@@ -1122,7 +1186,8 @@ kbd {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 18px;
+  margin-top: 24px;
+  flex-wrap: wrap;
 }
 .modal.picker {
   width: 620px;
@@ -1173,29 +1238,32 @@ kbd {
   padding-right: 6px;
 }
 .settings-body h3 {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--fg-muted);
-  margin: 16px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 24px 0 8px;
 }
+.settings-body h3:first-child { margin-top: 2px; }
 .settings-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 5px 0;
+  padding: 10px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
   gap: 12px;
 }
 .settings-row .input {
   width: 220px;
+  max-width: 55%;
 }
 .settings-row .input.wide {
   width: 340px;
 }
 .settings-row input[type="checkbox"] {
   accent-color: var(--accent);
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
+  flex: none;
 }
 .settings-actions {
   display: flex;

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="UTF-8"><title>Nax-Notepad UI tests</title></head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
+      mockWindows("main");
+      const language = new URLSearchParams(location.search).get("language") ?? "en";
+      // Exercise the real frontend with no access to the user's files or profile.
+      mockIPC((cmd) => {
+        switch (cmd) {
+          case "settings_load": return { language, theme: "nax-dark", checkUpdates: false };
+          case "session_load": return { tabs: [], active: null, next_untitled: 1 };
+          case "session_buffer_epoch": return 1;
+          case "finished_saves": return { finished: [], failed: [] };
+          case "startup_files": return [];
+          case "plugin:window|is_maximized": return false;
+          default: return null;
+        }
+      }, { shouldMockEvents: true });
+      await import("/src/main.ts");
+      window.dialogs = await import("/src/ui/dialogs.ts");
+      window.themes = await import("/src/theme.ts");
+    </script>
+  </body>
+</html>

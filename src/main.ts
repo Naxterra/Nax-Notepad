@@ -124,7 +124,7 @@ async function main(): Promise<void> {
           pane.view.dom.style.display = split ? "" : "none";
           try {
             const info = await app.hexFor(tab);
-            if (pane.tab !== tab) continue;
+            if (pane.tab !== tab || !tab.hexView) continue;
             const isNew = hex.buffer !== info.buffer || hexTab[i] !== tab || !hex.visible;
             hexTab[i] = tab;
             hex.show(

@@ -11,7 +11,7 @@ import { LanguageDescription } from "@codemirror/language";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog, message } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { backend, E_EXTERNAL_CHANGE, E_HARD_LINKS, E_READ_ONLY_ENCODING, E_UNREPRESENTABLE, Eol, errorText, OpenResult, SaveResult, SessionData, TabMeta } from "./backend";
+import { backend, E_EXTERNAL_CHANGE, E_HARD_LINKS, E_READ_ONLY_ENCODING, E_UNREPRESENTABLE, Eol, errorText, HexRecovery, HexStamp, OpenResult, SaveResult, SessionData, TabMeta } from "./backend";
 import { bookmarkLines, setBookmarks } from "./bookmarks";
 import { compartments, createState, indentExt, languageByName, languageForFile, loadLanguage, systemChange } from "./editor";
 import { HexBuffer } from "./hexbuffer";
@@ -86,6 +86,10 @@ export interface Tab {
   hex?: HexBuffer;
   /** What `hex` was loaded from (file size and time, or the unsaved text). */
   hexKey?: string;
+  hexStamp?: HexStamp;
+  hexRecoveryRevision?: number;
+  hexRecoveryTimer?: number;
+  hexLoading?: { key: string; promise: Promise<{ buffer: HexBuffer; stamp?: HexStamp }> };
   /** The text is read-only because the file has bytes that are invalid in its encoding. */
   invalidBytes?: boolean;
 }
@@ -114,6 +118,10 @@ interface ClosedTab {
 /** Same file time, also accepting legacy session values stored in whole seconds. */
 function sameMtime(disk: number, known: number): boolean {
   return disk === known || (known > 0 && known < 1e11 && Math.floor(disk / 1000) === known);
+}
+
+function sameHexStamp(a: HexStamp, b: HexStamp): boolean {
+  return a.size === b.size && a.mtime === b.mtime && a.fingerprint === b.fingerprint;
 }
 
 /** Marks an edit copied from a tab to its clone (or back), so it is not mirrored again. */
@@ -269,7 +277,7 @@ export class App {
     this.focused = i;
     this.view = this.panes[i].view;
     this.active = this.panes[i].tab;
-    this.panes.forEach((p, k) => p.host.parentElement?.classList.toggle("focused", k === i));
+    this.panes.forEach((p, k) => p.host.closest(".pane")?.classList.toggle("focused", k === i));
     if (focusView) this.view.focus();
     this.emit("active");
     this.emit("tabs");
@@ -311,7 +319,8 @@ export class App {
   setSplit(on: boolean): void {
     if (this.splitOn === on) return;
     this.splitOn = on;
-    this.panes[1].host.parentElement!.style.display = on ? "" : "none";
+    const container = this.panes[1].host.closest<HTMLElement>(".pane");
+    if (container) container.style.display = on ? "" : "none";
     this.emit("layout");
   }
 
@@ -507,7 +516,7 @@ export class App {
   /** Read-only for editing: the tab setting or a window of a large file that cannot be edited. */
   effectiveReadOnly(tab: Tab): boolean {
     // In the hex view the text editor is hidden: nothing may change the text behind it.
-    return tab.readOnly || !!tab.paged?.windowReadOnly || (tab.hexView && !tab.splitView);
+    return tab.readOnly || !!tab.paged?.windowReadOnly || (tab.hexView && !tab.splitView) || !!this.owner(tab).hex?.dirty || !!this.owner(tab).hex?.saving;
   }
 
   private applyReadOnly(tab: Tab): void {
@@ -831,6 +840,7 @@ export class App {
       this.scheduleSessionSave();
       return true;
     }
+    await tab.saveChain;
     if (!force && tab.dirty) {
       this.activate(tab);
       const r = await confirm3(t("Save changes?"), t('Save changes to "{name}" before closing?', { name: tab.name }));
@@ -838,9 +848,21 @@ export class App {
       if (r === "yes") {
         const ok = await this.save(tab);
         if (!ok) return false;
+        if (tab.dirty) {
+          toast(t('"{name}" was changed during saving and has been kept open. Save the latest changes before closing.', { name: tab.name }), 6000);
+          return false;
+        }
       }
     }
     if (!this.tabs.includes(tab)) return true;
+    const rev = tab.revision;
+    const hex = tab.hex;
+    const hexRev = hex?.revision;
+    await this.dropHexRecovery(tab);
+    if (tab.revision !== rev || tab.hex !== hex || tab.hex?.revision !== hexRev) {
+      toast(t("The document changed again. Its latest changes have been kept."), 6000);
+      return false;
+    }
     this.rememberClosed(tab);
     for (const c of this.clonesOf(tab)) this.removeTab(c);
     if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
@@ -910,11 +932,16 @@ export class App {
   }
 
   save(tab: Tab): Promise<boolean> {
+    const byteView = tab.hexView && !tab.splitView;
     tab = this.owner(tab);
-    if (tab.hex?.dirty && tab.path) return this.serial(tab, () => this.writeHex(tab));
     if (!tab.path) return this.saveAs(tab);
-    const path = tab.path;
-    return this.serial(tab, () => this.writeTab(tab, path, false));
+    return this.serial(tab, () => {
+      // A queued Save As may have changed the path or finished saving the byte buffer.
+      if (tab.hex?.dirty) return this.writeHex(tab);
+      // Saving an unchanged byte view must not re-encode the decoded, hidden text.
+      if (byteView && tab.revision === tab.savedRevision) return Promise.resolve(true);
+      return this.writeTab(tab, tab.path!, false);
+    });
   }
 
   /**
@@ -970,7 +997,7 @@ export class App {
   private markSaved(tab: Tab, rev: number): void {
     tab.savedRevision = rev;
     const clean = tab.revision === rev;
-    tab.dirty = !clean;
+    tab.dirty = !clean || !!tab.hex?.dirty;
     if (clean) {
       if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
       tab.bufferTimer = undefined;
@@ -1049,13 +1076,21 @@ export class App {
   }
 
   async saveAs(tab: Tab): Promise<boolean> {
+    const byteView = tab.hexView && !tab.splitView;
     tab = this.owner(tab);
     const target = await saveDialog({
       defaultPath: tab.path ?? `${tab.name}${tab.untitled !== null ? ".txt" : ""}`,
       title: t("Save As"),
     });
     if (!target) return false;
-    return this.serial(tab, () => this.writeTab(tab, target, true));
+    return this.serial(tab, async () => {
+      // The dialog and earlier saves can yield to new byte edits or a mode change.
+      if (tab.hex?.dirty || (byteView && tab.path && tab.revision === tab.savedRevision)) {
+        await this.hexFor(tab);
+        return this.writeHex(tab, target, true);
+      }
+      return this.writeTab(tab, target, true);
+    });
   }
 
   async saveAll(): Promise<void> {
@@ -1075,12 +1110,20 @@ export class App {
   async reload(tab: Tab, encoding: string | null = null): Promise<void> {
     tab = this.owner(tab);
     if (!tab.path) return;
+    const rev = tab.revision;
+    const hex = tab.hex;
+    const hexRev = hex?.revision;
+    const changed = () => tab.revision !== rev || tab.hex !== hex || tab.hex?.revision !== hexRev;
     if (tab.kind === "paged" && tab.paged) {
-      tab.hex = undefined;
-      tab.hexKey = undefined;
       // Opening under the same id replaces the document only when the file could be opened, so
       // a failed reload keeps the current one.
       const res = await backend.openPath(tab.id, tab.path, true, encoding);
+      if (changed()) {
+        toast(t("The reload was stopped because the document was changed while the file was being read."), 6000);
+        return;
+      }
+      tab.hex = undefined;
+      tab.hexKey = undefined;
       tab.paged.resetRevisions();
       tab.paged.totalLines = res.lineCount ?? 1;
       tab.mtime = res.mtime;
@@ -1093,24 +1136,23 @@ export class App {
       await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
       this.applyReadOnly(tab);
     } else {
-      const rev = tab.revision;
       const res = await backend.openPath(tab.id, tab.path, false, encoding);
-      if (tab.revision !== rev) {
+      if (changed()) {
         // Typed while the file was read: keep that text instead of replacing it. A file that
         // grew past the size limit was opened as a large document; close it again, or its
         // memory map would block saving this tab.
         if (res.kind === "paged") await backend.pagedClose(tab.id);
-        toast(t("The reload was stopped because the text was changed while the file was being read."), 6000);
+        toast(t("The reload was stopped because the document was changed while the file was being read."), 6000);
+        return;
+      }
+      if (res.kind === "paged") {
+        if (!(await this.becomePaged(tab, res, changed))) return;
+        await this.finishReload(tab, rev);
+        if (tab.tail) await this.restartFollow(tab);
         return;
       }
       tab.hex = undefined;
       tab.hexKey = undefined;
-      if (res.kind === "paged") {
-        await this.becomePaged(tab, res);
-        this.finishReload(tab);
-        if (tab.tail) await this.restartFollow(tab);
-        return;
-      }
       const state = this.stateOf(tab);
       const head = state.selection.main.head;
       this.dispatchTo(tab, {
@@ -1129,15 +1171,15 @@ export class App {
         toast(t('"{name}" contains bytes that are not valid {encoding}. It was opened read-only so saving cannot change them. Use the tab menu to allow editing.', { name: tab.name, encoding: res.encoding }), 8000);
       }
     }
-    this.finishReload(tab);
+    await this.finishReload(tab, rev);
     if (tab.tail) await this.restartFollow(tab);
   }
 
-  private finishReload(tab: Tab): void {
-    tab.savedRevision = tab.revision;
-    tab.dirty = false;
+  private async finishReload(tab: Tab, rev = tab.revision): Promise<void> {
+    await this.dropHexRecovery(tab);
+    this.markSaved(tab, rev);
     tab.externalAck = undefined;
-    void backend.sessionDropBuffer(tab.id, bufferGeneration(tab.revision));
+    this.applyReadOnly(tab);
     this.emit("tabs");
     this.emit("status");
   }
@@ -1146,11 +1188,30 @@ export class App {
    * Turn a memory tab into a paged one after its file grew beyond the size limit; `res` is the
    * paged document the backend opened. The text is never loaded into a JS string.
    */
-  private async becomePaged(tab: Tab, res: OpenResult): Promise<void> {
+  private async becomePaged(tab: Tab, res: OpenResult, changed: () => boolean): Promise<boolean> {
+    // Fetch everything before replacing the in-memory tab: editing stays safe while IPC or
+    // a language import is pending, and a failed first window leaves the old document intact.
+    let w: Awaited<ReturnType<typeof backend.pagedWindow>>;
+    let langExt: Extension;
+    try {
+      w = await backend.pagedWindow(tab.id, 0, Math.max(500, settings.pagedWindowLines));
+      const desc = tab.languageName ? languageByName(tab.languageName) : null;
+      langExt = desc ? await loadLanguage(desc) : [];
+    } catch (e) {
+      await backend.pagedClose(tab.id);
+      throw e;
+    }
+    if (changed()) {
+      await backend.pagedClose(tab.id);
+      toast(t("The reload was stopped because the document was changed while the file was being read."), 6000);
+      return false;
+    }
     for (const c of this.clonesOf(tab)) this.removeTab(c);
     if (tab.bufferTimer) clearTimeout(tab.bufferTimer);
     tab.bufferTimer = undefined;
     tab.kind = "paged";
+    tab.hex = undefined;
+    tab.hexKey = undefined;
     tab.encoding = res.encoding;
     tab.eol = res.eol;
     tab.mtime = res.mtime;
@@ -1158,13 +1219,10 @@ export class App {
     tab.lockedReadOnly = res.readOnlyReason === "encoding" ? t("Large files in {encoding} can be viewed but not edited yet.", { encoding: res.encoding }) : undefined;
     if (tab.lockedReadOnly) tab.readOnly = true;
     tab.paged = new PagedController(tab.id, res.lineCount ?? 1, this.pagedHost(tab));
-    const w = await backend.pagedWindow(tab.id, 0, Math.max(500, settings.pagedWindowLines));
     tab.paged.firstLine = w.firstLine;
     tab.paged.count = w.count;
     tab.paged.totalLines = w.totalLines;
     tab.paged.windowReadOnly = w.truncated || w.lossy;
-    const desc = tab.languageName ? languageByName(tab.languageName) : null;
-    const langExt: Extension = desc ? await loadLanguage(desc) : [];
     tab.state = this.buildState(tab, windowText(w.text), langExt, 0);
     const view = this.viewOf(tab);
     if (view) {
@@ -1173,6 +1231,7 @@ export class App {
     }
     this.applyReadOnly(tab);
     toast(t('"{name}" is now larger than {size} MB and is shown in pages.', { name: tab.name, size: 48 }), 6000);
+    return true;
   }
 
   /** "Reopen with Encoding": decode the file again with `encoding`, discarding edits after asking. */
@@ -1378,6 +1437,10 @@ export class App {
 
   /** "Convert to Encoding": the text is written in `enc` on the next save. */
   setEncoding(tab: Tab, enc: string): void {
+    if (this.effectiveReadOnly(tab) || this.owner(tab).readOnly) {
+      toast(t("This document is read-only."));
+      return;
+    }
     tab = this.owner(tab);
     if (tab.kind !== "memory") {
       toast(t("Converting large files to another encoding is not supported yet."));
@@ -1392,6 +1455,10 @@ export class App {
   }
 
   async setEol(tab: Tab, eol: Eol): Promise<void> {
+    if (this.effectiveReadOnly(tab) || this.owner(tab).readOnly) {
+      toast(t("This document is read-only."));
+      return;
+    }
     tab = this.owner(tab);
     if (tab.lockedReadOnly) {
       toast(tab.lockedReadOnly);
@@ -1460,7 +1527,16 @@ export class App {
       const r = await confirm3(t("Unsaved byte changes"), t('Save the changes made in the hex view of "{name}"?', { name: own.name }), [t("Save"), t("Discard")]);
       if (r === "cancel") return;
       if (r === "yes" && !(await this.save(own))) return;
-      if (r === "no") this.discardHex(own);
+      if (r === "no") {
+        const hex = own.hex;
+        const rev = hex?.revision;
+        await this.dropHexRecovery(own);
+        if (own.hex !== hex || own.hex?.revision !== rev) {
+          toast(t("The document changed again. Its latest changes have been kept."), 6000);
+          return;
+        }
+        this.discardHex(own);
+      }
     }
     tab.hexView = mode !== "text";
     tab.splitView = mode === "split";
@@ -1476,44 +1552,105 @@ export class App {
     const textDirty = own.revision !== own.savedRevision || !own.path;
     const key = textDirty ? `text:${own.revision}` : `file:${own.path}:${own.size}:${own.mtime}`;
     if (!own.hex || (!own.hex.dirty && own.hexKey !== key)) {
-      if (textDirty) {
-        const bytes = new TextEncoder().encode(this.docText(own));
-        own.hex = await HexBuffer.load({ size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) });
-      } else {
-        const path = own.path!;
-        const size = await backend.fileSize(path);
-        own.hex = await HexBuffer.load({ size, read: (o, l) => backend.readBytes(path, o, l), find: (pattern, from, backwards) => backend.findBytes(path, pattern, from, backwards) });
+      if (own.hexLoading?.key !== key) {
+        own.hexLoading = { key, promise: (async () => {
+          if (textDirty) {
+            const bytes = new TextEncoder().encode(this.docText(own));
+            return { buffer: await HexBuffer.load({ size: bytes.length, read: async (o, l) => bytes.subarray(o, o + l) }) };
+          }
+          const path = own.path!;
+          const stamp = await backend.hexSourceStamp(path);
+          return { buffer: await HexBuffer.load(this.hexSource(path, stamp.size)), stamp };
+        })() };
       }
-      own.hexKey = key;
+      const pending = own.hexLoading;
+      try {
+        const loaded = await pending.promise;
+        const currentKey = own.revision !== own.savedRevision || !own.path ? `text:${own.revision}` : `file:${own.path}:${own.size}:${own.mtime}`;
+        if (currentKey !== key || own.hexLoading !== pending) return this.hexFor(tab);
+        if (!own.hex?.dirty) {
+          own.hex = loaded.buffer;
+          own.hexStamp = loaded.stamp;
+          own.hexKey = key;
+        }
+      } finally {
+        if (own.hexLoading === pending) own.hexLoading = undefined;
+      }
     }
     let readOnly: string | null = null;
     if (tab.splitView) readOnly = t("In the split view the bytes are shown for inspection. Choose Hex to edit them.");
     else if (own.hexKey?.startsWith("text:")) readOnly = t("The hex view shows the unsaved text as UTF-8. Save the document to edit the bytes of the file.");
     else if (own.readOnly && !own.lockedReadOnly && !own.invalidBytes) readOnly = t("This document is read-only.");
     const name = own.name + (readOnly && own.hexKey?.startsWith("text:") ? ` (${t("unsaved")}, UTF-8)` : "");
-    return { buffer: own.hex, name, readOnly };
+    return { buffer: own.hex!, name, readOnly };
   }
 
   /** The hex view changed bytes: the tab is dirty while they are unsaved. */
   noteHexChange(tab: Tab): void {
     const own = this.owner(tab);
+    own.hexRecoveryRevision = (own.hexRecoveryRevision ?? 0) + 1;
     const dirty = !!own.hex?.dirty || own.revision !== own.savedRevision;
     if (dirty !== own.dirty) {
       own.dirty = dirty;
+      this.applyReadOnly(own);
       this.emit("tabs");
     }
     this.emit("status");
+    if (own.hex?.dirty) this.scheduleHexRecovery(own);
+    else void this.dropHexRecovery(own).catch((e) => this.reportBackgroundError(own, e));
+    this.scheduleSessionSave();
+  }
+
+  private hexSource(path: string, size: number) {
+    return { size, read: (o: number, l: number) => backend.readBytes(path, o, l), find: (pattern: Uint8Array, from: number, backwards: boolean, patches?: [number, number][]) => backend.findBytes(path, pattern, from, backwards, patches) };
+  }
+
+  private scheduleHexRecovery(tab: Tab): void {
+    if (tab.hexRecoveryTimer) clearTimeout(tab.hexRecoveryTimer);
+    tab.hexRecoveryTimer = window.setTimeout(() => {
+      tab.hexRecoveryTimer = undefined;
+      void this.storeHexRecovery(tab).catch((e) => this.reportBackgroundError(tab, e));
+    }, 700);
+  }
+
+  private async storeHexRecovery(tab: Tab): Promise<void> {
+    // Capture synchronously. Edits arriving during IPC belong to the next generation.
+    if (!tab.hex?.dirty) return;
+    const recovery: HexRecovery = { version: 1, tab: this.tabMeta(tab), buffer: tab.hex.snapshot(), stamp: tab.hexStamp };
+    await backend.sessionStoreHex(tab.id, recovery, bufferGeneration(tab.hexRecoveryRevision ?? 0));
+  }
+
+  private async dropHexRecovery(tab: Tab): Promise<void> {
+    if (tab.hexRecoveryRevision === undefined && !tab.hexRecoveryTimer) return;
+    if (tab.hexRecoveryTimer) clearTimeout(tab.hexRecoveryTimer);
+    tab.hexRecoveryTimer = undefined;
+    tab.hexRecoveryRevision = (tab.hexRecoveryRevision ?? 0) + 1;
+    await backend.sessionDropHex(tab.id, bufferGeneration(tab.hexRecoveryRevision));
   }
 
   private discardHex(tab: Tab): void {
     tab.hex = undefined;
     tab.hexKey = undefined;
+    tab.hexStamp = undefined;
     tab.dirty = tab.revision !== tab.savedRevision;
+    this.applyReadOnly(tab);
     this.emit("tabs");
   }
 
   /** Write the bytes edited in the hex view, then load the file again. */
-  private async writeHex(tab: Tab): Promise<boolean> {
+  private async writeHex(tab: Tab, target = tab.path!, isSaveAs = false): Promise<boolean> {
+    const buf = tab.hex!;
+    buf.saving = true;
+    this.applyReadOnly(tab);
+    try {
+      return await this.writeHexNow(tab, target, isSaveAs);
+    } finally {
+      buf.saving = false;
+      this.applyReadOnly(tab);
+    }
+  }
+
+  private async writeHexNow(tab: Tab, target: string, isSaveAs: boolean): Promise<boolean> {
     const buf = tab.hex!;
     const path = tab.path!;
     if (tab.revision !== tab.savedRevision) {
@@ -1522,13 +1659,17 @@ export class App {
     }
     const paged = tab.kind === "paged";
     try {
+      if (tab.hexStamp && (!isSaveAs || !buf.resizable)) {
+        const stamp = await backend.hexSourceStamp(path);
+        if (!sameHexStamp(stamp, tab.hexStamp)) throw new Error(E_EXTERNAL_CHANGE + path);
+      }
       // A large file is memory-mapped; Windows cannot replace it while the mapping is open.
       if (paged) {
         tab.paged?.resetRevisions();
         await backend.pagedClose(tab.id);
       }
-      if (buf.resizable) await backend.writeBytes(path, buf.bytes(), tab.mtime);
-      else await backend.patchFile(path, buf.patchList(), buf.originalSize, tab.mtime);
+      if (buf.resizable) await backend.writeBytes(target, buf.bytes().slice(), isSaveAs ? 0 : tab.mtime, isSaveAs ? undefined : buf.originalSize);
+      else await backend.patchFile(path, buf.patchList(), buf.originalSize, tab.mtime, isSaveAs ? target : undefined);
     } catch (e) {
       if (paged) await this.reopenPaged(tab).catch(() => undefined);
       const msg = errorText(e);
@@ -1537,9 +1678,20 @@ export class App {
       } else await message(msg, { title: t("Save failed"), kind: "error" });
       return false;
     }
+    tab.path = target;
+    tab.name = basename(target);
+    if (isSaveAs) tab.untitled = null;
+    for (const c of this.clonesOf(tab)) {
+      c.path = tab.path;
+      c.name = tab.name;
+      c.untitled = tab.untitled;
+    }
+    await this.dropHexRecovery(tab);
     this.discardHex(tab);
     await this.reload(tab);
-    this.addRecent(path);
+    if (isSaveAs) await this.applyLanguage(tab, languageForFile(tab.name));
+    this.addRecent(target);
+    this.scheduleSessionSave();
     return true;
   }
 
@@ -1651,6 +1803,7 @@ export class App {
       eol: tab.eol,
       languageName: tab.languageName,
       dirty: tab.dirty,
+      hexDirty: !!tab.hex?.dirty,
       livePreview: tab.livePreview,
       hexView: tab.hexView,
       splitView: tab.splitView,
@@ -1706,12 +1859,20 @@ export class App {
     const errors: string[] = [];
     for (const tab of this.tabs) {
       if (tab.cloneOf) continue;
+      await tab.saveChain;
       if (tab.bufferTimer) {
         clearTimeout(tab.bufferTimer);
         tab.bufferTimer = undefined;
       }
-      if (tab.hex?.dirty) errors.push(`${tab.name}: ${t("byte changes in the hex view cannot be kept for recovery. Save them first.")}`);
+      if (tab.hexRecoveryTimer) clearTimeout(tab.hexRecoveryTimer);
+      tab.hexRecoveryTimer = undefined;
       try {
+        for (let attempt = 0; tab.hex?.dirty; attempt++) {
+          const rev = tab.hexRecoveryRevision ?? 0;
+          await this.storeHexRecovery(tab);
+          if ((tab.hexRecoveryRevision ?? 0) === rev) break;
+          if (attempt >= 4) throw new Error(t("The bytes kept changing while recovery was being stored. Please try again."));
+        }
         if (tab.revision !== tab.savedRevision && tab.kind === "memory") await backend.sessionStoreBuffer(tab.id, this.docText(tab), bufferGeneration(tab.revision));
         if (tab.kind === "paged" && tab.paged) {
           await tab.paged.commit();
@@ -1756,7 +1917,7 @@ export class App {
           else if ((meta as { shown?: boolean }).shown) shownOther = tab;
         } catch (e) {
           console.warn("restore failed for", meta.path, e);
-          if ((meta as { dirty?: boolean }).dirty) await this.keepForLater(meta);
+          if ((meta as { dirty?: boolean }).dirty) await this.keepForLater(meta, errorText(e));
         }
       }
       if (this.tabs.length === 0) return false;
@@ -1779,7 +1940,7 @@ export class App {
       this.scheduleSessionSave();
       this.reportRestoreProblems();
       if (unmatched.length) {
-        void message(t("The session file was damaged. These saved changes to large files can no longer be matched to their files. They are kept for 30 days:\n\n{files}", { files: unmatched.join("\n") }), {
+        void message(t("These saved file changes can no longer be matched to their files. The recovery files have been kept:\n\n{files}", { files: unmatched.join("\n") }), {
           title: t("Unsaved changes kept"),
           kind: "warning",
         });
@@ -1809,7 +1970,7 @@ export class App {
    * Keep the session entry of an unsaved tab that cannot be restored now, if its recovery data
    * exists (without it there is nothing to keep); give up after 30 days.
    */
-  private async keepForLater(meta: TabMeta): Promise<void> {
+  private async keepForLater(meta: TabMeta, reason?: string): Promise<void> {
     const name = meta.path ?? (meta as { name?: string }).name ?? meta.id;
     // One entry per tab: a kept entry that is tried again replaces itself, or goes when lost.
     this.keptMetas = this.keptMetas.filter((m) => m.id !== meta.id);
@@ -1824,7 +1985,7 @@ export class App {
       return;
     }
     this.keptMetas.push({ ...meta, keptSince: since } as TabMeta);
-    this.notRestored.push(name);
+    this.notRestored.push(reason ? `${name}: ${reason}` : name);
   }
 
   private async restoreTab(meta: TabMeta): Promise<Tab | null> {
@@ -1834,6 +1995,7 @@ export class App {
       eol?: Eol;
       languageName?: string | null;
       dirty?: boolean;
+      hexDirty?: boolean;
       livePreview?: boolean;
       hexView?: boolean;
       splitView?: boolean;
@@ -1849,7 +2011,10 @@ export class App {
     };
     const pane: 0 | 1 = m.pane === 1 && this.splitOn ? 1 : 0;
     let tab: Tab | null = null;
-    if (meta.kind === "paged" && meta.path) {
+    const hexRecovery = await backend.sessionLoadHex(meta.id);
+    if (hexRecovery) {
+      tab = await this.restoreHexTab(meta, hexRecovery, pane);
+    } else if (meta.kind === "paged" && meta.path) {
       // The recovery log of a large file only describes changes to the file it was made for. A
       // missing file may be on a drive that is not connected, so the log is kept for a while.
       if (!(await backend.pathExists(meta.path))) {
@@ -1900,7 +2065,7 @@ export class App {
     }
     if (!tab) return null;
     tab.pinned = m.pinned ?? false;
-    tab.splitView = !!m.splitView && tab.hexView;
+    tab.splitView = !hexRecovery && !!m.splitView && tab.hexView;
     if (m.encoding && tab.kind === "memory") tab.encoding = m.encoding;
     if (m.eol) tab.eol = m.eol;
     if (m.readOnly) tab.readOnly = true;
@@ -1911,6 +2076,41 @@ export class App {
     if (m.bookmarks?.length && tab.kind === "memory") tab.state = tab.state.update({ effects: setBookmarks.of(m.bookmarks) }).state;
     tab.scrollTop = m.scrollTop ?? 0;
     if (m.cursorLine) tab.pendingCursor = { line: m.cursorLine, col: m.cursorCol ?? 0 };
+    return tab;
+  }
+
+  private async restoreHexTab(meta: TabMeta, recovery: HexRecovery, pane: 0 | 1): Promise<Tab> {
+    if (recovery.version !== 1 || recovery.tab?.id !== meta.id || typeof recovery.tab.path !== "string" || !recovery.tab.path || !recovery.buffer) throw new Error(t("The saved byte changes are damaged and could not be restored."));
+    const path = recovery.tab.path;
+    const source = this.hexSource(path, recovery.buffer.originalSize);
+    const buffer = HexBuffer.restore(recovery.buffer, source);
+    const resizable = buffer.resizable;
+    if (!resizable) {
+      const stamp = await backend.hexSourceStamp(path);
+      if (!recovery.stamp || !sameHexStamp(stamp, recovery.stamp)) throw new Error(t("The original file changed. Its saved byte patches have been kept without applying them."));
+    }
+    let tab: Tab | null = null;
+    try {
+      tab = await this.openOne(path, meta.id, { paged: meta.kind === "paged", hexView: true, pane });
+    } catch (e) {
+      // Small-file recovery is self-contained, including when the original drive is missing.
+      if (!resizable) throw e;
+    }
+    if (!tab) {
+      tab = this.makeTab({ id: meta.id, path, name: String(recovery.tab.name ?? basename(path)), kind: "memory", pane });
+      tab.state = this.buildState(tab, "", []);
+      this.insertTab(tab);
+    }
+    tab.hex = buffer;
+    tab.hexStamp = recovery.stamp;
+    tab.hexRecoveryRevision = 1;
+    tab.hexView = true;
+    tab.splitView = false;
+    tab.revision = tab.savedRevision = 0;
+    tab.mtime = Number(recovery.tab.mtime ?? 0);
+    tab.size = recovery.buffer.originalSize;
+    tab.dirty = true;
+    this.applyReadOnly(tab);
     return tab;
   }
 }

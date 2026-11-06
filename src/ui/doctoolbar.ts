@@ -86,19 +86,19 @@ export function mountDocToolbar(app: App, root: HTMLElement, pane: 0 | 1): { ren
     lastKey = key;
     renderCrumbs(tab);
 
-    const seg = h("div", { class: "seg", role: "tablist" });
+    const seg = h("div", { class: "seg", role: "group", "aria-label": t("View") });
     const modes: [ViewMode, string, string][] = [
       ["text", t("Text"), t("Text view")],
       ["hex", t("Hex"), t("Hex editor (Ctrl+Shift+H)")],
       ["split", t("Split"), t("Text and bytes side by side")],
     ];
     for (const [m, label, title] of modes) {
-      seg.append(h("button", { class: "seg-btn" + (m === mode ? " on" : ""), title, click: () => void app.setViewMode(tab, m) }, label));
+      seg.append(h("button", { class: "seg-btn" + (m === mode ? " on" : ""), "aria-pressed": String(m === mode), title, click: () => void app.setViewMode(tab, m) }, label));
     }
 
     const parts: HTMLElement[] = [];
     if (tab.languageName === "Markdown" && mode !== "hex") {
-      parts.push(h("button", { class: "tool-btn" + (tab.livePreview ? " on" : ""), title: t("Toggle Markdown Live Preview (Ctrl+Shift+V)"), click: () => app.toggleLivePreview(tab) }, icon("eye"), h("span", {}, t("Live Preview"))));
+      parts.push(h("button", { class: "tool-btn" + (tab.livePreview ? " on" : ""), "aria-pressed": String(tab.livePreview), title: t("Toggle Markdown Live Preview (Ctrl+Shift+V)"), click: () => app.toggleLivePreview(tab) }, icon("eye"), h("span", {}, t("Live Preview"))));
     }
     parts.push(seg);
     if (own.path) {
@@ -119,6 +119,7 @@ export function mountDocToolbar(app: App, root: HTMLElement, pane: 0 | 1): { ren
         "button",
         {
           class: "tool-btn" + (ro ? " on" : ""),
+          "aria-pressed": String(ro),
           title: ro ? t("Allow editing") : t("Protect against changes"),
           click: () => app.setReadOnly(tab, !ro),
         },

@@ -1,7 +1,7 @@
 {
   "name": "nax-notepad",
   "private": true,
-  "version": "0.5.5",
+  "version": "0.5.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "node tests/frontend.test.cjs",
+    "test:ui": "playwright test",
     "test:rust": "cargo test --lib --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
@@ -30,6 +31,7 @@
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@tauri-apps/cli": "^2",
     "@types/node": "^24",
     "typescript": "~6.0.3",

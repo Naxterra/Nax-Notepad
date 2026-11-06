@@ -21,6 +21,15 @@ export function t(key: string, vars?: Record<string, string | number>): string {
 }
 
 const de: Record<string, string> = {
+  "The saved byte changes are damaged and could not be restored.": "Die gespeicherten Byte-Änderungen sind beschädigt und konnten nicht wiederhergestellt werden.",
+  "The bytes kept changing while recovery was being stored. Please try again.": "Die Bytes wurden während der Wiederherstellungssicherung weiter geändert. Bitte erneut versuchen.",
+  "The original file changed. Its saved byte patches have been kept without applying them.": "Die Originaldatei wurde geändert. Ihre gespeicherten Byte-Patches wurden aufbewahrt und nicht angewendet.",
+  "These saved file changes can no longer be matched to their files. The recovery files have been kept:\n\n{files}": "Diese gespeicherten Dateiänderungen können ihren Dateien nicht mehr zugeordnet werden. Die Wiederherstellungsdateien wurden aufbewahrt:\n\n{files}",
+  "The byte changes are being saved. Please wait.": "Die Byte-Änderungen werden gespeichert. Bitte warten.",
+  '"{name}" was changed during saving and has been kept open. Save the latest changes before closing.':
+    '„{name}“ wurde während des Speicherns geändert und bleibt geöffnet. Bitte vor dem Schließen die neuesten Änderungen speichern.',
+  "The file changed while its bytes were being read. Reload it and try again.":
+    "Die Datei wurde beim Lesen ihrer Bytes geändert. Bitte neu laden und erneut versuchen.",
   // Menus / categories
   File: "Datei",
   Edit: "Bearbeiten",
@@ -146,7 +155,8 @@ const de: Record<string, string> = {
     "{file} hat ungespeicherte Änderungen aus einer früheren Sitzung, die noch nicht wiederhergestellt werden können ({error}). Sie werden aufbewahrt und später erneut versucht.",
   "Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}":
     "Ungespeicherte Änderungen an diesen Dateien konnten jetzt nicht wiederhergestellt werden. Sie werden aufbewahrt und beim nächsten Start erneut versucht:\n\n{files}",
-  "The reload was stopped because the text was changed while the file was being read.": "Das Neuladen wurde abgebrochen, weil der Text geändert wurde, während die Datei gelesen wurde.",
+  "The reload was stopped because the document was changed while the file was being read.": "Das Neuladen wurde abgebrochen, weil das Dokument geändert wurde, während die Datei gelesen wurde.",
+  "The document changed again. Its latest changes have been kept.": "Das Dokument wurde erneut geändert. Die neuesten Änderungen wurden beibehalten.",
   "Load images from the internet in Live Preview": "Bilder aus dem Internet in der Live-Vorschau laden",
   '"{name}" is now larger than {size} MB and is shown in pages.': "„{name}“ ist jetzt größer als {size} MB und wird seitenweise angezeigt.",
   '"{name}" was modified outside Nax-Notepad.\nReload it?': "„{name}“ wurde außerhalb von Nax-Notepad geändert.\nNeu laden?",

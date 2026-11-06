@@ -1,5 +1,6 @@
 // Typed wrappers around the Rust commands.
 import { invoke } from "@tauri-apps/api/core";
+import type { HexSnapshot } from "./hexbuffer";
 
 export type Eol = "LF" | "CRLF" | "CR";
 
@@ -149,6 +150,9 @@ export interface SessionData {
   unmatched_logs?: string[];
 }
 
+export interface HexStamp { size: number; mtime: number; fingerprint: string }
+export interface HexRecovery { version: 1; tab: TabMeta; buffer: HexSnapshot; stamp?: HexStamp }
+
 export const backend = {
   openPath: (id: string, path: string, forcePaged = false, encoding: string | null = null) =>
     invoke<OpenResult>("open_path", { id, path, forcePaged, encoding }),
@@ -183,6 +187,10 @@ export const backend = {
   /** Stores whose `generation` is not above the last dropped one are ignored (late writes after a save). */
   sessionStoreBuffer: (id: string, text: string, generation: number) => invoke<void>("session_store_buffer", { id, text, generation }),
   sessionLoadBuffer: (id: string) => invoke<string | null>("session_load_buffer", { id }),
+  sessionStoreHex: (id: string, recovery: HexRecovery, generation: number) => invoke<void>("session_store_hex", { id, recovery, generation }),
+  sessionLoadHex: (id: string) => invoke<HexRecovery | null>("session_load_hex", { id }),
+  sessionDropHex: (id: string, generation: number) => invoke<void>("session_drop_hex", { id, generation }),
+  hexSourceStamp: (path: string) => invoke<HexStamp>("hex_source_stamp", { path }),
   /** True when unsaved text or a large-file edit log is stored for the tab. */
   sessionHasRecovery: (id: string) => invoke<boolean>("session_has_recovery", { id }),
   sessionDropBuffer: (id: string, generation: number) => invoke<void>("session_drop_buffer", { id, generation }),
@@ -215,13 +223,13 @@ export const backend = {
   readBytes: async (path: string, offset: number, len: number) => new Uint8Array(await invoke<ArrayBuffer>("read_bytes", { path, offset, len })),
   fileSize: (path: string) => invoke<number>("file_size", { path }),
   /** Replace a file with `bytes` (atomic). Fails with E_EXTERNAL_CHANGE if its time differs. */
-  writeBytes: (path: string, bytes: Uint8Array, expectedMtime: number) =>
-    invoke<SaveResult>("write_bytes", bytes, { headers: { "x-path": encodeURIComponent(path), "x-mtime": String(expectedMtime) } }),
+  writeBytes: (path: string, bytes: Uint8Array, expectedMtime: number, expectedLen?: number) =>
+    invoke<SaveResult>("write_bytes", bytes, { headers: { "x-path": encodeURIComponent(path), "x-mtime": String(expectedMtime), ...(expectedLen === undefined ? {} : { "x-size": String(expectedLen) }) } }),
   /** Offset of a byte pattern in a file (searches the file on disk). */
-  findBytes: (path: string, pattern: Uint8Array, from: number, backwards: boolean) =>
-    invoke<number | null>("find_bytes", { path, pattern: Array.from(pattern), from, backwards }),
+  findBytes: (path: string, pattern: Uint8Array, from: number, backwards: boolean, patches: [number, number][] = []) =>
+    invoke<number | null>("find_bytes", { path, pattern: Array.from(pattern), from, backwards, patches }),
   /** Change single bytes of a (large) file through an atomic copy. */
-  patchFile: (path: string, patches: [number, number][], expectedLen: number, expectedMtime: number) =>
-    invoke<SaveResult>("patch_file", { path, patches, expectedLen, expectedMtime }),
+  patchFile: (path: string, patches: [number, number][], expectedLen: number, expectedMtime: number, target?: string) =>
+    invoke<SaveResult>("patch_file", { path, patches, expectedLen, expectedMtime, target: target ?? null }),
   revealInExplorer: (path: string) => invoke<void>("reveal_in_explorer", { path }),
 };

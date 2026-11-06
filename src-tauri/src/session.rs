@@ -804,6 +804,40 @@ fn load_session_from(path: &Path, buffers: &Path, marker: &Path) -> LoadedSessio
         logs.sort();
         session.unmatched_logs = logs;
     }
+    // A crash can occur after storing bytes but before updating the session's dirty flag or
+    // adding a new tab. These self-contained records must be discovered on every start.
+    let mut hexes: Vec<_> = fs::read_dir(buffers).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".hex.json"))).collect()).unwrap_or_else(|_| Vec::new());
+    hexes.sort();
+    for path in hexes {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let id = name.strip_suffix(".hex.json").unwrap();
+        match load_hex_from(&path) {
+            Ok(None) => continue,
+            Ok(Some(record)) => {
+                if let Some(mut tab) = record.get("tab").cloned().and_then(|v| serde_json::from_value::<TabMeta>(v).ok()) {
+                    if sanitize(&tab.id) == id {
+                        let existing = session.tabs.iter_mut().find(|m| m.id == tab.id);
+                        if let Some(existing) = existing {
+                            existing.extra.insert("dirty".into(), true.into());
+                            existing.extra.insert("hexDirty".into(), true.into());
+                        } else {
+                            tab.extra.insert("dirty".into(), true.into());
+                            tab.extra.insert("hexDirty".into(), true.into());
+                            session.tabs.push(tab);
+                        }
+                        continue;
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        if let Some(existing) = session.tabs.iter_mut().find(|m| sanitize(&m.id) == id) {
+            existing.extra.insert("dirty".into(), true.into());
+            existing.extra.insert("hexDirty".into(), true.into());
+        } else {
+            session.unmatched_logs.push(path.display().to_string());
+        }
+    }
     LoadedSession { session, complete, read_failed }
 }
 
@@ -826,6 +860,64 @@ pub fn save_session(s: &Session) -> Result<(), String> {
 
 pub fn buffer_path(id: &str) -> PathBuf {
     buffers_dir().join(format!("{}.txt", sanitize(id)))
+}
+
+pub fn hex_path(id: &str) -> PathBuf {
+    buffers_dir().join(format!("{}.hex.json", sanitize(id)))
+}
+
+/// (newest stored, newest dropped), separate from text revisions.
+fn hex_generations() -> &'static Mutex<HashMap<String, (u64, u64)>> {
+    static MAP: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+pub fn store_hex(id: &str, recovery: &serde_json::Value, generation: u64) -> Result<(), String> {
+    ensure_dirs()?;
+    store_hex_at(&hex_path(id), id, recovery, generation)
+}
+
+fn store_hex_at(path: &Path, id: &str, recovery: &serde_json::Value, generation: u64) -> Result<(), String> {
+    let lock = target_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (stored, dropped) = hex_generations().lock().unwrap_or_else(|e| e.into_inner()).get(id).copied().unwrap_or_default();
+    if generation <= dropped || generation < stored { return Ok(()); }
+    let bytes = serde_json::to_vec(recovery).map_err(|e| e.to_string())?;
+    replace_atomic_locked(path, |f| f.write_all(&bytes))?;
+    hex_generations().lock().unwrap_or_else(|e| e.into_inner()).entry(id.into()).or_default().0 = generation;
+    Ok(())
+}
+
+pub fn drop_hex(id: &str, generation: u64) -> Result<(), String> {
+    ensure_dirs()?;
+    drop_hex_at(&hex_path(id), id, generation)
+}
+
+fn drop_hex_at(path: &Path, id: &str, generation: u64) -> Result<(), String> {
+    let lock = target_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut generations = hex_generations().lock().unwrap_or_else(|e| e.into_inner());
+    let state = generations.entry(id.into()).or_default();
+    state.1 = state.1.max(generation);
+    // An older completed save cannot discard recovery of newer edits.
+    if state.0 > generation { return Ok(()); }
+    drop(generations);
+    // Persist a tombstone before removal: a failed delete cannot resurrect old byte edits.
+    replace_atomic_locked(path, |f| f.write_all(b"null"))?;
+    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+pub fn load_hex(id: &str) -> Result<Option<serde_json::Value>, String> {
+    load_hex_from(&hex_path(id))
+}
+
+fn load_hex_from(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    match read_patiently(path) {
+        Ok(bytes) => serde_json::from_slice::<Option<serde_json::Value>>(&bytes).map_err(|e| format!("Cannot read the saved byte changes in {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Cannot read the saved byte changes in {}: {e}", path.display())),
+    }
 }
 
 pub fn edits_paths(id: &str) -> (PathBuf, PathBuf) {
@@ -897,7 +989,7 @@ fn drop_generation(path: &Path, extra: &[&Path], id: &str, generation: Option<u6
 /// True when unsaved text or a large-file edit log is stored for `id`.
 pub fn has_recovery(id: &str) -> bool {
     let (pieces, _) = edits_paths(id);
-    buffer_path(id).is_file() || pieces.is_file()
+    buffer_path(id).is_file() || pieces.is_file() || load_hex(id).map(|v| v.is_some()).unwrap_or(true)
 }
 
 /// The unsaved text stored for `id`: `Ok(None)` when there is none, an error when it exists but
@@ -921,8 +1013,12 @@ pub fn prune_buffers(s: &Session) {
     if SESSION_INCOMPLETE.load(Ordering::Relaxed) || recovery_hold_active(&recovery_hold_marker()) {
         return;
     }
+    prune_buffers_in(s, &buffers_dir());
+}
+
+fn prune_buffers_in(s: &Session, buffers: &Path) {
     let keep: std::collections::HashSet<String> = s.tabs.iter().map(|t| sanitize(&t.id)).collect();
-    if let Ok(rd) = fs::read_dir(buffers_dir()) {
+    if let Ok(rd) = fs::read_dir(buffers) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             if name.ends_with(TEMP_SUFFIX) {
@@ -940,6 +1036,10 @@ pub fn prune_buffers(s: &Session) {
             }
             let stem = name.split('.').next().unwrap_or("").to_string();
             if !keep.contains(&stem) {
+                // A newer byte snapshot may have completed after the frontend captured this
+                // session. Its own metadata lets the next start recover it. Explicit Save,
+                // Discard and Close write a tombstone and remove it instead.
+                if name.ends_with(".hex.json") && load_hex_from(&e.path()).map(|v| v.is_some()).unwrap_or(true) { continue; }
                 let _ = fs::remove_file(e.path());
             }
         }
@@ -963,6 +1063,65 @@ pub fn save_settings(v: &serde_json::Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_recovery_generations_survive_late_writes_and_old_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.hex.json");
+        let id = "hex-generation-test";
+        let old = serde_json::json!({"version":1,"buffer":{"originalSize":3,"bytes":"AQID"}});
+        let new = serde_json::json!({"version":1,"buffer":{"originalSize":3,"bytes":"CQID"}});
+        store_hex_at(&path, id, &old, 1).unwrap();
+        store_hex_at(&path, id, &new, 3).unwrap();
+        store_hex_at(&path, id, &old, 2).unwrap();
+        assert_eq!(load_hex_from(&path).unwrap(), Some(new.clone()));
+        drop_hex_at(&path, id, 2).unwrap();
+        assert_eq!(load_hex_from(&path).unwrap(), Some(new));
+        drop_hex_at(&path, id, 3).unwrap();
+        store_hex_at(&path, id, &old, 3).unwrap();
+        assert_eq!(load_hex_from(&path).unwrap(), None);
+        store_hex_at(&path, id, &old, 4).unwrap();
+        assert_eq!(load_hex_from(&path).unwrap(), Some(old));
+    }
+
+    #[test]
+    fn byte_recovery_reports_damage_and_treats_tombstones_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.hex.json");
+        assert_eq!(load_hex_from(&path).unwrap(), None);
+        fs::write(&path, b"{broken").unwrap();
+        assert!(load_hex_from(&path).is_err());
+        fs::write(&path, b"null").unwrap();
+        assert_eq!(load_hex_from(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn byte_recovery_is_found_before_session_metadata_was_written() {
+        for session_bytes in [b"{\"tabs\":[]}".as_slice(), b"{broken".as_slice(), b"{\"tabs\":[{\"id\":\"hex\",\"path\":\"x.bin\",\"kind\":\"memory\",\"dirty\":false}]}".as_slice()] {
+            let (_dir, path, buffers) = session_dir_with_buffers(session_bytes);
+            let record = serde_json::json!({"version":1,"tab":{"id":"hex","path":"x.bin","kind":"memory","name":"x.bin"},"buffer":{"originalSize":3,"bytes":"CQID"}});
+            fs::write(buffers.join("hex.hex.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+            let loaded = load_session_from(&path, &buffers, &path.with_file_name("recovery-hold"));
+            let tabs: Vec<_> = loaded.session.tabs.iter().filter(|m| m.id == "hex").collect();
+            assert_eq!(tabs.len(), 1);
+            assert_eq!(tabs[0].extra["dirty"], true);
+            assert_eq!(tabs[0].extra["hexDirty"], true);
+        }
+    }
+
+    #[test]
+    fn pruning_an_older_session_keeps_self_contained_byte_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("new.hex.json");
+        let tombstone = dir.path().join("saved.hex.json");
+        fs::write(&record, br#"{"tab":{"id":"new"}}"#).unwrap();
+        fs::write(&tombstone, b"null").unwrap();
+        fs::write(dir.path().join("old.txt"), b"no tab owns this").unwrap();
+        prune_buffers_in(&Session::default(), dir.path());
+        assert!(record.exists());
+        assert!(!tombstone.exists());
+        assert!(!dir.path().join("old.txt").exists());
+    }
 
     #[test]
     fn atomic_save_preserves_neighbor_tmp() {

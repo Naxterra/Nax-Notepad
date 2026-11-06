@@ -13,7 +13,8 @@ const { SearchQuery } = require("@codemirror/search");
 global.window = { setTimeout: () => 1, clearTimeout: () => {} };
 global.requestAnimationFrame = () => 1;
 
-const backend = {};
+const backend = { sessionLoadHex: async () => null, sessionDropHex: async () => {} };
+const clipboard = { readText: async () => "", writeClipboard: async () => {} };
 const settings = {
   pagedWindowLines: 3000,
   trimTrailingOnSave: false,
@@ -58,6 +59,8 @@ function load(name) {
         return { t: (s, vars) => (vars ? s.replace(/\{(\w+)\}/g, (_, k) => String(vars[k])) : s) };
       case "ui/dialogs":
         return dialogs;
+      case "clipboard":
+        return clipboard;
       case "editor":
         return {
           systemChange: load("readonly").systemChange,
@@ -89,9 +92,11 @@ function load(name) {
       case "bytemap":
       case "signature":
       case "paths":
+      case "ui/hexview":
         return load(id);
     }
     if (id === "@tauri-apps/plugin-dialog") return tauriDialog;
+    if (id === "@tauri-apps/plugin-clipboard-manager") return clipboard;
     if (id.startsWith("@tauri") || !id.startsWith("@")) return {};
     return require(id);
   };
@@ -138,6 +143,7 @@ function pagedHost(holder, active = true) {
 function fakeApp(tab, view) {
   const app = Object.create(App.prototype);
   view.scrollDOM = view.scrollDOM ?? { scrollTop: 0 };
+  view.dispatch ??= function (spec) { this.state = this.state.update(spec).state; };
   Object.assign(app, {
     active: tab,
     tabs: [tab],
@@ -1182,6 +1188,152 @@ test("settings: wrong types are ignored", () => {
 
 const memSource = (bytes) => ({ size: bytes.length, read: async (o, l) => bytes.slice(o, o + l) });
 
+test("closing after saving keeps edits typed during the save open", async () => {
+  const tab = memoryTab();
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "first edit" }) });
+  app.activate = () => {};
+  app.save = async () => { tab.revision++; return true; };
+  app.rememberClosed = () => assert.fail("new edits must stay open");
+  const oldConfirm = dialogs.confirm3;
+  dialogs.confirm3 = async () => "yes";
+  try {
+    assert.equal(await app.closeTab(tab), false);
+    assert.ok(app.tabs.includes(tab));
+    assert.equal(tab.dirty, true);
+  } finally { dialogs.confirm3 = oldConfirm; }
+});
+
+test("encoding and line-ending conversion respect read-only text and hex mode", async () => {
+  for (const extra of [{ readOnly: true }, { hexView: true, splitView: false }]) {
+    const tab = memoryTab({ dirty: false, revision: 0, savedRevision: 0, ...extra });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "keep me" }) });
+    app.setEncoding(tab, "UTF-16LE");
+    await app.setEol(tab, "CRLF");
+    assert.equal(tab.encoding, "UTF-8");
+    assert.equal(tab.eol, "LF");
+    assert.equal(tab.dirty, false);
+    assert.equal(tab.revision, 0);
+  }
+});
+
+test("saving an unchanged hex view never re-encodes its hidden text", async () => {
+  const tab = memoryTab({ hexView: true, dirty: false, revision: 0, savedRevision: 0 });
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "decoded binary" }) });
+  backend.saveText = async () => assert.fail("unchanged binary must not be re-encoded");
+  assert.equal(await app.save(tab), true);
+});
+
+test("Save As from hex writes exact bytes and updates the document path", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  for (const edited of [false, true]) {
+    const tab = memoryTab({ hexView: true, dirty: edited, revision: 0, savedRevision: 0, size: 3, mtime: 1234 });
+    tab.hex = await HexBuffer.load(memSource(Uint8Array.from([0xff, 0, 0x80])));
+    tab.hexKey = "file:test.txt:3:1234";
+    if (edited) tab.hex.overwrite(1, Uint8Array.from([9]));
+    const view = { state: EditorState.create({ doc: "decoded binary" }), dispatch(spec) { this.state = this.state.update(spec).state; } };
+    const app = fakeApp(tab, view);
+    app.addRecent = () => {};
+    const writes = [];
+    backend.writeBytes = async (path, bytes, mtime) => (writes.push([path, [...bytes], mtime]), { size: 3, mtime: 5, name: "copy.bin", path });
+    backend.saveText = async () => assert.fail("Save As must write bytes");
+    backend.openPath = async (id, path) => ({ kind: "memory", path, name: "copy.bin", text: "binary", encoding: "windows-1252", eol: "LF", size: 3, hadErrors: false, readOnly: false, mtime: 5 });
+    backend.sessionDropBuffer = async () => {};
+    const oldSave = tauriDialog.save;
+    tauriDialog.save = async () => "copy.bin";
+    try {
+      assert.equal(await app.saveAs(tab), true);
+      assert.deepEqual(writes, [["copy.bin", [0xff, edited ? 9 : 0, 0x80], 0]]);
+      assert.equal(tab.path, "copy.bin");
+      assert.equal(tab.dirty, false);
+    } finally { tauriDialog.save = oldSave; }
+  }
+});
+
+test("hex reads refuse truncated content instead of padding it with zero bytes", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const src = { size: 4, read: async () => Uint8Array.from([1, 2]) };
+  await assert.rejects(HexBuffer.load(src));
+  const big = await HexBuffer.load(src, 1);
+  await assert.rejects(big.ready(0, 4));
+});
+
+test("a failed hex chunk read can be retried", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  let attempts = 0;
+  const b = await HexBuffer.load({ size: 4, read: async () => {
+    if (++attempts === 1) throw new Error("temporary read failure");
+    return Uint8Array.from([1, 2, 3, 4]);
+  } }, 1);
+  await assert.rejects(b.ready(0, 4));
+  await b.ready(0, 4);
+  assert.equal(b.byteAt(2), 3);
+  assert.equal(attempts, 2);
+});
+
+test("a save queued after Save As uses the new path", async () => {
+  const tab = memoryTab();
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "abc" }) });
+  const pending = deferred();
+  const started = deferred();
+  const paths = [];
+  backend.saveText = async (p) => {
+    paths.push(p);
+    if (paths.length === 1) { started.resolve(); await pending.promise; }
+    return { size: 3, mtime: 10, name: "copy.txt", path: p };
+  };
+  backend.sessionDropBuffer = async () => {};
+  const first = app.serial(tab, () => app.writeTab(tab, "copy.txt", true));
+  await started.promise;
+  const second = app.save(tab);
+  pending.resolve();
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+  assert.deepEqual(paths, ["copy.txt", "copy.txt"]);
+});
+
+test("hex editing pauses during saves and resumes when a save fails", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const { HexView } = load("ui/hexview");
+  const tab = memoryTab({ hexView: true, revision: 0, savedRevision: 0 });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "" }) });
+  const pending = deferred();
+  const started = deferred();
+  backend.writeBytes = async () => { started.resolve(); await pending.promise; throw new Error("disk full"); };
+  const saving = app.save(tab);
+  await started.promise;
+  const hex = Object.create(HexView.prototype);
+  hex.session = { buffer: tab.hex, readOnly: null };
+  assert.equal(tab.hex.saving, true);
+  assert.equal(hex.editable(), false);
+  hex.undo();
+  assert.equal(tab.hex.byteAt(0), 9);
+  pending.resolve();
+  assert.equal(await saving, false);
+  assert.equal(tab.hex.saving, false);
+  assert.equal(tab.hex.dirty, true);
+});
+
+test("an asynchronous hex paste cannot edit a different tab", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const { HexView } = load("ui/hexview");
+  const first = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  const second = await HexBuffer.load(memSource(Uint8Array.from([4, 5, 6])));
+  const hex = Object.create(HexView.prototype);
+  Object.assign(hex, { session: { buffer: first, readOnly: null }, cursor: 0, anchor: null, pane: "hex" });
+  const pending = deferred();
+  const oldRead = clipboard.readText;
+  clipboard.readText = () => pending.promise;
+  try {
+    const paste = hex.paste();
+    hex.session = { buffer: second, readOnly: null };
+    pending.resolve("FF");
+    await paste;
+    assert.deepEqual([...first.bytes()], [1, 2, 3]);
+    assert.deepEqual([...second.bytes()], [4, 5, 6]);
+  } finally { clipboard.readText = oldRead; }
+});
+
 test("hex buffer: overwrite, insert, remove, undo and redo (small file)", async () => {
   const { HexBuffer } = load("hexbuffer");
   const b = await HexBuffer.load(memSource(Uint8Array.from([0x41, 0x42, 0x43, 0x44])));
@@ -1367,6 +1519,472 @@ test("view modes: only the hex mode locks the text", () => {
   assert.equal(app.viewMode(tab), "hex");
   tab.hexView = false;
   assert.equal(app.viewMode(tab), "text");
+});
+
+test("overlapping hex loads share one buffer instead of overwriting edits", async () => {
+  const tab = memoryTab({ dirty: false, revision: 0, savedRevision: 0, size: 3, mtime: 123 });
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "" }) });
+  const pending = deferred();
+  let reads = 0;
+  const oldStamp = backend.hexSourceStamp;
+  const oldRead = backend.readBytes;
+  backend.hexSourceStamp = async () => ({ size: 3, mtime: 123, fingerprint: "original" });
+  backend.readBytes = async () => { reads++; return pending.promise; };
+  try {
+    const first = app.hexFor(tab);
+    const second = app.hexFor(tab);
+    pending.resolve(Uint8Array.from([1, 2, 3]));
+    const a = await first;
+    a.buffer.overwrite(0, Uint8Array.from([9]));
+    const b = await second;
+    assert.equal(a.buffer, b.buffer);
+    assert.equal(tab.hex.byteAt(0), 9);
+    assert.equal(reads, 1);
+  } finally { backend.hexSourceStamp = oldStamp; backend.readBytes = oldRead; }
+});
+
+test("a delayed file-byte load cannot replace newer unsaved text bytes", async () => {
+  const tab = memoryTab({ dirty: false, revision: 0, savedRevision: 0, size: 3, mtime: 123 });
+  const view = { state: EditorState.create({ doc: "old" }) };
+  const app = fakeApp(tab, view);
+  const pending = deferred();
+  const started = deferred();
+  const oldStamp = backend.hexSourceStamp;
+  const oldRead = backend.readBytes;
+  backend.hexSourceStamp = async () => ({ size: 3, mtime: 123, fingerprint: "original" });
+  backend.readBytes = async () => { started.resolve(); return pending.promise; };
+  try {
+    const loading = app.hexFor(tab);
+    await started.promise;
+    view.state = EditorState.create({ doc: "new text" });
+    app.noteUserEdit(tab);
+    pending.resolve(Uint8Array.from([1, 2, 3]));
+    const info = await loading;
+    assert.equal(new TextDecoder().decode(info.buffer.bytes()), "new text");
+    assert.ok(info.readOnly);
+    assert.equal(tab.hexKey, "text:1");
+  } finally { backend.hexSourceStamp = oldStamp; backend.readBytes = oldRead; }
+});
+
+test("hex snapshots recover exact resized bytes and empty files", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const original = Uint8Array.from({ length: 256 }, (_, i) => i);
+  const b = await HexBuffer.load(memSource(original));
+  b.remove(3, 17);
+  b.insert(8, Uint8Array.from([255, 0, 128]));
+  const snapshot = JSON.parse(JSON.stringify(b.snapshot()));
+  const restored = HexBuffer.restore(snapshot, { size: original.length, read: async () => assert.fail("complete recovery does not need the original") });
+  assert.deepEqual(restored.bytes(), b.bytes());
+  assert.equal(restored.dirty, true);
+  const empty = HexBuffer.restore({ originalSize: 0, bytes: "" }, memSource(new Uint8Array()));
+  assert.equal(empty.size, 0);
+  assert.equal(empty.dirty, true);
+});
+
+test("large-file byte recovery remains sparse and validates every patch", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const size = 10_000_000_000;
+  const source = { size, read: async () => assert.fail("restoring patches must not read a giant file") };
+  const patches = [[8, 255], [size - 1, 128]];
+  const b = HexBuffer.restore({ originalSize: size, patches }, source);
+  assert.equal(b.resizable, false);
+  assert.equal(b.byteAt(size - 1), 128);
+  assert.deepEqual(b.snapshot(), { originalSize: size, patches });
+  for (const invalid of [ [[size, 1]], [[-1, 1]], [[8, 256]], [[8, 1.5]], [[8, 1], [8, 2]] ]) {
+    assert.throws(() => HexBuffer.restore({ originalSize: size, patches: invalid }, source), /damaged/);
+  }
+  assert.throws(() => HexBuffer.restore({ originalSize: size, bytes: "AA==" }, source), /damaged/);
+  assert.throws(() => HexBuffer.restore({ originalSize: 1, bytes: "!not-base64" }, memSource(new Uint8Array(1))), /damaged/);
+});
+
+test("large-file search forwards unsaved patches and refuses negative backward starts", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const calls = [];
+  const b = await HexBuffer.load({ size: 100, read: async () => new Uint8Array(100), find: async (...args) => { calls.push(args); return 20; } }, 1);
+  await b.ready(0, 10);
+  b.overwrite(5, Uint8Array.from([0xab, 0xcd]));
+  assert.equal(await b.find(Uint8Array.from([0xab, 0xcd]), 0, false), 20);
+  assert.deepEqual(calls[0].slice(1), [0, false, [[5, 0xab], [6, 0xcd]]]);
+  assert.equal(await b.find(Uint8Array.from([1]), -1, true), null);
+  assert.equal(calls.length, 1);
+});
+
+test("branching hex undo history never marks different bytes as saved", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const b = await HexBuffer.load(memSource(Uint8Array.from([1, 2])));
+  b.overwrite(0, Uint8Array.from([9]));
+  b.insert(2, Uint8Array.from([3]));
+  b.markSaved();
+  b.undo();
+  b.overwrite(0, Uint8Array.from([8]));
+  b.insert(2, Uint8Array.from([4]));
+  assert.equal(b.dirty, true);
+});
+
+test("flushing hex edits stores exact bytes and retries edits arriving during recovery IPC", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ revision: 0, savedRevision: 0, hexView: true });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "hidden text" }) });
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  app.noteHexChange(tab);
+  const records = [];
+  const oldStore = backend.sessionStoreHex;
+  backend.sessionStoreHex = async (id, recovery, generation) => {
+    records.push([recovery, generation]);
+    if (records.length === 1) { tab.hex.overwrite(1, Uint8Array.from([8])); app.noteHexChange(tab); }
+  };
+  backend.sessionStoreBuffer = async () => assert.fail("hidden text is not the edited bytes");
+  backend.sessionSave = async () => {};
+  try {
+    await app.flushAll();
+    assert.equal(records.length, 2);
+    assert.equal(records[0][0].buffer.bytes, btoa(String.fromCharCode(9, 2, 3)));
+    assert.equal(records[1][0].buffer.bytes, btoa(String.fromCharCode(9, 8, 3)));
+    assert.ok(records[1][1] > records[0][1]);
+    assert.equal(records[1][0].tab.hexDirty, true);
+  } finally { backend.sessionStoreHex = oldStore; }
+});
+
+test("flushing byte recovery failures keeps the window close from succeeding", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ revision: 0, savedRevision: 0 });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1])));
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "" }) });
+  backend.sessionSave = async () => {};
+  const oldStore = backend.sessionStoreHex;
+  backend.sessionStoreHex = async () => { throw new Error("recovery disk full"); };
+  try { await assert.rejects(app.flushAll(), /recovery disk full/); assert.equal(tab.hex.dirty, true); }
+  finally { backend.sessionStoreHex = oldStore; }
+});
+
+test("self-contained byte recovery restores with its original file missing", async () => {
+  const record = { version: 1, tab: { id: "recovered", path: "E:/missing.bin", kind: "memory", name: "missing.bin", mtime: 123, dirty: true }, buffer: { originalSize: 3, bytes: btoa(String.fromCharCode(255, 9, 128, 0)) } };
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  app.activate = (tab) => { app.active = tab; };
+  app.openOne = async () => { throw new Error("drive disconnected"); };
+  backend.sessionLoad = async () => ({ tabs: [record.tab], active: "recovered", next_untitled: 1 });
+  backend.sessionLoadHex = async () => record;
+  try {
+    assert.equal(await app.restoreSession({ onlyUnsaved: true }), true);
+    const tab = app.tabs[0];
+    assert.deepEqual([...tab.hex.bytes()], [255, 9, 128, 0]);
+    assert.equal(tab.path, "E:/missing.bin");
+    assert.equal(tab.hexView, true);
+    assert.equal(tab.dirty, true);
+    assert.equal(tab.revision, tab.savedRevision, "hidden text is not treated as edited");
+    assert.equal(tab.mtime, 123);
+  } finally { backend.sessionLoadHex = async () => null; }
+});
+
+test("changed originals keep sparse byte recovery without applying or deleting it", async () => {
+  const stamp = { size: 49 * 1024 * 1024, mtime: 123, fingerprint: "original" };
+  const meta = { id: "recovered", path: "E:/large.bin", kind: "paged", dirty: true, hexDirty: true };
+  const record = { version: 1, tab: meta, buffer: { originalSize: stamp.size, patches: [[0, 255]] }, stamp };
+  const app = fakeApp(memoryTab(), { state: EditorState.create({ doc: "" }) });
+  app.tabs = [];
+  app.openOne = async () => assert.fail("changed sources must not be opened with old patches");
+  backend.sessionLoad = async () => ({ tabs: [meta], active: "recovered", next_untitled: 1 });
+  backend.sessionLoadHex = async () => record;
+  backend.sessionHasRecovery = async () => true;
+  backend.hexSourceStamp = async () => ({ ...stamp, fingerprint: "changed" });
+  try {
+    assert.equal(await app.restoreSession(), false);
+    assert.equal(app.tabs.length, 0);
+    assert.equal(app.keptMetas[0].id, "recovered");
+    assert.ok(messages.some((msg) => /original file changed/.test(msg)));
+  } finally { backend.sessionLoadHex = async () => null; }
+});
+
+test("byte search completing after a tab switch never selects the other file", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const { HexView } = load("ui/hexview");
+  const pending = deferred();
+  const first = await HexBuffer.load({ size: 100, read: async () => new Uint8Array(100), find: () => pending.promise }, 1);
+  const second = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  const hex = Object.create(HexView.prototype);
+  Object.assign(hex, { session: { buffer: first }, cursor: 0, anchor: null });
+  hex.setSelection = () => assert.fail("stale search must not select another file");
+  const search = hex.findBytes(Uint8Array.from([2]), false);
+  hex.session = { buffer: second };
+  pending.resolve(20);
+  assert.equal(await search, false);
+});
+
+test("queued Save As checks for byte edits when the write actually starts", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ dirty: false, revision: 0, savedRevision: 0 });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "decoded text" }) });
+  const pending = deferred();
+  app.serial(tab, () => pending.promise);
+  const writes = [];
+  app.writeTab = async () => { writes.push("text"); return true; };
+  app.writeHex = async () => { writes.push("bytes"); return true; };
+  const oldSave = tauriDialog.save;
+  tauriDialog.save = async () => "copy.bin";
+  try {
+    const saving = app.saveAs(tab);
+    await Promise.resolve();
+    tab.hexView = true;
+    tab.hex.overwrite(0, Uint8Array.from([9]));
+    pending.resolve();
+    assert.equal(await saving, true);
+    assert.deepEqual(writes, ["bytes"]);
+  } finally { tauriDialog.save = oldSave; }
+});
+
+test("reload keeps byte edits made while the file read is pending", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ hexView: true, dirty: false, revision: 0, savedRevision: 0 });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  const buffer = tab.hex;
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "old" }) });
+  const pending = deferred();
+  const oldOpen = backend.openPath;
+  backend.openPath = () => pending.promise;
+  try {
+    const reloading = app.reload(tab);
+    buffer.overwrite(0, Uint8Array.from([9]));
+    app.noteHexChange(tab);
+    pending.resolve({ kind: "memory", text: "disk", size: 4, mtime: 1, encoding: "UTF-8", eol: "LF" });
+    await reloading;
+    assert.equal(tab.hex, buffer);
+    assert.equal(tab.hex.byteAt(0), 9);
+    assert.equal(tab.dirty, true);
+    assert.equal(app.docText(tab), "old");
+  } finally { backend.openPath = oldOpen; }
+});
+
+test("a failed paged reload keeps its unsaved byte buffer", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ kind: "paged", hexView: true, revision: 0, savedRevision: 0, paged: {} });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  const buffer = tab.hex;
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "old" }) });
+  const oldOpen = backend.openPath;
+  backend.openPath = async () => { throw new Error("drive disconnected"); };
+  try {
+    await assert.rejects(app.reload(tab), /drive disconnected/);
+    assert.equal(tab.hex, buffer);
+    assert.equal(tab.hex.byteAt(0), 9);
+    assert.equal(tab.dirty, true);
+  } finally { backend.openPath = oldOpen; }
+});
+
+test("text typed during reload recovery cleanup stays dirty and recoverable", async () => {
+  const tab = memoryTab({ dirty: false, revision: 0, savedRevision: 0, hexRecoveryRevision: 1 });
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "disk" }) });
+  let recoveryScheduled = false;
+  app.scheduleBufferStore = () => { recoveryScheduled = true; };
+  const pending = deferred();
+  const oldDrop = backend.sessionDropHex;
+  backend.sessionDropHex = () => pending.promise;
+  try {
+    const finishing = app.finishReload(tab);
+    app.view.state = EditorState.create({ doc: "new edit" });
+    app.noteUserEdit(tab);
+    pending.resolve();
+    await finishing;
+    assert.equal(tab.savedRevision, 0);
+    assert.equal(tab.dirty, true);
+    assert.equal(recoveryScheduled, true);
+  } finally { backend.sessionDropHex = oldDrop; }
+});
+
+test("hex Delete checks saving and read-only state at execution time", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const { HexView } = load("ui/hexview");
+  for (const saving of [true, false]) {
+    const buffer = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+    buffer.saving = saving;
+    const hex = Object.create(HexView.prototype);
+    Object.assign(hex, { session: { buffer, readOnly: saving ? null : "read-only" }, cursor: 1, anchor: null });
+    hex.changed = () => {};
+    hex.moveTo = () => {};
+    hex.removeBytes(false);
+    assert.deepEqual([...buffer.bytes()], [1, 2, 3]);
+    assert.equal(buffer.dirty, false);
+  }
+});
+
+test("text typed during the reloaded paged window stays unsaved", async () => {
+  const tab = memoryTab({ kind: "paged", dirty: false, revision: 0, savedRevision: 0 });
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "disk" }) });
+  const pending = deferred();
+  const started = deferred();
+  tab.paged = { firstLine: 0, cursorLine: () => 0, resetRevisions() {}, load: async () => { started.resolve(); await pending.promise; } };
+  const oldOpen = backend.openPath;
+  backend.openPath = async () => ({ kind: "paged", size: 3, mtime: 1 });
+  try {
+    const reloading = app.reload(tab);
+    await started.promise;
+    app.noteUserEdit(tab);
+    pending.resolve();
+    await reloading;
+    assert.equal(tab.savedRevision, 0);
+    assert.equal(tab.dirty, true);
+  } finally { backend.openPath = oldOpen; }
+});
+
+test("growing a file into paged mode keeps edits made during the first window read", async () => {
+  const tab = memoryTab({ dirty: false, revision: 0, savedRevision: 0 });
+  const view = { state: EditorState.create({ doc: "old" }), scrollDOM: { scrollTop: 0, addEventListener() {}, removeEventListener() {} }, setState(state) { this.state = state; } };
+  const app = fakeApp(tab, view);
+  const pending = deferred();
+  const started = deferred();
+  const oldOpen = backend.openPath;
+  const oldWindow = backend.pagedWindow;
+  const oldClose = backend.pagedClose;
+  let closed = false;
+  backend.openPath = async () => ({ kind: "paged", size: 50 * 1024 * 1024, mtime: 1, lineCount: 1 });
+  backend.pagedWindow = async () => { started.resolve(); return pending.promise; };
+  backend.pagedClose = async () => { closed = true; };
+  try {
+    const reloading = app.reload(tab);
+    await started.promise;
+    view.state = EditorState.create({ doc: "new edit" });
+    app.noteUserEdit(tab);
+    pending.resolve({ text: "disk", firstLine: 0, count: 1, totalLines: 1 });
+    await reloading;
+    assert.equal(app.docText(tab), "new edit");
+    assert.equal(tab.kind, "memory");
+    assert.equal(tab.dirty, true);
+    assert.equal(closed, true, "the unused memory map must not block saving");
+  } finally { backend.openPath = oldOpen; backend.pagedWindow = oldWindow; backend.pagedClose = oldClose; }
+});
+
+test("closing keeps edits made during byte-recovery cleanup open", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  for (const byteEdit of [false, true]) {
+    const tab = memoryTab({ dirty: false, revision: 0, savedRevision: 0, hexRecoveryRevision: 1 });
+    tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "old" }) });
+    app.rememberClosed = () => assert.fail("new edits must stay open");
+    const pending = deferred();
+    const started = deferred();
+    const oldDrop = backend.sessionDropHex;
+    backend.sessionDropHex = () => { started.resolve(); return pending.promise; };
+    try {
+      const closing = app.closeTab(tab);
+      await started.promise;
+      if (byteEdit) { tab.hex.overwrite(0, Uint8Array.from([9])); app.noteHexChange(tab); }
+      else { app.view.state = EditorState.create({ doc: "new edit" }); app.noteUserEdit(tab); }
+      pending.resolve();
+      assert.equal(await closing, false);
+      assert.ok(app.tabs.includes(tab));
+      assert.equal(tab.dirty, true);
+    } finally { backend.sessionDropHex = oldDrop; }
+  }
+});
+
+test("a failed first paged window leaves the memory tab and byte edits intact", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ hexView: true, revision: 0, savedRevision: 0 });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  const buffer = tab.hex;
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "old text" }) });
+  const oldOpen = backend.openPath;
+  const oldWindow = backend.pagedWindow;
+  const oldClose = backend.pagedClose;
+  let closed = false;
+  backend.openPath = async () => ({ kind: "paged", size: 50 * 1024 * 1024, mtime: 1, lineCount: 1 });
+  backend.pagedWindow = async () => { throw new Error("cannot read window"); };
+  backend.pagedClose = async () => { closed = true; };
+  try {
+    await assert.rejects(app.reload(tab), /cannot read window/);
+    assert.equal(tab.kind, "memory");
+    assert.equal(app.docText(tab), "old text");
+    assert.equal(tab.hex, buffer);
+    assert.equal(tab.dirty, true);
+    assert.equal(closed, true);
+  } finally { backend.openPath = oldOpen; backend.pagedWindow = oldWindow; backend.pagedClose = oldClose; }
+});
+
+test("discarding hex edits keeps newer edits made during recovery cleanup", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ hexView: true, revision: 0, savedRevision: 0, hexRecoveryRevision: 1 });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  const buffer = tab.hex;
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "old" }) });
+  const pending = deferred();
+  const started = deferred();
+  const oldDrop = backend.sessionDropHex;
+  const oldConfirm = dialogs.confirm3;
+  backend.sessionDropHex = () => { started.resolve(); return pending.promise; };
+  dialogs.confirm3 = async () => "no";
+  try {
+    const switching = app.setViewMode(tab, "text");
+    await started.promise;
+    buffer.overwrite(1, Uint8Array.from([8]));
+    app.noteHexChange(tab);
+    pending.resolve();
+    await switching;
+    assert.equal(tab.hex, buffer);
+    assert.equal(app.viewMode(tab), "hex");
+    assert.deepEqual([...buffer.bytes()], [9, 8, 3]);
+    assert.equal(tab.dirty, true);
+  } finally { backend.sessionDropHex = oldDrop; dialogs.confirm3 = oldConfirm; }
+});
+
+test("successful hex discard switches to text and clears byte edits", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ hexView: true, revision: 0, savedRevision: 0, hexRecoveryRevision: 1 });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  tab.hex.overwrite(0, Uint8Array.from([9]));
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "old" }) });
+  const oldConfirm = dialogs.confirm3;
+  dialogs.confirm3 = async () => "no";
+  try {
+    await app.setViewMode(tab, "text");
+    assert.equal(app.viewMode(tab), "text");
+    assert.equal(tab.hex, undefined);
+    assert.equal(tab.dirty, false);
+  } finally { dialogs.confirm3 = oldConfirm; }
+});
+
+test("paged reload keeps byte edits made while opening the original", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const tab = memoryTab({ kind: "paged", hexView: true, dirty: false, revision: 0, savedRevision: 0, paged: {} });
+  tab.hex = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  const buffer = tab.hex;
+  const app = fakeApp(tab, { state: EditorState.create({ doc: "old" }) });
+  const pending = deferred();
+  const oldOpen = backend.openPath;
+  backend.openPath = () => pending.promise;
+  try {
+    const reloading = app.reload(tab);
+    buffer.overwrite(0, Uint8Array.from([9]));
+    app.noteHexChange(tab);
+    pending.resolve({ kind: "paged", size: 3, mtime: 1 });
+    await reloading;
+    assert.equal(tab.hex, buffer);
+    assert.equal(tab.hex.byteAt(0), 9);
+    assert.equal(tab.dirty, true);
+  } finally { backend.openPath = oldOpen; }
+});
+
+test("copying an unaligned 16 MiB hex selection preserves bytes despite cache eviction", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const { HexView } = load("ui/hexview");
+  const count = 16 * 1024 * 1024;
+  const buffer = await HexBuffer.load({ size: count + 2, read: async (o, len) => new Uint8Array(len).fill(65) });
+  await buffer.ready(0, 16);
+  buffer.overwrite(5, Uint8Array.from([66]));
+  const hex = Object.create(HexView.prototype);
+  Object.assign(hex, { session: { buffer, readOnly: null }, cursor: count, anchor: 1, pane: "ascii" });
+  const oldWrite = clipboard.writeClipboard;
+  let copied;
+  clipboard.writeClipboard = async (text) => { copied = { length: text.length, first: text[0], patched: text[4], last: text.at(-1) }; };
+  try {
+    await hex.copy();
+    assert.deepEqual(copied, { length: count, first: "A", patched: "B", last: "A" });
+  } finally { clipboard.writeClipboard = oldWrite; }
 });
 
 (async () => {

@@ -239,10 +239,13 @@ export class HexView {
   /** Find `pattern` after (or before) the cursor and select it. */
   async findBytes(pattern: Uint8Array, backwards: boolean): Promise<boolean> {
     if (!this.session || !pattern.length) return false;
+    const buffer = this.buf;
+    const revision = buffer.revision;
     const { from, to } = this.state;
     const start = backwards ? from - 1 : to > from ? from + 1 : this.cursor + 1;
-    let at = await this.buf.find(pattern, start, backwards);
-    if (at === null) at = await this.buf.find(pattern, backwards ? this.size() - 1 : 0, backwards);
+    let at = await buffer.find(pattern, start, backwards);
+    if (at === null) at = await buffer.find(pattern, backwards ? buffer.size - 1 : 0, backwards);
+    if (this.session?.buffer !== buffer || buffer.revision !== revision) return false;
     if (at === null) return false;
     this.setSelection(at, at + pattern.length);
     this.userMoved();
@@ -257,6 +260,10 @@ export class HexView {
   private editable(): boolean {
     const s = this.session;
     if (!s) return false;
+    if (s.buffer.saving) {
+      toast(t("The byte changes are being saved. Please wait."), 5000);
+      return false;
+    }
     if (s.readOnly) {
       toast(s.readOnly, 5000);
       return false;
@@ -320,6 +327,7 @@ export class HexView {
   }
 
   private removeBytes(backwards: boolean): void {
+    if (!this.editable()) return;
     const b = this.buf;
     if (!b.resizable) {
       toast(t("Bytes cannot be removed from large files in the hex view. Overwrite them instead."), 5000);
@@ -343,23 +351,25 @@ export class HexView {
   /** Copy the selection (or the byte at the cursor) as hex digits or as text. */
   async copy(cut = false, as: "hex" | "text" | null = null): Promise<void> {
     if (!this.session) return;
+    const buf = this.buf;
+    const rev = buf.revision;
     const sel = this.selection() ?? (this.cursor < this.size() ? { from: this.cursor, to: this.cursor + 1 } : null);
     if (!sel) return;
     if (sel.to - sel.from > 16 * 1024 * 1024) {
       toast(t("The selection is too large to copy."));
       return;
     }
-    await this.buf.ready(sel.from, sel.to);
-    const bytes = this.buf.slice(sel.from, sel.to);
+    const bytes = await buf.readSlice(sel.from, sel.to);
+    if (this.session?.buffer !== buf || buf.revision !== rev) return;
     const asHex = as ? as === "hex" : this.pane === "hex";
     const text = asHex ? toHex(bytes) : Array.from(bytes, (x) => (x === 0 ? "." : String.fromCharCode(x))).join("");
     await writeClipboard(text);
-    if (!cut || !this.editable()) return;
-    if (!this.buf.resizable) {
+    if (!cut || this.session?.buffer !== buf || buf.revision !== rev || !this.editable()) return;
+    if (!buf.resizable) {
       toast(t("Bytes cannot be removed from large files in the hex view. Overwrite them instead."), 5000);
       return;
     }
-    this.buf.remove(sel.from, sel.to - sel.from);
+    buf.remove(sel.from, sel.to - sel.from);
     this.anchor = null;
     this.changed();
     this.moveTo(sel.from, false);
@@ -367,20 +377,27 @@ export class HexView {
 
   async paste(): Promise<void> {
     if (!this.session || !this.editable()) return;
+    const buf = this.buf;
+    const rev = buf.revision;
+    const cursor = this.cursor;
+    const anchor = this.anchor;
+    const pane = this.pane;
+    const unchanged = () => this.session?.buffer === buf && buf.revision === rev && this.cursor === cursor && this.anchor === anchor && this.pane === pane;
     let text: string;
     try {
       text = await readText();
     } catch {
       return;
     }
-    if (!text) return;
-    const bytes = this.pane === "hex" ? (parseHex(text) ?? textBytes(text)) : textBytes(text);
-    await this.buf.ready(this.cursor, this.cursor + bytes.length);
+    if (!text || !unchanged()) return;
+    const bytes = pane === "hex" ? (parseHex(text) ?? textBytes(text)) : textBytes(text);
+    await buf.ready(cursor, cursor + bytes.length);
+    if (!unchanged() || !this.editable()) return;
     this.put(bytes);
   }
 
   undo(): void {
-    if (!this.session || this.session.readOnly) return;
+    if (!this.editable()) return;
     const at = this.buf.undo();
     if (at === null) return;
     this.anchor = null;
@@ -389,7 +406,7 @@ export class HexView {
   }
 
   redo(): void {
-    if (!this.session || this.session.readOnly) return;
+    if (!this.editable()) return;
     const at = this.buf.redo();
     if (at === null) return;
     this.anchor = null;

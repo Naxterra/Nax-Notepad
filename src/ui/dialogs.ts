@@ -18,33 +18,69 @@ export function h<K extends keyof HTMLElementTagNameMap>(
   return el;
 }
 
-let openModal: HTMLElement | null = null;
+let openModal: { overlay: HTMLElement; close: () => void } | null = null;
+let modalId = 0;
 
 export function showModal(content: HTMLElement, onClose: () => void = () => undefined): () => void {
   closeModal();
+  const previousFocus = document.activeElement as HTMLElement | null;
   const overlay = h("div", { class: "modal-overlay" }, content);
+  content.setAttribute("role", "dialog");
+  content.setAttribute("aria-modal", "true");
+  content.tabIndex = -1;
+  const title = content.querySelector<HTMLElement>(".modal-title");
+  if (title) {
+    if (!title.id) title.id = `modal-title-${++modalId}`;
+    content.setAttribute("aria-labelledby", title.id);
+  }
   overlay.addEventListener("mousedown", (e) => {
     if (e.target === overlay) close();
   });
+  let closed = false;
   const close = () => {
-    if (overlay.parentElement) overlay.remove();
-    if (openModal === overlay) openModal = null;
+    if (closed) return;
+    closed = true;
+    overlay.remove();
+    if (openModal?.overlay === overlay) openModal = null;
+    if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
     onClose();
   };
+  overlay.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    } else if (e.key === "Enter") {
+      // A dialog may close in its own handler before the event reaches the editor.
+      e.stopPropagation();
+    } else if (e.key === "Tab") {
+      const controls = Array.from(content.querySelectorAll<HTMLElement>('button, input, select, textarea, a[href], [tabindex]'))
+        .filter((el) => el.tabIndex >= 0 && !el.matches(":disabled") && el.getClientRects().length > 0);
+      const index = controls.indexOf(document.activeElement as HTMLElement);
+      if (!controls.length || index < 0 || (e.shiftKey ? index === 0 : index === controls.length - 1)) {
+        e.preventDefault();
+        (controls.length ? controls[e.shiftKey ? controls.length - 1 : 0] : content).focus();
+      }
+    }
+  });
   document.body.appendChild(overlay);
-  openModal = overlay;
+  openModal = { overlay, close };
+  content.focus({ preventScroll: true });
   return close;
 }
 
 export function closeModal(): void {
-  if (openModal) {
-    openModal.remove();
-    openModal = null;
-  }
+  openModal?.close();
 }
 
 export function isModalOpen(): boolean {
   return openModal !== null;
+}
+
+function activateFocusedButton(box: HTMLElement, fallback: () => void): void {
+  const focused = document.activeElement as HTMLElement | null;
+  if (focused?.tagName === "BUTTON" && box.contains(focused)) focused.click();
+  else fallback();
 }
 
 export function confirm3(title: string, text: string, labels: [string, string] = [t("Save"), t("Don't save")]): Promise<"yes" | "no" | "cancel"> {
@@ -63,7 +99,7 @@ export function confirm3(title: string, text: string, labels: [string, string] =
     box.addEventListener("keydown", (e) => {
       if (e.key === "Escape" || e.key === "Enter") e.preventDefault();
       if (e.key === "Escape") done("cancel");
-      if (e.key === "Enter" && (document.activeElement === box || document.activeElement === btnYes)) done("yes");
+      if (e.key === "Enter") activateFocusedButton(box, () => done("yes"));
     });
     box.tabIndex = -1;
     const close = showModal(box, () => resolve(result));
@@ -91,7 +127,7 @@ export function confirmDialog(title: string, text: string, okLabel = t("OK"), ca
     box.addEventListener("keydown", (e) => {
       if (e.key === "Escape" || e.key === "Enter") e.preventDefault();
       if (e.key === "Escape") done(false);
-      if (e.key === "Enter") done(true);
+      if (e.key === "Enter") activateFocusedButton(box, () => done(true));
     });
     const close = showModal(box, () => resolve(result));
     const done = (r: boolean) => {
@@ -138,7 +174,7 @@ export function prompt(title: string, label: string, initial = "", placeholder =
     box.addEventListener("keydown", (e) => {
       if (e.key === "Escape" || e.key === "Enter") e.preventDefault();
       if (e.key === "Escape") done(null);
-      if (e.key === "Enter") done(input.value);
+      if (e.key === "Enter") activateFocusedButton(box, () => done(input.value));
     });
     const close = showModal(box, () => resolve(result));
     const done = (r: string | null) => {

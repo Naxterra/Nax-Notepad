@@ -641,6 +641,45 @@ fn session_load_buffer(id: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
+async fn session_store_hex(id: String, recovery: serde_json::Value, generation: u64) -> Result<(), String> {
+    session::store_hex(&id, &recovery, generation)
+}
+
+#[tauri::command]
+fn session_load_hex(id: String) -> Result<Option<serde_json::Value>, String> {
+    session::load_hex(&id)
+}
+
+#[tauri::command]
+fn session_drop_hex(id: String, generation: u64) -> Result<(), String> {
+    session::drop_hex(&id, generation)
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct HexStamp { size: u64, mtime: u64, fingerprint: String }
+
+#[tauri::command]
+fn hex_source_stamp(path: String) -> Result<HexStamp, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let p = Path::new(&path);
+    let mut f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    let mtime = mtime_of(p);
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut buf = vec![0; 8192];
+    // Bounded even for multi-gigabyte files. The hash and sample positions are part of the
+    // version-1 byte recovery format; keep them stable so earlier recovery remains valid.
+    for start in [0, size.saturating_sub(8192) / 2, size.saturating_sub(8192)] {
+        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        let n = (size - start).min(buf.len() as u64) as usize;
+        f.read_exact(&mut buf[..n]).map_err(|e| e.to_string())?;
+        for b in &buf[..n] { hash = (hash ^ *b as u64).wrapping_mul(0x100000001b3); }
+    }
+    ensure_unchanged(p, Some(mtime), Some(size))?;
+    Ok(HexStamp { size, mtime, fingerprint: format!("{hash:016x}") })
+}
+
+#[tauri::command]
 fn session_drop_buffer(id: String, generation: Option<u64>) {
     session::drop_buffer_gen(&id, generation)
 }
@@ -1015,21 +1054,30 @@ async fn write_bytes(request: tauri::ipc::Request<'_>) -> Result<SaveResult, Str
     let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let path = percent_decode(&header("x-path").ok_or("missing path")?);
     let expected = header("x-mtime").and_then(|s| s.parse::<u64>().ok());
+    let expected_len = header("x-size").and_then(|s| s.parse::<u64>().ok());
     let p = PathBuf::from(&path);
-    let unchanged = || if p.exists() { ensure_unchanged(&p, expected, None) } else { Ok(()) };
-    session::replace_atomic_checked(&p, unchanged, |f| std::io::Write::write_all(f, data))?;
+    write_bytes_impl(&p, data, expected, expected_len)?;
     Ok(saved(&p))
+}
+
+fn write_bytes_impl(p: &Path, data: &[u8], expected: Option<u64>, expected_len: Option<u64>) -> Result<(), String> {
+    let unchanged = || if p.exists() { ensure_unchanged(p, expected, expected_len) } else { Ok(()) };
+    session::replace_atomic_checked(p, unchanged, |f| std::io::Write::write_all(f, data))
 }
 
 /// Write `patches` (offset, byte) into a copy of the file and replace it atomically. Used for
 /// files too large to edit in memory; the file is streamed, so any size works.
 fn patch_file_impl(p: &Path, patches: &mut [(u64, u8)], expected_len: u64, expected_mtime: Option<u64>) -> Result<(), String> {
+    patch_file_to_impl(p, p, patches, expected_len, expected_mtime)
+}
+
+fn patch_file_to_impl(p: &Path, target: &Path, patches: &mut [(u64, u8)], expected_len: u64, expected_mtime: Option<u64>) -> Result<(), String> {
     use std::io::{Read, Write};
     patches.sort_by_key(|x| x.0);
     if patches.last().is_some_and(|x| x.0 >= expected_len) {
         return Err("A changed byte lies beyond the end of the file.".into());
     }
-    session::replace_atomic_checked(p, || ensure_unchanged(p, expected_mtime, Some(expected_len)), |out| {
+    session::replace_atomic_checked(target, || ensure_unchanged(p, expected_mtime, Some(expected_len)), |out| {
         let mut src = std::fs::File::open(p)?;
         let mut buf = vec![0u8; 1 << 20];
         let mut off = 0u64;
@@ -1056,6 +1104,10 @@ fn patch_file_impl(p: &Path, patches: &mut [(u64, u8)], expected_len: u64, expec
 /// Offset of the first occurrence of `pattern` at or after `from` (or the last one at or before
 /// `from` when `backwards`), reading the file in blocks so files of any size can be searched.
 fn find_bytes_impl(p: &Path, pattern: &[u8], from: u64, backwards: bool, cancel: &dyn Fn() -> bool) -> Result<Option<u64>, String> {
+    find_bytes_patched_impl(p, pattern, from, backwards, cancel, &[])
+}
+
+fn find_bytes_patched_impl(p: &Path, pattern: &[u8], from: u64, backwards: bool, cancel: &dyn Fn() -> bool, patches: &[(u64, u8)]) -> Result<Option<u64>, String> {
     use std::io::{Read, Seek, SeekFrom};
     if pattern.is_empty() {
         return Ok(None);
@@ -1072,7 +1124,13 @@ fn find_bytes_impl(p: &Path, pattern: &[u8], from: u64, backwards: bool, cancel:
     let mut read_at = |start: u64, end: u64, buf: &mut Vec<u8>| -> Result<(), String> {
         buf.resize((end - start) as usize, 0);
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-        f.read_exact(buf).map_err(|e| e.to_string())
+        f.read_exact(buf).map_err(|e| e.to_string())?;
+        let first = patches.partition_point(|(offset, _)| *offset < start);
+        for &(offset, byte) in &patches[first..] {
+            if offset >= end { break; }
+            buf[(offset - start) as usize] = byte;
+        }
+        Ok(())
     };
     if !backwards {
         let mut start = from.min(len);
@@ -1112,15 +1170,24 @@ fn find_bytes_impl(p: &Path, pattern: &[u8], from: u64, backwards: bool, cancel:
 }
 
 #[tauri::command]
-async fn find_bytes(path: String, pattern: Vec<u8>, from: u64, backwards: bool) -> Result<Option<u64>, String> {
-    find_bytes_impl(Path::new(&path), &pattern, from, backwards, &cancel_token())
+async fn find_bytes(path: String, pattern: Vec<u8>, from: u64, backwards: bool, patches: Option<Vec<(u64, u8)>>) -> Result<Option<u64>, String> {
+    let mut patches = patches.unwrap_or_default();
+    patches.sort_by_key(|p| p.0);
+    if patches.is_empty() { find_bytes_impl(Path::new(&path), &pattern, from, backwards, &cancel_token()) }
+    else { find_bytes_patched_impl(Path::new(&path), &pattern, from, backwards, &cancel_token(), &patches) }
 }
 
 #[tauri::command]
-async fn patch_file(path: String, mut patches: Vec<(u64, u8)>, expected_len: u64, expected_mtime: Option<u64>) -> Result<SaveResult, String> {
+async fn patch_file(path: String, mut patches: Vec<(u64, u8)>, expected_len: u64, expected_mtime: Option<u64>, target: Option<String>) -> Result<SaveResult, String> {
     let p = PathBuf::from(&path);
-    patch_file_impl(&p, &mut patches, expected_len, expected_mtime)?;
-    Ok(saved(&p))
+    if let Some(target) = target {
+        let target = PathBuf::from(target);
+        patch_file_to_impl(&p, &target, &mut patches, expected_len, expected_mtime)?;
+        Ok(saved(&target))
+    } else {
+        patch_file_impl(&p, &mut patches, expected_len, expected_mtime)?;
+        Ok(saved(&p))
+    }
 }
 
 #[tauri::command]
@@ -1453,6 +1520,10 @@ pub fn run() {
             session_save,
             session_store_buffer,
             session_load_buffer,
+            session_store_hex,
+            session_load_hex,
+            session_drop_hex,
+            hex_source_stamp,
             session_buffer_epoch,
             session_has_recovery,
             session_drop_buffer,
@@ -1629,6 +1700,39 @@ mod tests {
     }
 
     #[test]
+    fn hex_save_as_streams_patched_bytes_to_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("original.bin");
+        let target = dir.path().join("copy.bin");
+        let original: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &original).unwrap();
+        let mtime = mtime_of(&p);
+        let mut patches = vec![(2_999_999, 0xFF), (1_048_576, 0xEE), (0, 0x80)];
+        patch_file_to_impl(&p, &target, &mut patches, original.len() as u64, Some(mtime)).unwrap();
+        let mut expected = original.clone();
+        for &(offset, byte) in &patches { expected[offset as usize] = byte; }
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert_eq!(std::fs::read(&p).unwrap(), original, "Save As keeps the original");
+        // A stale source must not replace an existing destination, even for Save As.
+        let err = patch_file_to_impl(&p, &target, &mut patches, original.len() as u64, Some(1)).unwrap_err();
+        assert!(err.starts_with(paged::E_EXTERNAL_CHANGE));
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn hex_save_checks_the_original_size_before_replacing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("original.bin");
+        std::fs::write(&p, [1, 2, 3, 4]).unwrap();
+        let err = write_bytes_impl(&p, &[9, 2, 3], Some(mtime_of(&p)), Some(3)).unwrap_err();
+        assert!(err.starts_with(paged::E_EXTERNAL_CHANGE));
+        assert_eq!(std::fs::read(&p).unwrap(), [1, 2, 3, 4]);
+        write_bytes_impl(&p, &[9, 2, 3], Some(mtime_of(&p)), Some(4)).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), [9, 2, 3]);
+    }
+
+    #[test]
     fn find_bytes_across_block_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("big.bin");
@@ -1647,6 +1751,44 @@ mod tests {
         assert_eq!(f(at2 as u64 - 1, true), Some(at1 as u64));
         assert_eq!(f(at1 as u64 - 1, true), None);
         assert_eq!(f(at1 as u64, true), Some(at1 as u64));
+    }
+
+    #[test]
+    fn byte_search_sees_unsaved_patches_and_hides_matches_they_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bytes.bin");
+        let mut bytes = vec![0; 9 * 1024 * 1024];
+        let first = 4 * 1024 * 1024 - 2;
+        let second = 8 * 1024 * 1024 - 1;
+        bytes[first..first + 4].copy_from_slice(b"NAX!");
+        std::fs::write(&path, &bytes).unwrap();
+        let patches = vec![(first as u64 + 1, b'O'), (second as u64, b'N'), (second as u64 + 1, b'A'), (second as u64 + 2, b'X'), (second as u64 + 3, b'!')];
+        let find = |pat: &[u8], from, back| find_bytes_patched_impl(&path, pat, from, back, &|| false, &patches).unwrap();
+        assert_eq!(find(b"NAX!", 0, false), Some(second as u64));
+        assert_eq!(find(b"NAX!", bytes.len() as u64, true), Some(second as u64));
+        assert_eq!(find(b"NAX!", first as u64, true), None);
+        assert_eq!(find(b"NOX!", 0, false), Some(first as u64));
+        assert_eq!(find(b"NOX!", bytes.len() as u64, true), Some(first as u64));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "search never saves patches");
+        let err = find_bytes_patched_impl(&path, b"NAX!", 0, false, &|| true, &patches).unwrap_err();
+        assert!(err.starts_with(paged::E_CANCELLED));
+    }
+
+    #[test]
+    fn byte_source_stamps_detect_changed_content_even_when_time_and_size_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stamp.bin");
+        std::fs::write(&path, vec![0u8; 32_768]).unwrap();
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before = hex_source_stamp(path.display().to_string()).unwrap();
+        let mut content = vec![0u8; 32_768];
+        content[0] = 255;
+        std::fs::write(&path, content).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        let after = hex_source_stamp(path.display().to_string()).unwrap();
+        assert_eq!(before.mtime, after.mtime);
+        assert_eq!(before.size, after.size);
+        assert_ne!(before.fingerprint, after.fingerprint);
     }
 
     #[test]
