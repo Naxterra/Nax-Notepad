@@ -81,7 +81,7 @@ input[type="checkbox"]:focus-visible,
   align-items: center;
   height: 46px;
   flex: none;
-  background: var(--chrome-bg);
+  background: linear-gradient(110deg, var(--chrome-bg), color-mix(in srgb, var(--accent-alt) 9%, var(--chrome-bg)));
   padding-left: 12px;
 }
 .tb-left,
@@ -129,6 +129,7 @@ input[type="checkbox"]:focus-visible,
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   color: var(--fg);
 }
+.tb-search > .ic { color: var(--accent); }
 .tb-search-text {
   flex: 1;
   text-align: left;
@@ -196,6 +197,7 @@ kbd {
   background: var(--hover-strong);
   opacity: 1;
 }
+.menu-btn.open { color: var(--accent); }
 .menu-drop,
 .ctx-menu {
   position: fixed;
@@ -339,7 +341,7 @@ kbd {
   bottom: 0;
   height: 2px;
   border-radius: 2px 2px 0 0;
-  background: var(--accent);
+  background: linear-gradient(90deg, var(--accent), var(--accent-alt));
 }
 .panes .pane:not(.focused) .tab.active::after {
   opacity: 0.3;
@@ -349,7 +351,7 @@ kbd {
 }
 .tab.active .tab-icon {
   opacity: 1;
-  color: var(--fg-muted);
+  color: var(--accent-alt);
 }
 .tab.pinned .tab-name::before {
   content: "📌 ";
@@ -371,7 +373,7 @@ kbd {
   display: none;
   width: 18px;
   text-align: center;
-  color: var(--accent);
+  color: var(--syn-string);
   font-size: 10px;
 }
 .tab.dirty .tab-dot {
@@ -469,7 +471,7 @@ kbd {
 }
 .crumb-icon {
   margin-right: 6px;
-  color: var(--fg-muted);
+  color: var(--accent-alt);
 }
 .crumb {
   background: none;
@@ -532,8 +534,8 @@ kbd {
   background: var(--hover);
 }
 .seg-btn.on {
-  background: var(--bg-elev2);
-  color: var(--fg);
+  background: var(--accent-soft);
+  color: var(--accent);
   box-shadow: 0 1px 3px #00000018;
 }
 .seg.small .seg-btn {
@@ -558,9 +560,9 @@ kbd {
   background: var(--bg-elev2);
 }
 .tool-btn.on {
-  color: var(--fg);
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 25%, transparent);
+  color: var(--syn-string);
+  background: color-mix(in srgb, var(--syn-string) 10%, transparent);
+  border-color: color-mix(in srgb, var(--syn-string) 28%, transparent);
 }
 .tool-label {
   display: inline-flex;
@@ -1117,6 +1119,7 @@ kbd {
 }
 .sb-lp.on {
   font-weight: 600;
+  color: var(--syn-string);
 }
 .sb-slider {
   width: 160px;
