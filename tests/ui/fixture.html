@@ -6,9 +6,10 @@
     <script type="module">
       import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
       mockWindows("main");
+      window.settingsWrites = [];
       const language = new URLSearchParams(location.search).get("language") ?? "en";
       // Exercise the real frontend with no access to the user's files or profile.
-      mockIPC((cmd) => {
+      mockIPC((cmd, args) => {
         switch (cmd) {
           case "settings_load": return { language, theme: "nax-dark", checkUpdates: false };
           case "session_load": return { tabs: [], active: null, next_untitled: 1 };
@@ -16,12 +17,14 @@
           case "finished_saves": return { finished: [], failed: [] };
           case "startup_files": return [];
           case "plugin:window|is_maximized": return false;
+          case "settings_save": window.settingsWrites.push(structuredClone(args.value)); return null;
           default: return null;
         }
       }, { shouldMockEvents: true });
       await import("/src/main.ts");
       window.dialogs = await import("/src/ui/dialogs.ts");
       window.themes = await import("/src/theme.ts");
+      window.icons = await import("/src/ui/icons.ts");
     </script>
   </body>
 </html>

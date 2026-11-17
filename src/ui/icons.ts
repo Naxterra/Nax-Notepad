@@ -44,6 +44,7 @@ export type IconName = keyof typeof ICONS;
 export function icon(name: IconName, cls = ""): HTMLElement {
   const el = document.createElement("span");
   el.className = "ic" + (cls ? " " + cls : "");
+  el.dataset.icon = name;
   el.innerHTML = ICONS[name];
   return el;
 }

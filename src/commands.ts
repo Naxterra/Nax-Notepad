@@ -591,7 +591,7 @@ export function buildCommands(app: App, find: FindPanel, extras: CommandExtras):
       key: "Ctrl+Alt+T",
       category: t("View"),
       run: async () => {
-        const it = await pickList(t("Theme"), [{ label: t("Follow Windows"), value: "system" }, ...THEMES.map((th) => ({ label: th.name, value: th.id, detail: th.dark ? t("dark") : t("light") }))]);
+        const it = await pickList(t("Theme"), [{ label: t("Follow Windows"), value: "system" }, ...THEMES.map((th) => ({ label: t(th.name), value: th.id, detail: th.dark ? t("dark") : t("light") }))]);
         if (it) updateSettings({ theme: it.value });
       },
     },

@@ -55,7 +55,14 @@ input[type="checkbox"]:focus-visible,
   justify-content: center;
   flex: none;
   line-height: 0;
+  color: var(--icon-color, inherit);
 }
+.ic:is([data-icon="file"], [data-icon="fileText"], [data-icon="fileLog"], [data-icon="drive"], [data-icon="search"], [data-icon="copy"], [data-icon="info"], [data-icon="arrowRight"], [data-icon="chevronUp"], [data-icon="chevronDown"], [data-icon="chevronRight"]) { --icon-color: var(--icon-blue); }
+.ic:is([data-icon="fileMarkdown"], [data-icon="fileSettings"], [data-icon="panelRight"], [data-icon="menu"]) { --icon-color: var(--icon-purple); }
+.ic:is([data-icon="fileCode"], [data-icon="plus"], [data-icon="unlock"], [data-icon="eye"], [data-icon="link"]) { --icon-color: var(--icon-green); }
+.ic:is([data-icon="fileJson"], [data-icon="folder"], [data-icon="lock"]) { --icon-color: var(--icon-amber); }
+.ic:is([data-icon="fileBinary"], [data-icon="binary"], [data-icon="close"]) { --icon-color: var(--icon-coral); }
+.ic[data-icon="fileImage"] { --icon-color: var(--icon-pink); }
 
 ::-webkit-scrollbar {
   width: 12px;
@@ -81,7 +88,7 @@ input[type="checkbox"]:focus-visible,
   align-items: center;
   height: 46px;
   flex: none;
-  background: linear-gradient(110deg, var(--chrome-bg), color-mix(in srgb, var(--accent-alt) 9%, var(--chrome-bg)));
+  background: var(--chrome-bg);
   padding-left: 12px;
 }
 .tb-left,
@@ -129,7 +136,7 @@ input[type="checkbox"]:focus-visible,
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   color: var(--fg);
 }
-.tb-search > .ic { color: var(--accent); }
+.tb-search > .ic { color: var(--icon-color, var(--accent)); }
 .tb-search-text {
   flex: 1;
   text-align: left;
@@ -169,6 +176,7 @@ kbd {
   background: #e81123;
   color: #fff;
 }
+.tb-win.close:hover .ic { color: inherit; }
 
 /* ---- menu bar ---- */
 .menubar {
@@ -341,17 +349,17 @@ kbd {
   bottom: 0;
   height: 2px;
   border-radius: 2px 2px 0 0;
-  background: linear-gradient(90deg, var(--accent), var(--accent-alt));
+  background: var(--accent);
 }
 .panes .pane:not(.focused) .tab.active::after {
   opacity: 0.3;
 }
 .tab-icon {
-  opacity: 0.75;
+  opacity: 1;
 }
 .tab.active .tab-icon {
   opacity: 1;
-  color: var(--accent-alt);
+  color: var(--icon-color, var(--accent-alt));
 }
 .tab.pinned .tab-name::before {
   content: "📌 ";
@@ -471,7 +479,7 @@ kbd {
 }
 .crumb-icon {
   margin-right: 6px;
-  color: var(--accent-alt);
+  color: var(--icon-color, var(--accent-alt));
 }
 .crumb {
   background: none;

@@ -116,6 +116,8 @@ const de: Record<string, string> = {
   "Type a command…": "Befehl eingeben…",
   "Type to filter…": "Zum Filtern tippen…",
   Theme: "Design",
+  "Unix Terminal": "Unix-Terminal",
+  "Proton Purple": "Proton-Violett",
   "Follow Windows": "Windows folgen",
   dark: "dunkel",
   light: "hell",
