@@ -48,6 +48,8 @@ export interface Settings {
   sidebarTab: string;
   /** Show the inspector beside the hex view. */
   inspectorVisible: boolean;
+  /** 0 fits the available width; otherwise a fixed number of bytes in each hex row. */
+  hexBytesPerRow: number;
 }
 
 export const DEFAULTS: Settings = {
@@ -91,6 +93,7 @@ export const DEFAULTS: Settings = {
   sidebarVisible: false,
   sidebarTab: "folders",
   inspectorVisible: true,
+  hexBytesPerRow: 0,
 };
 
 /**

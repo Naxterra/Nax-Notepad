@@ -1354,11 +1354,25 @@ kbd {
   border-bottom: 1px solid var(--border);
 }
 .hex-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--fg-muted);
   white-space: nowrap;
+}
+.hex-layout { display: flex; align-items: center; gap: 10px; flex: 0 1 auto; min-width: 0; max-width: 100%; }
+.hex-row-select {
+  height: 24px;
+  max-width: 110px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 5px;
+  background: var(--input-bg);
+  color: var(--input-fg);
+  font: 11px var(--ui-font);
 }
 .hex-info {
   font-size: 12px;
@@ -1368,6 +1382,7 @@ kbd {
   text-overflow: ellipsis;
 }
 .hex-cols {
+  position: relative;
   flex: none;
   padding: 0 14px;
   font-family: var(--editor-font);
@@ -1379,6 +1394,7 @@ kbd {
   overflow: hidden;
   font-variant-ligatures: none;
 }
+.hex-measure { position: absolute; visibility: hidden; pointer-events: none; white-space: pre; }
 .hex-cols .hx-row {
   height: 26px;
 }

@@ -10,6 +10,7 @@ import { writeClipboard } from "../clipboard";
 import { HexBuffer, parseHex, textBytes, toHex } from "../hexbuffer";
 import { letterOf } from "../keymap";
 import { t } from "../i18n";
+import { settings, updateSettings } from "../settings";
 import { contextMenu, h, prompt, toast } from "./dialogs";
 
 export interface HexSession {
@@ -25,7 +26,7 @@ export interface HexSession {
   title?: string;
 }
 
-const BYTES_PER_ROW = 16;
+const MAX_BYTES_PER_ROW = 64;
 const MAX_VIRTUAL = 6_000_000; // px, keeps the scroll container within browser limits
 
 type Pane = "hex" | "ascii";
@@ -39,6 +40,11 @@ export class HexView {
   private header: HTMLElement;
   private titleEl: HTMLElement;
   private cols: HTMLElement;
+  private columnsRow: HTMLElement;
+  private measure: HTMLElement;
+  private rowMode: HTMLSelectElement;
+  private rowBytes = 16;
+  private renderSequence = 0;
   private listeners = new Set<() => void>();
   private scroller: HTMLElement;
   private spacer: HTMLElement;
@@ -58,11 +64,21 @@ export class HexView {
   constructor(parent: HTMLElement) {
     this.header = h("span", { class: "hex-info" });
     this.titleEl = h("span", { class: "hex-title-text" });
-    this.cols = h("div", { class: "hex-cols" });
+    this.columnsRow = h("div", { class: "hx-row" });
+    this.measure = h("span", { class: "hex-measure", "aria-hidden": "true" }, "0000000000000000");
+    this.cols = h("div", { class: "hex-cols" }, this.columnsRow, this.measure);
+    this.rowMode = h("select", { class: "hex-row-select", "aria-label": t("Bytes per row"), title: t("Bytes per row") }) as HTMLSelectElement;
+    for (const [value, label] of [[0, t("Auto")], [16, "16"], [32, "32"], [64, "64"]] as const) {
+      this.rowMode.append(h("option", { value: String(value) }, label));
+    }
+    this.rowMode.addEventListener("change", () => {
+      updateSettings({ hexBytesPerRow: Number(this.rowMode.value) });
+      this.render();
+    });
     this.spacer = h("div", { class: "hex-spacer" });
     this.body = h("div", { class: "hex-body" });
     this.scroller = h("div", { class: "hex-scroller", tabindex: "0" }, this.spacer, this.body);
-    this.root = h("div", { class: "hex-root" }, h("div", { class: "hex-title" }, this.titleEl, this.header), this.cols, this.scroller);
+    this.root = h("div", { class: "hex-root" }, h("div", { class: "hex-title" }, h("div", { class: "hex-layout" }, this.titleEl, this.rowMode), this.header), this.cols, this.scroller);
     this.root.style.display = "none";
     parent.appendChild(this.root);
     this.scroller.addEventListener("scroll", () => {
@@ -134,7 +150,7 @@ export class HexView {
     return this.buf.resizable && !this.session.readOnly ? this.size() : Math.max(0, this.size() - 1);
   }
   private rows(): number {
-    return Math.max(1, Math.ceil((this.maxCursor() + 1) / BYTES_PER_ROW));
+    return Math.max(1, Math.ceil((this.maxCursor() + 1) / this.rowBytes));
   }
   private visibleRows(): number {
     return Math.max(1, Math.floor(this.scroller.clientHeight / this.rowHeight));
@@ -188,7 +204,7 @@ export class HexView {
     if (!extend) this.anchor = null;
     this.cursor = Math.max(0, Math.min(offset, this.maxCursor()));
     this.nibble = 0;
-    const row = Math.floor(this.cursor / BYTES_PER_ROW);
+    const row = Math.floor(this.cursor / this.rowBytes);
     const vis = this.visibleRows();
     if (row < this.firstRow) this.setFirstRow(row);
     else if (row >= this.firstRow + vis) this.setFirstRow(row - vis + 1);
@@ -229,7 +245,7 @@ export class HexView {
     }
     this.nibble = 0;
     if (scroll) {
-      const row = Math.floor(Math.min(from, max) / BYTES_PER_ROW);
+      const row = Math.floor(Math.min(from, max) / this.rowBytes);
       const vis = this.visibleRows();
       if (row < this.firstRow || row >= this.firstRow + vis) this.setFirstRow(row - Math.floor(vis / 3));
       else this.render();
@@ -430,7 +446,7 @@ export class HexView {
     const ctrl = (e.ctrlKey || e.metaKey) && !altGr;
     const shift = e.shiftKey;
     const page = this.visibleRows() - 1;
-    const row = Math.floor(this.cursor / BYTES_PER_ROW) * BYTES_PER_ROW;
+    const row = Math.floor(this.cursor / this.rowBytes) * this.rowBytes;
     const k = e.key;
     const handled = () => {
       e.preventDefault();
@@ -452,16 +468,16 @@ export class HexView {
     const moves: Record<string, number> = {
       ArrowLeft: this.cursor - 1,
       ArrowRight: this.cursor + 1,
-      ArrowUp: this.cursor - BYTES_PER_ROW,
-      ArrowDown: this.cursor + BYTES_PER_ROW,
-      PageUp: this.cursor - page * BYTES_PER_ROW,
-      PageDown: this.cursor + page * BYTES_PER_ROW,
+      ArrowUp: this.cursor - this.rowBytes,
+      ArrowDown: this.cursor + this.rowBytes,
+      PageUp: this.cursor - page * this.rowBytes,
+      PageDown: this.cursor + page * this.rowBytes,
       Home: row,
-      End: row + BYTES_PER_ROW - 1,
+      End: row + this.rowBytes - 1,
     };
     if (k in moves) {
       handled();
-      if ((k === "ArrowUp" && this.cursor < BYTES_PER_ROW) || (k === "ArrowDown" && moves[k] > this.maxCursor() && Math.floor(this.cursor / 16) === Math.floor(this.maxCursor() / 16))) return;
+      if ((k === "ArrowUp" && this.cursor < this.rowBytes) || (k === "ArrowDown" && moves[k] > this.maxCursor() && Math.floor(this.cursor / this.rowBytes) === Math.floor(this.maxCursor() / this.rowBytes))) return;
       this.moveTo(moves[k], shift);
       this.userMoved();
       return;
@@ -564,25 +580,28 @@ export class HexView {
   private async renderNow(): Promise<void> {
     const s = this.session;
     if (!s) return;
+    const sequence = ++this.renderSequence;
     const b = s.buffer;
+    const width = Math.max(8, Math.max(b.size, 1).toString(16).length);
+    this.fitColumns(width);
+    const rowBytes = this.rowBytes;
     const first = this.firstRow;
     const count = this.visibleRows() + 1;
-    const startOff = first * BYTES_PER_ROW;
-    await b.ready(startOff, (first + count) * BYTES_PER_ROW);
-    if (this.session !== s || this.firstRow !== first) return; // stale
+    const startOff = first * rowBytes;
+    await b.ready(startOff, (first + count) * rowBytes);
+    if (this.session !== s || this.firstRow !== first || this.rowBytes !== rowBytes || this.renderSequence !== sequence) return; // stale
     const size = b.size;
-    const width = Math.max(8, Math.max(size, 1).toString(16).length);
     const sel = this.selection();
     const lastCursor = this.maxCursor();
     const out: string[] = [];
     for (let r = 0; r < count; r++) {
-      const off = (first + r) * BYTES_PER_ROW;
+      const off = (first + r) * this.rowBytes;
       if (off > lastCursor && off >= size) break;
       let hex = "";
       let ascii = "";
-      for (let i = 0; i < BYTES_PER_ROW; i++) {
+      for (let i = 0; i < this.rowBytes; i++) {
         const o = off + i;
-        const gap = i === 7 ? "  " : " ";
+        const gap = i % 8 === 7 && i < this.rowBytes - 1 ? "  " : " ";
         if (o > lastCursor && o >= size) {
           hex += "  " + gap;
           continue;
@@ -605,9 +624,9 @@ export class HexView {
     }
     this.body.innerHTML = out.join("");
     let cols = `<span class="hx-off">${"OFFSET".padEnd(width, " ")}</span>  `;
-    for (let i = 0; i < BYTES_PER_ROW; i++) cols += i.toString(16).padStart(2, "0").toUpperCase() + (i === 7 ? "  " : " ");
-    this.cols.innerHTML = `<div class="hx-row">${cols} <span class="hx-bar">|</span>${this.pane === "ascii" ? "<b>ASCII</b>" : "ASCII"}</div>`;
-    this.titleEl.textContent = s.title ?? t("Hex · 16 bytes per row");
+    for (let i = 0; i < this.rowBytes; i++) cols += i.toString(16).padStart(2, "0").toUpperCase() + (i % 8 === 7 && i < this.rowBytes - 1 ? "  " : " ");
+    this.columnsRow.innerHTML = `${cols} <span class="hx-bar">|</span>${this.pane === "ascii" ? "<b>ASCII</b>" : "ASCII"}`;
+    this.titleEl.textContent = s.title ?? t("Hex · {n} bytes per row", { n: this.rowBytes });
     this.body.style.top = `${this.scaled() ? this.scroller.scrollTop : first * this.rowHeight}px`;
     const parts = [
       `${size.toLocaleString()} ${t("bytes")}`,
@@ -619,5 +638,34 @@ export class HexView {
     this.header.textContent = parts.join("  ·  ");
     this.header.title = s.readOnly ?? t("Tab switches between hex and characters, Insert between insert and overwrite.");
     this.notify();
+  }
+
+  /** Fit whole groups of eight using the actual rendered font, without stretching the bytes. */
+  private fitColumns(offsetWidth: number): void {
+    const mode = [16, 32, 64].includes(settings.hexBytesPerRow) ? settings.hexBytesPerRow : 0;
+    this.rowMode.value = String(mode);
+    let next = mode;
+    if (!next) {
+      const charWidth = this.measure.getBoundingClientRect().width / 16;
+      if (!charWidth || !this.scroller.clientWidth) return;
+      const style = getComputedStyle(this.body);
+      const available = this.scroller.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - 2;
+      next = MAX_BYTES_PER_ROW;
+      // Offset, separators, 2 hex digits + space and 1 ASCII character per byte, with 8-byte gaps.
+      while (next > 8 && (offsetWidth + 5 + 4 * next + Math.floor((next - 1) / 8)) * charWidth > available) next -= 8;
+    }
+    if (next === this.rowBytes) return;
+    const topByte = this.firstRow * this.rowBytes;
+    const oldCursorRow = Math.floor(this.cursor / this.rowBytes);
+    const cursorWasVisible = oldCursorRow >= this.firstRow && oldCursorRow < this.firstRow + this.visibleRows();
+    this.rowBytes = next;
+    let first = Math.floor(topByte / next);
+    if (cursorWasVisible) {
+      const row = Math.floor(this.cursor / next);
+      first = Math.max(0, Math.min(first, row));
+      first = Math.max(first, row - this.visibleRows() + 1);
+    }
+    this.spacer.style.height = `${this.virtualHeight()}px`;
+    this.setFirstRow(first);
   }
 }

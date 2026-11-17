@@ -130,7 +130,7 @@ async function main(): Promise<void> {
             hex.show(
               {
                 ...info,
-                title: split ? t("Hex · linked to the text") : t("Hex · 16 bytes per row"),
+                title: split ? t("Hex · linked to the text") : undefined,
                 onChange: () => app.noteHexChange(tab),
                 onSelect: (from, to) => (split ? hexToText(tab, from, to) : undefined),
               },
@@ -257,6 +257,7 @@ async function main(): Promise<void> {
     app.emit("status");
     for (const ins of inspectors) ins.refresh();
     for (const bar of docBars) bar.render();
+    for (const hex of hexes) hex.render();
   });
   onSystemThemeChange(() => {
     if (settings.theme === "system") applyTheme("system");

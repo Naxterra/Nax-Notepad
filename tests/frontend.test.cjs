@@ -1987,6 +1987,20 @@ test("copying an unaligned 16 MiB hex selection preserves bytes despite cache ev
   } finally { clipboard.writeClipboard = oldWrite; }
 });
 
+test("hex ArrowDown keeps its byte on the last partial auto-sized row", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const { HexView } = load("ui/hexview");
+  const buffer = await HexBuffer.load(memSource(new Uint8Array(35)), 0);
+  const hex = Object.create(HexView.prototype);
+  Object.assign(hex, { session: { buffer, readOnly: null }, rowBytes: 24, cursor: 25, rowHeight: 20, scroller: { clientHeight: 100 } });
+  let moved = false;
+  hex.moveTo = () => { moved = true; };
+  hex.userMoved = () => {};
+  hex.onKey({ key: "ArrowDown", preventDefault() {}, stopPropagation() {} });
+  assert.equal(moved, false);
+  assert.equal(hex.cursor, 25);
+});
+
 (async () => {
   let failures = 0;
   for (const [name, fn] of tests) {
