@@ -407,7 +407,8 @@ export class HexView {
     }
     if (!text || !unchanged()) return;
     const bytes = pane === "hex" ? (parseHex(text) ?? textBytes(text)) : textBytes(text);
-    await buf.ready(cursor, cursor + bytes.length);
+    const at = this.selection()?.from ?? cursor;
+    await buf.ready(at, at + bytes.length);
     if (!unchanged() || !this.editable()) return;
     this.put(bytes);
   }

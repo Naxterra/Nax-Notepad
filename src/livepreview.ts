@@ -4,6 +4,7 @@ import { syntaxTree } from "@codemirror/language";
 import { EditorState, Extension, Range, StateEffect } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, WidgetType } from "@codemirror/view";
 import type { SyntaxNode, SyntaxNodeRef } from "@lezer/common";
+import { t } from "./i18n";
 
 export interface LivePreviewConfig {
   /** Resolve an image source (relative or absolute) to a URL the webview can load; null when it must not be loaded. */
@@ -97,7 +98,7 @@ class ImageWidget extends WidgetType {
     img.alt = this.alt;
     img.title = this.alt;
     img.addEventListener("error", () => {
-      wrap.textContent = `🖼 ${this.alt || this.src} (not found)`;
+      wrap.textContent = `🖼 ${this.alt || this.src} (${t("not found")})`;
       wrap.classList.add("cm-lp-image-missing");
     });
     wrap.appendChild(img);

@@ -18,7 +18,7 @@ import { HexBuffer } from "./hexbuffer";
 import { detectIndent, IndentInfo } from "./indentdetect";
 import { livePreview, LivePreviewConfig } from "./livepreview";
 import { PagedController, PagedHost, pagedLineExtensions, windowText } from "./paged";
-import { basename, dirname, imageSource, joinPath, safeDecode } from "./paths";
+import { basename, imageSource } from "./paths";
 import { settings, updateSettings } from "./settings";
 import { whitespaceExt } from "./whitespace";
 import { confirm3, confirmDialog, toast } from "./ui/dialogs";
@@ -499,7 +499,12 @@ export class App {
       openLink: (href) => {
         const path = this.owner(tab).path;
         if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) void openUrl(href);
-        else if (path) void this.openFiles([joinPath(dirname(path), safeDecode(href.split("#")[0]))]);
+        else if (path) {
+          const target = href.split("#")[0];
+          if (!target) return;
+          const local = imageSource(target, path, false);
+          if (local && "path" in local) void this.openFiles([local.path]);
+        }
       },
     };
   }
@@ -723,9 +728,12 @@ export class App {
     updateSettings({ recentFiles: [] }, { silent: true });
   }
 
-  private async openOne(path: string, id?: string, restoreOpts?: { livePreview?: boolean; languageName?: string | null; paged?: boolean; hexView?: boolean; pane?: 0 | 1 }): Promise<Tab> {
+  private async openOne(path: string, id?: string, restoreOpts?: { livePreview?: boolean; languageName?: string | null; paged?: boolean; hexView?: boolean; pane?: 0 | 1; encoding?: string | null; readOnly?: boolean }): Promise<Tab> {
     const tabId = id ?? newId();
-    const res = restoreOpts?.paged ? await backend.pagedRestore(tabId, path).catch(() => backend.openPath(tabId, path)) : await backend.openPath(tabId, path);
+    const forcedEnc = restoreOpts?.encoding ?? null;
+    const res = restoreOpts?.paged
+      ? await backend.pagedRestore(tabId, path).catch(() => backend.openPath(tabId, path, false, forcedEnc))
+      : await backend.openPath(tabId, path, false, forcedEnc);
     const tab = this.makeTab({
       id: tabId,
       path: res.path,
@@ -735,7 +743,7 @@ export class App {
       eol: res.eol,
       mtime: res.mtime,
       size: res.size,
-      readOnly: res.readOnly,
+      readOnly: res.readOnly || !!restoreOpts?.readOnly,
       livePreview: restoreOpts?.livePreview ?? settings.livePreviewDefault,
       pane: restoreOpts?.pane,
     });
@@ -955,7 +963,9 @@ export class App {
       if (tab.kind === "paged" && tab.paged) {
         rev = tab.revision;
         await tab.paged.commit();
-        r = await backend.pagedSave(tab.id, isSaveAs ? target : undefined, opts.overwrite ?? false);
+        const overwrite = opts.overwrite ?? isSaveAs;
+        const expected = isSaveAs ? null : (tab.externalAck ?? null);
+        r = await backend.pagedSave(tab.id, isSaveAs ? target : undefined, overwrite, expected);
       } else {
         this.applySaveTransforms(tab);
         rev = tab.revision;
@@ -1022,9 +1032,15 @@ export class App {
         [t("Save as UTF-8"), t("Replace with ?")]
       );
       if (r === "yes") {
+        const prevEncoding = tab.encoding;
         tab.encoding = "UTF-8";
         this.emit("status");
-        return this.writeTab(tab, target, isSaveAs, opts);
+        const ok = await this.writeTab(tab, target, isSaveAs, opts);
+        if (!ok) {
+          tab.encoding = prevEncoding;
+          this.emit("status");
+        }
+        return ok;
       }
       if (r === "no") return this.writeTab(tab, target, isSaveAs, { ...opts, lossy: true });
       return false;
@@ -1381,10 +1397,19 @@ export class App {
         const wasMissing = tail.missing;
         tail.missing = r.status === "missing";
         if (r.status === "appended") {
-          if (r.text) this.appendFollowed(tab, r.text);
-          tail.offset = r.offset;
-          tab.size = r.offset;
-          tab.mtime = r.mtime;
+          if (r.headHash != null && r.headLen != null) {
+            tail.headHash = r.headHash;
+            tail.headLen = r.headLen;
+          }
+          if (r.offset >= 48 * 1024 * 1024) {
+            await this.reload(tab);
+            this.scrollToEnd(tab);
+          } else {
+            if (r.text) this.appendFollowed(tab, r.text);
+            tail.offset = r.offset;
+            tab.size = r.offset;
+            tab.mtime = r.mtime;
+          }
         } else if (r.status === "rotated") {
           await this.reload(tab);
           toast(t('"{name}" was replaced on disk and has been reloaded.', { name: tab.name }));
@@ -1475,6 +1500,7 @@ export class App {
     tab.eol = eol;
     this.noteUserEdit(tab);
     if (tab.kind === "memory") this.scheduleBufferStore(tab);
+    else if (tab.kind === "paged") void backend.pagedStoreEdits(tab.id).catch((e) => this.reportBackgroundError(tab, e));
     for (const x of [tab, ...this.clonesOf(tab)]) this.dispatchTo(x, { effects: compartments.whitespace.reconfigure(this.whitespaceExtFor(x)) });
     this.emit("tabs");
     this.emit("status");
@@ -1616,8 +1642,15 @@ export class App {
   private async storeHexRecovery(tab: Tab): Promise<void> {
     // Capture synchronously. Edits arriving during IPC belong to the next generation.
     if (!tab.hex?.dirty) return;
+    const gen = bufferGeneration(tab.hexRecoveryRevision ?? 0);
+    const rawSnap = typeof backend.sessionStoreHexRaw === "function" ? tab.hex.rawSnapshot() : null;
+    if (rawSnap) {
+      const recovery: HexRecovery = { version: 1, tab: this.tabMeta(tab), buffer: rawSnap.meta, stamp: tab.hexStamp };
+      await backend.sessionStoreHexRaw(tab.id, recovery, rawSnap.raw, gen);
+      return;
+    }
     const recovery: HexRecovery = { version: 1, tab: this.tabMeta(tab), buffer: tab.hex.snapshot(), stamp: tab.hexStamp };
-    await backend.sessionStoreHex(tab.id, recovery, bufferGeneration(tab.hexRecoveryRevision ?? 0));
+    await backend.sessionStoreHex(tab.id, recovery, gen);
   }
 
   private async dropHexRecovery(tab: Tab): Promise<void> {
@@ -1668,8 +1701,9 @@ export class App {
         tab.paged?.resetRevisions();
         await backend.pagedClose(tab.id);
       }
-      if (buf.resizable) await backend.writeBytes(target, buf.bytes().slice(), isSaveAs ? 0 : tab.mtime, isSaveAs ? undefined : buf.originalSize);
-      else await backend.patchFile(path, buf.patchList(), buf.originalSize, tab.mtime, isSaveAs ? target : undefined);
+      const expectedMtime = tab.hexStamp?.mtime ?? tab.mtime;
+      if (buf.resizable) await backend.writeBytes(target, buf.bytes().slice(), isSaveAs ? 0 : expectedMtime, isSaveAs ? undefined : buf.originalSize);
+      else await backend.patchFile(path, buf.patchList(), buf.originalSize, expectedMtime, isSaveAs ? target : undefined);
     } catch (e) {
       if (paged) await this.reopenPaged(tab).catch(() => undefined);
       const msg = errorText(e);
@@ -1697,7 +1731,7 @@ export class App {
 
   private async reopenPaged(tab: Tab): Promise<void> {
     if (!tab.path || !tab.paged) return;
-    const res = await backend.openPath(tab.id, tab.path, true);
+    const res = await backend.openPath(tab.id, tab.path, true, tab.encoding);
     tab.paged.totalLines = res.lineCount ?? 1;
     await tab.paged.load(tab.paged.firstLine, tab.paged.cursorLine());
   }
@@ -1938,32 +1972,35 @@ export class App {
       this.restoring = false;
       this.sessionHeld = false;
       this.scheduleSessionSave();
-      this.reportRestoreProblems();
-      if (unmatched.length) {
-        void message(t("These saved file changes can no longer be matched to their files. The recovery files have been kept:\n\n{files}", { files: unmatched.join("\n") }), {
-          title: t("Unsaved changes kept"),
-          kind: "warning",
-        });
-      }
+      this.reportRestoreProblems(unmatched);
     }
   }
 
   /** Show the unsaved changes that were lost or kept for later, once, and forget them. */
-  private reportRestoreProblems(): void {
-    if (this.lostEdits?.length) {
-      void message(t("Unsaved changes to these files could not be restored, because the files were changed by another program or their recovery data is missing:\n\n{files}", { files: this.lostEdits.join("\n") }), {
-        title: t("Unsaved changes lost"),
-        kind: "warning",
-      });
-    }
-    if (this.notRestored?.length) {
-      void message(t("Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}", { files: this.notRestored.join("\n") }), {
-        title: t("Unsaved changes kept"),
-        kind: "warning",
-      });
-    }
-    this.lostEdits = [];
-    this.notRestored = [];
+  private reportRestoreProblems(unmatched: string[] = []): void {
+    const lost = this.lostEdits?.splice(0) ?? [];
+    const kept = this.notRestored?.splice(0) ?? [];
+    if (!lost.length && !kept.length && !unmatched.length) return;
+    void (async () => {
+      if (lost.length) {
+        await message(t("Unsaved changes to these files could not be restored, because the files were changed by another program or their recovery data is missing:\n\n{files}", { files: lost.join("\n") }), {
+          title: t("Unsaved changes lost"),
+          kind: "warning",
+        });
+      }
+      if (kept.length) {
+        await message(t("Unsaved changes to these files could not be restored now. They are kept and tried again at the next start:\n\n{files}", { files: kept.join("\n") }), {
+          title: t("Unsaved changes kept"),
+          kind: "warning",
+        });
+      }
+      if (unmatched.length) {
+        await message(t("These saved file changes can no longer be matched to their files. The recovery files have been kept:\n\n{files}", { files: unmatched.join("\n") }), {
+          title: t("Unsaved changes kept"),
+          kind: "warning",
+        });
+      }
+    })();
   }
 
   /**
@@ -2011,6 +2048,7 @@ export class App {
     };
     const pane: 0 | 1 = m.pane === 1 && this.splitOn ? 1 : 0;
     let tab: Tab | null = null;
+    let fromBuffer = false;
     const hexRecovery = await backend.sessionLoadHex(meta.id);
     if (hexRecovery) {
       tab = await this.restoreHexTab(meta, hexRecovery, pane);
@@ -2021,11 +2059,12 @@ export class App {
         if (m.dirty) await this.keepForLater(meta);
         return null;
       }
-      tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView, pane });
+      tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, paged: true, hexView: m.hexView, pane, readOnly: m.readOnly });
       if (m.dirty && !tab.dirty) this.lostEdits.push(meta.path);
     } else {
       const buffer = await backend.sessionLoadBuffer(meta.id);
       if (buffer !== null) {
+        fromBuffer = true;
         tab = this.makeTab({
           id: meta.id,
           path: meta.path,
@@ -2054,11 +2093,11 @@ export class App {
         // showing the file as it is on disk.
         if (m.dirty) this.lostEdits.push(meta.path);
         if (!(await backend.pathExists(meta.path))) return null;
-        tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, hexView: m.hexView, pane });
+        tab = await this.openOne(meta.path, meta.id, { livePreview: m.livePreview, languageName: m.languageName, hexView: m.hexView, pane, encoding: m.encoding ?? null, readOnly: m.readOnly });
       } else {
         if (m.dirty) this.lostEdits.push(m.name ?? untitledName(m.untitled ?? 1));
         // untitled with no stored buffer: empty tab
-        tab = this.makeTab({ id: meta.id, name: untitledName(m.untitled ?? 1), kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview, pane });
+        tab = this.makeTab({ id: meta.id, name: untitledName(m.untitled ?? 1), kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview, pane, readOnly: m.readOnly });
         tab.state = this.buildState(tab, "", []);
         this.insertTab(tab);
       }
@@ -2066,9 +2105,12 @@ export class App {
     if (!tab) return null;
     tab.pinned = m.pinned ?? false;
     tab.splitView = !hexRecovery && !!m.splitView && tab.hexView;
-    if (m.encoding && tab.kind === "memory") tab.encoding = m.encoding;
-    if (m.eol) tab.eol = m.eol;
-    if (m.readOnly) tab.readOnly = true;
+    if (fromBuffer && m.encoding && tab.kind === "memory") tab.encoding = m.encoding;
+    if (fromBuffer && m.eol) tab.eol = m.eol;
+    if (m.readOnly) {
+      tab.readOnly = true;
+      this.applyReadOnly(tab);
+    }
     if (m.indent !== undefined && tab.kind === "memory") {
       tab.indent = m.indent;
       tab.state = tab.state.update({ effects: compartments.indent.reconfigure(this.indentExtFor(tab)) }).state;
@@ -2083,7 +2125,8 @@ export class App {
     if (recovery.version !== 1 || recovery.tab?.id !== meta.id || typeof recovery.tab.path !== "string" || !recovery.tab.path || !recovery.buffer) throw new Error(t("The saved byte changes are damaged and could not be restored."));
     const path = recovery.tab.path;
     const source = this.hexSource(path, recovery.buffer.originalSize);
-    const buffer = HexBuffer.restore(recovery.buffer, source);
+    const rawBytes = recovery.buffer.bytesFile ? await backend.sessionLoadHexBytes(meta.id) : undefined;
+    const buffer = HexBuffer.restore(recovery.buffer, source, rawBytes);
     const resizable = buffer.resizable;
     if (!resizable) {
       const stamp = await backend.hexSourceStamp(path);

@@ -394,7 +394,23 @@ export function buildCommands(app: App, find: FindPanel, extras: CommandExtras):
     { id: "edit.title", title: t("Title Case"), category: t("Edit"), run: () => transformSelection((s) => s.replace(/\b\p{L}/gu, (c) => c.toUpperCase())) },
     { id: "edit.sortAsc", title: t("Sort Lines Ascending"), category: t("Edit"), run: () => transformLines((l) => [...l].sort((a, b) => a.localeCompare(b))) },
     { id: "edit.sortDesc", title: t("Sort Lines Descending"), category: t("Edit"), run: () => transformLines((l) => [...l].sort((a, b) => b.localeCompare(a))) },
-    { id: "edit.sortNum", title: t("Sort Lines Numerically"), category: t("Edit"), run: () => transformLines((l) => [...l].sort((a, b) => parseFloat(a) - parseFloat(b))) },
+    {
+      id: "edit.sortNum",
+      title: t("Sort Lines Numerically"),
+      category: t("Edit"),
+      run: () =>
+        transformLines((l) =>
+          [...l].sort((a, b) => {
+            const na = parseFloat(a);
+            const nb = parseFloat(b);
+            const aNum = Number.isFinite(na);
+            const bNum = Number.isFinite(nb);
+            if (aNum && bNum) return na !== nb ? na - nb : a.localeCompare(b);
+            if (aNum !== bNum) return aNum ? -1 : 1;
+            return a.localeCompare(b);
+          })
+        ),
+    },
     { id: "edit.dedupe", title: t("Remove Duplicate Lines"), category: t("Edit"), run: () => transformLines((l) => [...new Set(l)]) },
     { id: "edit.removeEmpty", title: t("Remove Empty Lines"), category: t("Edit"), run: () => transformLines((l) => l.filter((x) => x.trim() !== "")) },
     { id: "edit.reverse", title: t("Reverse Lines"), category: t("Edit"), run: () => transformLines((l) => [...l].reverse()) },
@@ -455,11 +471,24 @@ export function buildCommands(app: App, find: FindPanel, extras: CommandExtras):
       run: () => {
         if (!bookmarkGuard() || !writable()) return;
         const st = v().state;
-        const changes = bookmarkLines(st).map((n) => {
-          const l = st.doc.line(n);
-          return n < st.doc.lines ? { from: l.from, to: l.to + 1 } : { from: Math.max(0, l.from - 1), to: l.to };
-        });
-        if (changes.length) v().dispatch({ changes, userEvent: "delete.line" });
+        const lines = bookmarkLines(st);
+        if (!lines.length) return;
+        if (lines.length === st.doc.lines) {
+          v().dispatch({ changes: { from: 0, to: st.doc.length }, userEvent: "delete.line" });
+          return;
+        }
+        // Group consecutive bookmarked lines so adjacent deletions near EOF never overlap.
+        const changes: { from: number; to: number }[] = [];
+        for (let i = 0; i < lines.length; ) {
+          const start = lines[i];
+          let end = start;
+          while (i + 1 < lines.length && lines[i + 1] === end + 1) end = lines[++i];
+          i++;
+          const first = st.doc.line(start);
+          const last = st.doc.line(end);
+          changes.push(end < st.doc.lines ? { from: first.from, to: last.to + 1 } : { from: first.from - 1, to: last.to });
+        }
+        v().dispatch({ changes, userEvent: "delete.line" });
       },
     },
     // View

@@ -232,7 +232,7 @@ export function pickList(title: string, items: PickItem[], opts: { placeholder?:
         done(null);
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
-        index = Math.min(index + 1, filtered.length - 1);
+        index = Math.min(index + 1, Math.max(0, Math.min(filtered.length, 200) - 1));
         render();
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
@@ -240,7 +240,7 @@ export function pickList(title: string, items: PickItem[], opts: { placeholder?:
         render();
       } else if (e.key === "PageDown") {
         e.preventDefault();
-        index = Math.min(index + 10, filtered.length - 1);
+        index = Math.min(index + 10, Math.max(0, Math.min(filtered.length, 200) - 1));
         render();
       } else if (e.key === "PageUp") {
         e.preventDefault();

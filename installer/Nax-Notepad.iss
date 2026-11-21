@@ -56,6 +56,8 @@ Name: "german"; MessagesFile: "compiler:Languages\German.isl"
 [CustomMessages]
 english.ContextMenu=Add "Open with Nax-Notepad" to the Explorer context menu
 german.ContextMenu="Mit Nax-Notepad öffnen" zum Explorer-Kontextmenü hinzufügen
+english.ContextMenuLabel=Open with Nax-Notepad
+german.ContextMenuLabel=Mit Nax-Notepad öffnen
 english.Integration=Integration:
 german.Integration=Integration:
 english.Assoc=File associations:
@@ -95,7 +97,7 @@ Name: "{autodesktop}\Nax-Notepad"; Filename: "{app}\nax-notepad.exe"; Tasks: des
 ; App Paths entry so "nax-notepad" works from Run and the command line
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\nax-notepad.exe"; ValueType: string; ValueName: ""; ValueData: "{app}\nax-notepad.exe"; Flags: uninsdeletekey
 ; Explorer context menu for every file
-Root: HKA; Subkey: "Software\Classes\*\shell\Nax-Notepad"; ValueType: string; ValueName: ""; ValueData: "Open with Nax-Notepad"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\*\shell\Nax-Notepad"; ValueType: string; ValueName: ""; ValueData: "{cm:ContextMenuLabel}"; Flags: uninsdeletekey; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\*\shell\Nax-Notepad"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\nax-notepad.exe"""; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\*\shell\Nax-Notepad\command"; ValueType: string; ValueName: ""; ValueData: """{app}\nax-notepad.exe"" ""%1"""; Tasks: contextmenu
 ; ProgID used by the optional associations
@@ -123,12 +125,25 @@ Root: HKA; Subkey: "Software\Classes\Applications\nax-notepad.exe\SupportedTypes
 Root: HKA; Subkey: "Software\Classes\Applications\nax-notepad.exe\SupportedTypes"; ValueType: string; ValueName: ".py"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\nax-notepad.exe\SupportedTypes"; ValueType: string; ValueName: ".sql"; ValueData: ""
 ; Optional PATH entry (user scope)
-Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))
+Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{code:AppendToUserPath}"; Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))
 
 [Run]
 Filename: "{app}\nax-notepad.exe"; Description: "{cm:LaunchProgram,Nax-Notepad}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function AppendToUserPath(Param: string): string;
+var
+  OrigPath, Dir: string;
+begin
+  Dir := ExpandConstant('{app}');
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', OrigPath) or (Trim(OrigPath) = '') then
+    Result := Dir
+  else if OrigPath[Length(OrigPath)] = ';' then
+    Result := OrigPath + Dir
+  else
+    Result := OrigPath + ';' + Dir;
+end;
+
 function NeedsAddPath(Param: string): boolean;
 var
   OrigPath: string;

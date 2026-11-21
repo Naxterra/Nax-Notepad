@@ -20,11 +20,34 @@ export function stickyRegex(q: SearchQuery): RegExp | null {
   }
 }
 
-/** Expand a JavaScript-style replacement template for one match. */
+/** Expand a JavaScript-style replacement template for one match (including \n, \r, \t, \\). */
 export function expandReplacement(template: string, m: RegExpExecArray, input: string): string {
   let out = "";
   for (let i = 0; i < template.length; i++) {
     const c = template[i];
+    if (c === "\\" && i + 1 < template.length) {
+      const next = template[i + 1];
+      if (next === "n") {
+        out += "\n";
+        i++;
+        continue;
+      }
+      if (next === "r") {
+        out += "\r";
+        i++;
+        continue;
+      }
+      if (next === "t") {
+        out += "\t";
+        i++;
+        continue;
+      }
+      if (next === "\\") {
+        out += "\\";
+        i++;
+        continue;
+      }
+    }
     if (c !== "$" || i + 1 >= template.length) {
       out += c;
       continue;

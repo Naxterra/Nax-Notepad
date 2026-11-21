@@ -2,7 +2,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
 import { settings, updateSettings } from "./settings";
-import { confirmDialog, toast } from "./ui/dialogs";
+import { confirmDialog, isModalOpen, toast } from "./ui/dialogs";
 
 class GitHubHttpError extends Error {
   constructor(readonly status: number) {
@@ -78,12 +78,15 @@ export async function checkForUpdates(silent: boolean): Promise<void> {
       if (go) void openUrl(RELEASES_URL);
     }
     return;
-  } finally {
-    updateSettings({ lastUpdateCheck: Date.now() });
   }
+  updateSettings({ lastUpdateCheck: Date.now() }, { silent: true });
   const latest = rel.tag_name.replace(/^v/i, "");
   if (!isNewer(latest, APP_VERSION)) {
     if (!silent) toast(t("You are up to date ({version}).", { version: APP_VERSION }));
+    return;
+  }
+  if (silent && isModalOpen()) {
+    toast(t("Nax-Notepad {version} is available", { version: latest }), 6000);
     return;
   }
   const text = t("Version {latest} is available (you have {current}).", { latest, current: APP_VERSION }) + (rel.body ? `\n\n${rel.body.slice(0, 600)}` : "");

@@ -91,7 +91,8 @@ export function openSettingsDialog(actions: SettingsDialogActions = {}): void {
         const inp = h("input", { class: "input", type: "number", min: String(f.min), max: String(f.max) }) as HTMLInputElement;
         inp.value = String(cur);
         inp.addEventListener("change", () => {
-          const v = Math.max(f.min, Math.min(f.max, Number(inp.value) || Number(DEFAULTS[f.key])));
+          const parsed = Number(inp.value);
+          const v = Math.max(f.min, Math.min(f.max, inp.value.trim() !== "" && Number.isFinite(parsed) ? parsed : Number(DEFAULTS[f.key])));
           inp.value = String(v);
           updateSettings({ [f.key]: v } as Partial<Settings>);
         });
@@ -199,7 +200,11 @@ export async function importSettings(onApplied: () => void): Promise<void> {
   if (typeof sel !== "string") return;
   let raw: Record<string, unknown>;
   try {
-    raw = JSON.parse(await backend.readTextFile(sel, 4 << 20));
+    const parsed: unknown = JSON.parse(await backend.readTextFile(sel, 4 << 20));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(t("Expected an object with settings."));
+    }
+    raw = parsed as Record<string, unknown>;
   } catch (e) {
     await message(t("Import Settings"), t("The file is not a valid settings file: {error}", { error: errorText(e) }));
     return;

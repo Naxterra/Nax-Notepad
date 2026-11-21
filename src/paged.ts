@@ -243,7 +243,12 @@ export class PagedController {
       this.host.view()?.focus();
       return;
     }
-    await this.load(Math.max(0, abs - Math.floor(this.windowLines / 2)), abs, col);
+    const start = Math.max(0, abs - Math.floor(this.windowLines / 2));
+    await this.load(start, abs, col);
+    // Preceding very long lines can hit MAX_WINDOW_BYTES before reaching `abs`; fall back to loading at `abs`.
+    if (abs < this.firstLine || abs >= this.firstLine + this.count) {
+      await this.load(abs, abs, col);
+    }
     this.host.view()?.focus();
   }
 
@@ -290,13 +295,26 @@ export class PagedController {
   async selectMatch(m: PagedMatch): Promise<void> {
     if (m.line < this.firstLine || m.line >= this.firstLine + this.count) {
       await this.load(Math.max(0, m.line - Math.floor(this.windowLines / 2)));
+      if (m.line < this.firstLine || m.line >= this.firstLine + this.count) {
+        await this.load(m.line);
+      }
     }
     const st = this.host.state();
-    const line = st.doc.line(Math.min(m.line - this.firstLine + 1, st.doc.lines));
-    const startChar = byteToChar(line.text, m.col);
-    const endChar = byteToChar(line.text, m.col + m.len);
+    const startRel = Math.max(0, Math.min(m.line - this.firstLine, st.doc.lines - 1));
+    const startLine = st.doc.line(startRel + 1);
+    const startChar = byteToChar(startLine.text, m.col);
+    let head: number;
+    if (m.endLine !== undefined && m.endCol !== undefined && m.endLine >= m.line) {
+      const endRel = Math.max(startRel, Math.min(m.endLine - this.firstLine, st.doc.lines - 1));
+      const endLine = st.doc.line(endRel + 1);
+      const endChar = m.endLine - this.firstLine >= st.doc.lines ? endLine.text.length : byteToChar(endLine.text, m.endCol);
+      head = Math.min(endLine.from + endChar, endLine.to);
+    } else {
+      const endChar = byteToChar(startLine.text, m.col + m.len);
+      head = Math.min(startLine.from + endChar, startLine.to);
+    }
     this.host.dispatch({
-      selection: { anchor: line.from + startChar, head: Math.min(line.from + endChar, line.to) },
+      selection: { anchor: startLine.from + startChar, head: Math.max(startLine.from + startChar, head) },
       scrollIntoView: true,
     });
     this.host.view()?.focus();

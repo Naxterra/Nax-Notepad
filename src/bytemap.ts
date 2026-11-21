@@ -11,7 +11,7 @@ const SINGLE_BYTE = /^(windows-125\d|iso-8859-\d+|koi8-[ru]|macintosh|ibm866|x-m
 function widthFor(encoding: string): { width: Width; unit: number } | null {
   const e = encoding.toUpperCase();
   if (e === "UTF-8" || e === "UTF-8-BOM") return { width: (cp) => (cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4), unit: 1 };
-  if (e === "UTF-16LE" || e === "UTF-16BE") return { width: (cp) => (cp < 0x10000 ? 2 : 4), unit: 2 };
+  if (e === "UTF-16LE" || e === "UTF-16BE" || e === "UTF-16LE-NOBOM" || e === "UTF-16BE-NOBOM") return { width: (cp) => (cp < 0x10000 ? 2 : 4), unit: 2 };
   if (SINGLE_BYTE.test(encoding)) return { width: () => 1, unit: 1 };
   return null;
 }
@@ -51,7 +51,8 @@ export function createByteMap(doc: Text, encoding: string, eol: "LF" | "CRLF" | 
   starts[doc.lines] = total;
   // A byte order mark is not part of the text.
   const bom = fileSize - total;
-  if (!(bom === 0 || (bom === 3 && w.unit === 1 && /UTF-8/i.test(encoding)) || (bom === 2 && w.unit === 2))) return null;
+  const allowUtf16Bom = w.unit === 2 && !/NOBOM$/i.test(encoding);
+  if (!(bom === 0 || (bom === 3 && w.unit === 1 && /UTF-8/i.test(encoding)) || (bom === 2 && allowUtf16Bom))) return null;
 
   return {
     toByte(pos: number): number {

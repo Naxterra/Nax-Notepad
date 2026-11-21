@@ -176,7 +176,7 @@ export function mountMenuBar(root: HTMLElement, getCmds: () => Command[], dynami
     return items.length;
   };
 
-  const buildDrop = (items: MenuItem[], left: number, top: number, level: number) => {
+  const buildDrop = (items: MenuItem[], left: number, top: number, level: number, parentLeft?: number) => {
     closeFrom(level);
     const byId = new Map(getCmds().map((c) => [c.id, c]));
     const drop = h("div", { class: "menu-drop" });
@@ -202,8 +202,8 @@ export function mountMenuBar(root: HTMLElement, getCmds: () => Command[], dynami
             const sub = h("div", { class: "menu-drop" });
             sub.addEventListener("mousedown", (e) => e.preventDefault());
             if (!dynamicRows(it.dynamic, sub, level + 1)) sub.append(h("div", { class: "ctx-item disabled" }, h("span", { class: "menu-check" }), t("(empty)")));
-            place(sub, r.right - 2, r.top - 5, level + 1);
-          } else buildDrop(it.items, r.right - 2, r.top - 5, level + 1);
+            place(sub, r.right - 2, r.top - 5, level + 1, r.left);
+          } else buildDrop(it.items, r.right - 2, r.top - 5, level + 1, r.left);
         });
         drop.append(row);
         continue;
@@ -226,16 +226,18 @@ export function mountMenuBar(root: HTMLElement, getCmds: () => Command[], dynami
       row.addEventListener("mouseenter", () => closeFrom(level + 1));
       drop.append(row);
     }
-    place(drop, left, top, level);
+    place(drop, left, top, level, parentLeft);
   };
 
-  const place = (drop: HTMLElement, left: number, top: number, level: number) => {
+  const place = (drop: HTMLElement, left: number, top: number, level: number, parentLeft?: number) => {
     document.body.appendChild(drop);
     // Keep the dropdown inside the window: scroll when too tall, flip when too far right.
     const maxH = window.innerHeight - top - 8;
     drop.style.maxHeight = `${Math.max(120, maxH)}px`;
     const w = drop.getBoundingClientRect().width;
-    if (left + w > window.innerWidth - 4) left = Math.max(4, (level === 0 ? left : left - w * 2 + 4) - (level === 0 ? left + w - window.innerWidth + 4 : 0));
+    if (left + w > window.innerWidth - 4) {
+      left = level === 0 ? Math.max(4, window.innerWidth - w - 4) : Math.max(4, (parentLeft ?? left) - w + 2);
+    }
     drop.style.left = `${left}px`;
     drop.style.top = `${top}px`;
     openDrops.push(drop);

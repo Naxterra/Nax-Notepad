@@ -16,7 +16,7 @@ export function initLanguage(setting: LangSetting): Lang {
 /** Translate `key`, substituting `{name}` placeholders from `vars`. */
 export function t(key: string, vars?: Record<string, string | number>): string {
   let s = lang === "de" ? (de[key] ?? key) : key;
-  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replace(new RegExp(`\\{${k}\\}`, "g"), String(v));
+  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replace(new RegExp(`\\{${k}\\}`, "g"), () => String(v));
   return s;
 }
 
@@ -658,4 +658,7 @@ const de: Record<string, string> = {
   "{n} changes, Ctrl+S saves": "{n} Änderungen, Strg+S speichert",
   "Tab switches between hex and characters, Insert between insert and overwrite.": "Tab wechselt zwischen Hex und Zeichen, Einfg zwischen Einfügen und Überschreiben.",
   "Stop following": "Verfolgen beenden",
+  "not found": "nicht gefunden",
+  "Expected an object with settings.": "Ein Einstellungsobjekt wurde erwartet.",
+  "Back to hits": "Zurück zu den Treffern",
 };

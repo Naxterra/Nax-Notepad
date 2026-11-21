@@ -105,15 +105,15 @@ impl DiskState {
 
     fn read_with(path: &Path, hash: fn(&[u8]) -> u64) -> std::io::Result<DiskState> {
         let mut f = File::open(path)?;
+        Self::read_file(&mut f, hash)
+    }
+
+    fn read_file(f: &mut File, hash: fn(&[u8]) -> u64) -> std::io::Result<DiskState> {
         let meta = f.metadata()?;
         let len = meta.len();
-        let mtime_ns = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let mtime_ns = Self::modified_ns(&meta);
         let mut buf = vec![0u8; FINGERPRINT_BYTES.min(len) as usize];
+        f.seek(SeekFrom::Start(0))?;
         f.read_exact(&mut buf)?;
         let head = hash(&buf);
         let tail_len = FINGERPRINT_BYTES.min(len);
@@ -122,6 +122,14 @@ impl DiskState {
         f.read_exact(&mut tbuf)?;
         let tail = hash(&tbuf);
         Ok(DiskState { len, mtime_ns, head, tail })
+    }
+
+    fn modified_ns(meta: &std::fs::Metadata) -> u64 {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     }
 
     /// The fingerprint of a file whose complete content is `bytes`.
@@ -208,11 +216,14 @@ pub struct PagedDoc {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Match {
     pub line: usize,
     pub col: usize,
     pub len: usize,
     pub offset: usize,
+    pub end_line: usize,
+    pub end_col: usize,
 }
 
 /// Text of an editor window.
@@ -272,12 +283,16 @@ impl PagedDoc {
     /// Open `path`; `forced` is an encoding label chosen by the user ("Reopen with encoding")
     /// instead of detection.
     pub fn open_with(path: &Path, forced: Option<&str>) -> Result<PagedDoc, String> {
-        let file = File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
-        let disk = DiskState::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+        let mut file = File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+        let disk = DiskState::read_file(&mut file, hash_bytes).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         // SAFETY: the mapping is read-only. Changes made by other programs while the file is
         // open are detected through `disk` before saving (see `disk_changed`).
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap failed: {e}"))?;
         let bytes: &[u8] = &mmap;
+        let meta = file.metadata().map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+        if meta.len() != disk.len || DiskState::from_bytes(bytes, DiskState::modified_ns(&meta)) != disk {
+            return Err(format!("{} changed while it was being opened.", path.display()));
+        }
         let (detected_bom, detected_skip) = detect_bom(bytes);
         let (bom, skip, unit, encoding, label, editable): (Bom, usize, Unit, &'static Encoding, String, bool) = match forced {
             Some("UTF-8") | Some("UTF-8-BOM") => {
@@ -287,13 +302,18 @@ impl PagedDoc {
                     (Bom::None, 0, Unit::Byte, encoding_rs::UTF_8, "UTF-8".into(), true)
                 }
             }
-            Some("UTF-16LE") => {
-                let skip = if detected_bom == Bom::Utf16Le { 2 } else { 0 };
-                (Bom::Utf16Le, skip, Unit::U16Le, encoding_rs::UTF_16LE, "UTF-16LE".into(), false)
+            Some("UTF-16LE" | "UTF-16LE-NOBOM") => {
+                let skip = if forced == Some("UTF-16LE") && detected_bom == Bom::Utf16Le { 2 } else { 0 };
+                let label = if skip == 2 { "UTF-16LE" } else { "UTF-16LE-NOBOM" };
+                (if skip == 2 { Bom::Utf16Le } else { Bom::None }, skip, Unit::U16Le, encoding_rs::UTF_16LE, label.into(), false)
             }
-            Some("UTF-16BE") => {
-                let skip = if detected_bom == Bom::Utf16Be { 2 } else { 0 };
-                (Bom::Utf16Be, skip, Unit::U16Be, encoding_rs::UTF_16BE, "UTF-16BE".into(), false)
+            Some("UTF-16BE" | "UTF-16BE-NOBOM") => {
+                let skip = if forced == Some("UTF-16BE") && detected_bom == Bom::Utf16Be { 2 } else { 0 };
+                let label = if skip == 2 { "UTF-16BE" } else { "UTF-16BE-NOBOM" };
+                (if skip == 2 { Bom::Utf16Be } else { Bom::None }, skip, Unit::U16Be, encoding_rs::UTF_16BE, label.into(), false)
+            }
+            Some(other) if other.eq_ignore_ascii_case("ISO-8859-1") || other.eq_ignore_ascii_case("latin1") => {
+                (Bom::None, 0, Unit::Byte, encoding_rs::WINDOWS_1252, "ISO-8859-1".into(), false)
             }
             Some(other) => {
                 let enc = Encoding::for_label(other.as_bytes()).ok_or_else(|| format!("Unknown encoding: {other}"))?;
@@ -362,16 +382,15 @@ impl PagedDoc {
     }
 
     fn build_index(&mut self) {
-        self.build_index_from(0);
+        (self.lines_before, self.orig_newlines) = self.index_from(&self.mmap, 0);
     }
 
     /// (Re)build the line index from chunk `chunk` onwards; earlier entries are kept. Used when
     /// a followed file grows, so only the new part is scanned.
-    fn build_index_from(&mut self, chunk: usize) {
-        let len = self.mmap.len();
+    fn index_from(&self, mmap: &[u8], chunk: usize) -> (Vec<usize>, usize) {
+        let len = mmap.len();
         let chunk = chunk.min(self.lines_before.len().saturating_sub(1));
-        let mut lines_before = std::mem::take(&mut self.lines_before);
-        lines_before.truncate(chunk + 1);
+        let mut lines_before = self.lines_before[..self.lines_before.len().min(chunk + 1)].to_vec();
         if lines_before.is_empty() {
             lines_before.push(0usize);
         }
@@ -380,12 +399,11 @@ impl PagedDoc {
         let mut pos = (lines_before.len() - 1) * CHUNK;
         while pos < len {
             let end = (pos + CHUNK).min(len);
-            acc += self.count_keys(pos, end);
+            acc += self.count_keys_in(mmap, pos, end);
             lines_before.push(acc);
             pos = end;
         }
-        self.lines_before = lines_before;
-        self.orig_newlines = acc;
+        (lines_before, acc)
     }
 
     pub fn line_count(&self) -> usize {
@@ -446,19 +464,27 @@ impl PagedDoc {
 
     /// Whether the '\n' byte at absolute offset `p` of the mapping is a real line break.
     fn is_key(&self, p: usize) -> bool {
+        self.is_key_in(&self.mmap, p)
+    }
+
+    fn is_key_in(&self, mmap: &[u8], p: usize) -> bool {
         match self.unit {
             Unit::Byte => true,
-            Unit::U16Le => p >= self.body_start && (p - self.body_start) % 2 == 0 && self.mmap.get(p + 1) == Some(&0),
-            Unit::U16Be => p > self.body_start && (p - self.body_start) % 2 == 1 && self.mmap[p - 1] == 0,
+            Unit::U16Le => p >= self.body_start && (p - self.body_start) % 2 == 0 && mmap.get(p + 1) == Some(&0),
+            Unit::U16Be => p > self.body_start && (p - self.body_start) % 2 == 1 && mmap[p - 1] == 0,
         }
     }
 
     /// Line breaks whose '\n' byte lies in mapping range [a, b).
     fn count_keys(&self, a: usize, b: usize) -> usize {
-        let s = &self.mmap[a..b];
+        self.count_keys_in(&self.mmap, a, b)
+    }
+
+    fn count_keys_in(&self, mmap: &[u8], a: usize, b: usize) -> usize {
+        let s = &mmap[a..b];
         match self.unit {
             Unit::Byte => memchr_iter(b'\n', s).count(),
-            _ => memchr_iter(b'\n', s).filter(|&i| self.is_key(a + i)).count(),
+            _ => memchr_iter(b'\n', s).filter(|&i| self.is_key_in(mmap, a + i)).count(),
         }
     }
 
@@ -659,6 +685,8 @@ impl PagedDoc {
                 Ok(s) => (s.to_string(), false),
                 Err(_) => (String::from_utf8_lossy(bytes).into_owned(), true),
             }
+        } else if self.encoding_label == "ISO-8859-1" {
+            (bytes.iter().map(|&b| b as char).collect(), false)
         } else {
             let (cow, had_errors) = self.encoding.decode_without_bom_handling(bytes);
             (cow.into_owned(), had_errors)
@@ -905,6 +933,12 @@ impl PagedDoc {
 
     /// `overwrite_external` skips the check for changes made by other programs.
     pub fn save_to_opts(&mut self, target: &Path, overwrite_external: bool) -> Result<(), String> {
+        self.save_to_opts_ack(target, overwrite_external, None)
+    }
+
+    /// Like `save_to_opts`, also allowing an overwrite when the file on disk matches the
+    /// modification time (`ack_mtime_ms`) that the user explicitly accepted with "Keep mine".
+    pub fn save_to_opts_ack(&mut self, target: &Path, overwrite_external: bool, ack_mtime_ms: Option<u64>) -> Result<(), String> {
         self.ensure_editable()?;
         // Save into the file a symbolic link points to, so the link stays a link.
         let resolved = session::resolve_links(target);
@@ -918,8 +952,13 @@ impl PagedDoc {
         // Checked under the save lock, so a save through another command cannot slip in between.
         let lock = session::target_lock(target);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if in_place && !overwrite_external && self.disk_changed() {
-            return Err(format!("{E_EXTERNAL_CHANGE}{}", self.path.display()));
+        if in_place && !overwrite_external {
+            let now = DiskState::read(&self.path).ok();
+            let changed = now.map_or(true, |n| n != self.disk);
+            let acked = ack_mtime_ms.is_some_and(|m| now.is_some_and(|n| n.mtime_ms() == m));
+            if changed && !acked {
+                return Err(format!("{E_EXTERNAL_CHANGE}{}", self.path.display()));
+            }
         }
         let (tmp, file) = session::create_temp_sibling(target)?;
         if let Err(e) = self.write_contents(file) {
@@ -1082,12 +1121,13 @@ impl PagedDoc {
     /// is read in blocks with context and look-ahead, so matches may span piece boundaries;
     /// look-ahead grows (up to 64 MiB) when a match reaches the end of the buffer. Stops when
     /// `f` returns false. Fails with `E_CANCELLED` when `cancel` returns true.
-    fn for_each_match<F>(&self, re: &Regex, start_lo: usize, start_hi: usize, end_limit: usize, cancel: &dyn Fn() -> bool, mut f: F) -> Result<(), String>
+    fn for_each_match<F>(&self, re: &Regex, start_lo: usize, start_hi: usize, end_limit: usize, read_limit: usize, cancel: &dyn Fn() -> bool, mut f: F) -> Result<(), String>
     where
         F: FnMut(usize, usize, &Captures<'_>) -> bool,
     {
         let start_hi = start_hi.min(self.total_len);
         let end_limit = end_limit.min(self.total_len);
+        let read_limit = read_limit.min(self.total_len).max(end_limit);
         let mut cursor = start_lo;
         let mut seen = 0usize;
         while cursor < start_hi {
@@ -1100,9 +1140,9 @@ impl PagedDoc {
             let mut scan_from = cursor;
             'block: loop {
                 let ctx = scan_from.saturating_sub(SEARCH_CONTEXT);
-                let buf_end = (block_hi + lookahead).min(self.total_len);
+                let buf_end = (block_hi + lookahead).min(read_limit);
                 let buf = self.read(ctx, buf_end);
-                let complete = buf_end == self.total_len;
+                let complete = buf_end == read_limit;
                 let hi = block_hi - ctx;
                 let mut pos = scan_from - ctx;
                 while pos <= hi && pos <= buf.len() {
@@ -1179,7 +1219,7 @@ impl PagedDoc {
         let from = from.clamp(lo, hi);
         if !backwards {
             let mut found = None;
-            self.for_each_match(re, from, hi, hi, cancel, |ms, me, _| {
+            self.for_each_match(re, from, hi, hi, hi, cancel, |ms, me, _| {
                 found = Some((ms, me));
                 false
             })?;
@@ -1189,7 +1229,7 @@ impl PagedDoc {
         while e > lo {
             let s = self.block_start_before(e, lo);
             let mut last = None;
-            self.for_each_match(re, s, e, from, cancel, |ms, me, _| {
+            self.for_each_match(re, s, e, from, hi, cancel, |ms, me, _| {
                 last = Some((ms, me));
                 true
             })?;
@@ -1210,7 +1250,10 @@ impl PagedDoc {
     fn match_at(&self, off: usize, len: usize) -> Match {
         let line = self.offset_to_line(off);
         let col = off - self.line_start(line);
-        Match { line, col, len, offset: off }
+        let end_off = off.saturating_add(len).min(self.total_len);
+        let end_line = self.offset_to_line(end_off);
+        let end_col = end_off - self.line_start(end_line);
+        Match { line, col, len, offset: off, end_line, end_col }
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // convenience wrapper used by tests
@@ -1222,7 +1265,7 @@ impl PagedDoc {
     pub fn count_in_c(&self, re: &Regex, limit: usize, scoped: bool, cancel: &dyn Fn() -> bool) -> Result<usize, String> {
         let (lo, hi) = self.search_bounds(scoped)?;
         let mut n = 0usize;
-        self.for_each_match(re, lo, hi, hi, cancel, |_, _, _| {
+        self.for_each_match(re, lo, hi, hi, hi, cancel, |_, _, _| {
             n += 1;
             n < limit
         })?;
@@ -1241,7 +1284,7 @@ impl PagedDoc {
         let (lo, hi) = self.search_bounds(scoped)?;
         let mut hits: Vec<(usize, usize)> = Vec::new();
         let mut truncated = false;
-        self.for_each_match(re, lo, hi, hi, cancel, |ms, me, _| {
+        self.for_each_match(re, lo, hi, hi, hi, cancel, |ms, me, _| {
             if hits.len() >= max {
                 truncated = true;
                 return false;
@@ -1254,13 +1297,26 @@ impl PagedDoc {
         for (ms, me) in hits {
             let line = self.offset_to_line(ms);
             let (start, text) = match &cached {
-                Some((l, s, t)) if *l == line => (*s, t.clone()),
+                Some((l, s, t)) if *l == line && ms.saturating_sub(*s) < 300 => (*s, t.clone()),
                 _ => {
                     let s = self.line_start(line);
-                    let e = self.line_end(line).min(s + 4096);
-                    let (t, _) = self.decode(&self.read(s, e));
-                    let t: String = t.chars().take(400).collect();
-                    cached = Some((line, s, t.clone()));
+                    let line_e = self.line_end(line);
+                    let t = if ms.saturating_sub(s) >= 300 {
+                        let mut ws = ms.saturating_sub(120).max(s);
+                        while ws < ms && self.byte_at(ws).is_some_and(|b| b & 0xC0 == 0x80) {
+                            ws += 1;
+                        }
+                        let we = me.saturating_add(280).min(line_e);
+                        let (snip, _) = self.decode(&self.read(ws, we));
+                        let snip: String = snip.chars().take(399).collect();
+                        format!("…{snip}")
+                    } else {
+                        let e = line_e.min(s + 4096);
+                        let (t, _) = self.decode(&self.read(s, e));
+                        let t: String = t.chars().take(400).collect();
+                        cached = Some((line, s, t.clone()));
+                        t
+                    };
                     (s, t)
                 }
             };
@@ -1269,25 +1325,69 @@ impl PagedDoc {
         Ok((out, truncated))
     }
 
-    /// Pieces describing document range [a, b) without copying any text.
-    fn pieces_in(&self, a: usize, b: usize) -> Vec<Piece> {
-        let mut out = Vec::new();
-        let mut o = 0usize;
-        for p in &self.pieces {
-            let (ps, pe) = (o, o + p.len);
-            o = pe;
-            if pe <= a || ps >= b {
-                if ps >= b {
-                    break;
+    fn normalize_replacement_eol(&self, bytes: Vec<u8>) -> Vec<u8> {
+        match self.eol {
+            Eol::Lf => {
+                if !bytes.contains(&b'\r') {
+                    return bytes;
                 }
-                continue;
+                let mut out = Vec::with_capacity(bytes.len());
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                        out.push(b'\n');
+                        i += 2;
+                    } else if bytes[i] == b'\r' {
+                        out.push(b'\n');
+                        i += 1;
+                    } else {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+                out
             }
-            let s = a.max(ps) - ps;
-            let e = b.min(pe) - ps;
-            let newlines = if s == 0 && e == p.len { p.newlines } else { self.piece_newlines(p.src, p.start + s, e - s) };
-            out.push(Piece { src: p.src, start: p.start + s, len: e - s, newlines });
+            Eol::CrLf => {
+                if !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                    return bytes;
+                }
+                let mut out = Vec::with_capacity(bytes.len() + 8);
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                        out.extend_from_slice(b"\r\n");
+                        i += 2;
+                    } else if bytes[i] == b'\r' || bytes[i] == b'\n' {
+                        out.extend_from_slice(b"\r\n");
+                        i += 1;
+                    } else {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+                out
+            }
+            Eol::Cr => {
+                if !bytes.contains(&b'\n') {
+                    return bytes;
+                }
+                let mut out = Vec::with_capacity(bytes.len());
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                        out.push(b'\r');
+                        i += 2;
+                    } else if bytes[i] == b'\n' {
+                        out.push(b'\r');
+                        i += 1;
+                    } else {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+                out
+            }
         }
-        out
     }
 
     /// Replace every match (inside the scope when `scoped`); returns the number replaced.
@@ -1302,21 +1402,54 @@ impl PagedDoc {
         self.ensure_editable()?;
         let (lo, hi) = self.search_bounds(scoped)?;
         let mut hits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-        self.for_each_match(re, lo, hi, hi, cancel, |ms, me, caps| {
+        self.for_each_match(re, lo, hi, hi, hi, cancel, |ms, me, caps| {
             let mut out = Vec::new();
             caps.expand(replacement, &mut out);
+            let out = self.normalize_replacement_eol(out);
             hits.push((ms, me, out));
             true
         })?;
         if hits.is_empty() {
             return Ok(0);
         }
-        let mut pieces: Vec<Piece> = Vec::new();
+        let mut pieces: Vec<Piece> = Vec::with_capacity(self.pieces.len() + hits.len() * 2);
         let mut cursor = 0usize;
         let mut delta: isize = 0;
         let mut new_add: Vec<(usize, Vec<u8>)> = Vec::new();
-        for (ms, me, out) in &hits {
-            pieces.extend(self.pieces_in(cursor, *ms));
+        let mut pi = 0usize;
+        let mut p_off = 0usize;
+        let mut push_range = |pieces: &mut Vec<Piece>, a: usize, b: usize| {
+            if b <= a {
+                return;
+            }
+            while pi < self.pieces.len() && p_off + self.pieces[pi].len <= a {
+                p_off += self.pieces[pi].len;
+                pi += 1;
+            }
+            while pi < self.pieces.len() {
+                let p = &self.pieces[pi];
+                let ps = p_off;
+                let pe = p_off + p.len;
+                if ps >= b {
+                    break;
+                }
+                let s = a.max(ps) - ps;
+                let e = b.min(pe) - ps;
+                let newlines = if s == 0 && e == p.len { p.newlines } else { self.piece_newlines(p.src, p.start + s, e - s) };
+                pieces.push(Piece { src: p.src, start: p.start + s, len: e - s, newlines });
+                if pe <= b {
+                    p_off = pe;
+                    pi += 1;
+                } else {
+                    break;
+                }
+            }
+        };
+        for (k, (ms, me, out)) in hits.iter().enumerate() {
+            if k % 4096 == 4095 && cancel() {
+                return Err(format!("{E_CANCELLED}search cancelled"));
+            }
+            push_range(&mut pieces, cursor, *ms);
             if !out.is_empty() {
                 new_add.push((pieces.len(), out.clone()));
                 pieces.push(Piece { src: Src::Add, start: 0, len: out.len(), newlines: memchr_iter(b'\n', out).count() });
@@ -1324,7 +1457,7 @@ impl PagedDoc {
             delta += out.len() as isize - (me - ms) as isize;
             cursor = *me;
         }
-        pieces.extend(self.pieces_in(cursor, self.total_len));
+        push_range(&mut pieces, cursor, self.total_len);
         for (idx, bytes) in new_add {
             pieces[idx].start = self.add.len();
             self.add.extend_from_slice(&bytes);
@@ -1352,41 +1485,44 @@ impl PagedDoc {
     /// appended to an unmodified file is mapped and indexed incrementally; a file that
     /// shrank or whose beginning changed is reported as rotated (the caller reopens it).
     pub fn refresh_append(&mut self) -> Result<TailStatus, String> {
-        let now = match DiskState::read(&self.path) {
-            Ok(n) => n,
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
             Err(_) => return Ok(TailStatus::Missing),
+        };
+        let now = match DiskState::read_file(&mut file, hash_bytes) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(TailStatus::Same),
+            Err(e) => return Err(format!("Cannot read {}: {e}", self.path.display())),
         };
         if now == self.disk {
             return Ok(TailStatus::Same);
         }
         let old_len = self.disk.len;
-        if now.len < old_len {
+        if now.len <= old_len || self.backing_temp.is_some() {
             return Ok(TailStatus::Rotated);
         }
-        // The first bytes the old fingerprint covered must be unchanged.
-        let head_len = FINGERPRINT_BYTES.min(old_len) as usize;
-        let mut head = vec![0u8; head_len];
-        File::open(&self.path)
-            .and_then(|mut f| f.read_exact(&mut head))
-            .map_err(|e| format!("Cannot read {}: {e}", self.path.display()))?;
-        if hash_bytes(&head) != self.disk.head || now.len == old_len {
-            return Ok(TailStatus::Rotated);
-        }
-        if self.backing_temp.is_some() {
-            return Ok(TailStatus::Rotated);
-        }
-        let file = File::open(&self.path).map_err(|e| format!("Cannot open {}: {e}", self.path.display()))?;
         // SAFETY: as in `open_with`.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap failed: {e}"))?;
+        let meta = file.metadata().map_err(|e| format!("Cannot read {}: {e}", self.path.display()))?;
+        if meta.len() != now.len || DiskState::from_bytes(&mmap, DiskState::modified_ns(&meta)) != now {
+            return Ok(TailStatus::Same);
+        }
         let old_mapped = self.mmap.len();
-        if mmap.len() < old_mapped || mmap[..old_mapped.min(4096)] != self.mmap[..old_mapped.min(4096)] {
+        let Some(previous_bytes) = mmap.get(..old_mapped) else {
+            return Ok(TailStatus::Rotated);
+        };
+        let previous = DiskState::from_bytes(previous_bytes, self.disk.mtime_ns);
+        if previous != self.disk {
             return Ok(TailStatus::Rotated);
         }
+        let (lines_before, orig_newlines) = self.index_from(&mmap, old_mapped / CHUNK);
+        let Some(new_lines) = orig_newlines.checked_sub(self.orig_newlines) else {
+            return Ok(TailStatus::Rotated);
+        };
         self.mmap = mmap;
-        let old_newlines = self.orig_newlines;
-        self.build_index_from(old_mapped / CHUNK);
+        self.lines_before = lines_before;
+        self.orig_newlines = orig_newlines;
         let new_bytes = self.mmap.len() - old_mapped;
-        let new_lines = self.orig_newlines - old_newlines;
         // Extend the last piece when it already ends at the old end of the file.
         match self.pieces.last_mut() {
             Some(p) if p.src == Src::Orig && p.start + p.len == old_mapped => {
@@ -1876,5 +2012,66 @@ mod tests {
         std::fs::write(&p, &utf16[2..]).unwrap(); // no BOM: only the forced encoding helps
         let doc = PagedDoc::open_with(&p, Some("UTF-16LE")).unwrap();
         assert_eq!(doc.read_lines(0, 2).0, "hi\nyo");
+    }
+
+    #[test]
+    fn scoped_greedy_regex_matches_inside_scope_boundary() {
+        let (_d, mut doc) = make(b"foobar\n");
+        assert!(doc.set_scope(0, 3)); // "foo" inside "foobar"
+        let re = Regex::new(r"foo\w*").unwrap();
+        assert_eq!(doc.count_in(&re, 10, true).unwrap(), 1);
+        let m = doc.find_in(&re, 0, false, true).unwrap().expect("must match inside scope");
+        assert_eq!((m.offset, m.len), (0, 3));
+        assert_eq!(doc.replace_all_in(&re, b"X", true).unwrap(), 1);
+        assert_eq!(doc.read_lines(0, 1).0, "Xbar");
+    }
+
+    #[test]
+    fn replace_all_normalizes_multiline_replacement_to_document_eol() {
+        let (_d, mut doc) = make(b"a\r\nb\r\n");
+        let re = Regex::new("a").unwrap();
+        assert_eq!(doc.replace_all(&re, b"x\ny"), 1);
+        assert_eq!(doc.read(0, 100), b"x\r\ny\r\nb\r\n");
+        // Existing CRLF from a capture is not doubled, and bare CR becomes CRLF.
+        let re2 = Regex::new("x\r\ny").unwrap();
+        assert_eq!(doc.replace_all(&re2, b"${0}\rz"), 1);
+        assert_eq!(doc.read(0, 100), b"x\r\ny\r\nz\r\nb\r\n");
+        // LF document normalizes CRLF and bare CR replacements to LF.
+        let (_d2, mut lf_doc) = make(b"a\nb\n");
+        assert_eq!(lf_doc.replace_all(&re, b"p\r\nq\rr"), 1);
+        assert_eq!(lf_doc.read(0, 100), b"p\nq\nr\nb\n");
+    }
+
+    #[test]
+    fn backwards_search_does_not_falsely_match_partial_word_at_cursor() {
+        let (_d, doc) = make(b"foobar\n");
+        let re = Regex::new(r"\bfoo\b").unwrap();
+        assert!(doc.find_in(&re, 3, true, false).unwrap().is_none());
+        let re_end = Regex::new(r"(?m)foo$").unwrap();
+        assert!(doc.find_in(&re_end, 3, true, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn forced_iso_8859_1_decodes_c1_bytes_literally_and_keeps_label() {
+        let (_d, doc) = make(b"\x80A\n");
+        let p = doc.path.clone();
+        drop(doc);
+        let iso = PagedDoc::open_with(&p, Some("ISO-8859-1")).unwrap();
+        assert_eq!(iso.encoding_label(), "ISO-8859-1");
+        assert_eq!(iso.read_lines(0, 1).0, "\u{80}A");
+    }
+
+    #[test]
+    fn save_to_opts_ack_allows_only_the_acknowledged_external_mtime() {
+        let (_d, mut doc) = make(b"original\n");
+        doc.replace_lines(0, 1, "mine").unwrap();
+        std::fs::OpenOptions::new().write(true).open(&doc.path).unwrap().write_all(b"external\n").unwrap();
+        let ack = DiskState::read(&doc.path).unwrap().mtime_ms();
+        let target = doc.path.clone();
+        // Wrong acknowledged time is refused.
+        assert!(doc.save_to_opts_ack(&target, false, Some(ack.saturating_sub(5_000))).is_err());
+        // Exact acknowledged time succeeds.
+        doc.save_to_opts_ack(&target, false, Some(ack)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine\n");
     }
 }

@@ -67,13 +67,23 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: StatusActio
     const it = await pickList(t("Language"), [{ label: t("Plain text"), value: "" }, ...allLanguages.map((l) => ({ label: l.name, value: l.name, detail: l.desc.extensions.slice(0, 6).map((x) => "." + x).join(" ") }))]);
     if (it && app.active) void app.setLanguage(app.active, it.value || null);
   });
-  slider.addEventListener("input", () => {
+  let sliderTimer: number | undefined;
+  const applySlider = () => {
+    if (sliderTimer) {
+      clearTimeout(sliderTimer);
+      sliderTimer = undefined;
+    }
     const tab = app.active;
     if (tab?.paged) {
       const line = Math.floor((Number(slider.value) / 1000) * Math.max(0, tab.paged.totalLines - 1));
       void tab.paged.gotoLine(line);
     }
+  };
+  slider.addEventListener("input", () => {
+    if (sliderTimer) clearTimeout(sliderTimer);
+    sliderTimer = window.setTimeout(applySlider, 60);
   });
+  slider.addEventListener("change", applySlider);
   slider.max = "1000";
 
   const render = () => {
@@ -90,7 +100,7 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: StatusActio
     if (tab.paged && document.activeElement !== slider) {
       slider.value = String(Math.round(((c.line - 1) / Math.max(1, tab.paged.totalLines - 1)) * 1000));
     }
-    ro.style.display = own.readOnly ? "" : "none";
+    ro.style.display = own.readOnly || !!tab.paged?.windowReadOnly ? "" : "none";
     hexBadge.style.display = tab.hexView ? "" : "none";
     if (own.tail) {
       tail.style.display = "";

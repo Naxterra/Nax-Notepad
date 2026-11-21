@@ -64,7 +64,7 @@ function load(name) {
       case "editor":
         return {
           systemChange: load("readonly").systemChange,
-          compartments: { lineNumbers: { reconfigure: () => [] }, readOnly: { reconfigure: () => [] } },
+          compartments: { lineNumbers: { reconfigure: () => [] }, readOnly: { reconfigure: () => [] }, whitespace: { reconfigure: () => [] } },
           lineNumbersExt: () => [],
           createState: () => EditorState.create({ doc: "" }),
           languageByName: () => null,
@@ -130,7 +130,7 @@ function pagedHost(holder, active = true) {
     dispatch: (spec) => {
       holder.state = holder.state.update(spec).state;
     },
-    view: () => (active ? {} : null),
+    view: () => (active ? { focus() {} } : null),
     onWindowChanged() {},
     onBackendEdit() {},
     onWindowFlags() {},
@@ -1999,6 +1999,466 @@ test("hex ArrowDown keeps its byte on the last partial auto-sized row", async ()
   hex.onKey({ key: "ArrowDown", preventDefault() {}, stopPropagation() {} });
   assert.equal(moved, false);
   assert.equal(hex.cursor, 25);
+});
+
+test("restored clean read-only tab enforces read-only state and passes saved encoding to openPath", async () => {
+  const openCalls = [];
+  const oldOpen = backend.openPath;
+  const oldLoadBuf = backend.sessionLoadBuffer;
+  backend.openPath = async (id, p, paged, encoding) => {
+    openCalls.push({ id, p, paged, encoding });
+    return { kind: "memory", path: p, name: "a.txt", encoding: "Windows-1252", eol: "LF", size: 3, mtime: 42, text: "abc" };
+  };
+  backend.sessionLoadBuffer = async () => null;
+  try {
+    const app = Object.create(App.prototype);
+    app.tabs = [];
+    app.panes = [{ tab: null, view: { state: EditorState.create({ doc: "" }), setState() {}, dispatch() {}, focus() {}, scrollDOM: { scrollTop: 0 }, requestMeasure() {} } }];
+    app.focused = 0;
+    app.view = app.panes[0].view;
+    app.active = null;
+    app.splitOn = false;
+    app.listeners = { tabs: new Set(), active: new Set(), status: new Set(), doc: new Set() };
+    app.emit = () => {};
+    app.scheduleSessionSave = () => {};
+    app.applyLanguage = async () => {};
+    app.buildState = (_tab, doc) => EditorState.create({ doc });
+    const appliedReadOnly = [];
+    app.applyReadOnly = (t) => appliedReadOnly.push({ id: t.id, readOnly: t.readOnly });
+    const tab = await app.restoreTab({
+      id: "t-ro",
+      path: "C:/notes/a.txt",
+      encoding: "Windows-1252",
+      eol: "CRLF",
+      readOnly: true,
+      dirty: false,
+      cursor: 0,
+      scrollTop: 0,
+      livePreview: false,
+    });
+    assert.ok(tab);
+    assert.equal(openCalls.length, 1);
+    assert.equal(openCalls[0].encoding, "Windows-1252");
+    assert.equal(tab.readOnly, true);
+    assert.equal(tab.eol, "LF", "clean restored file must keep the line ending read from disk");
+    assert.ok(appliedReadOnly.some((x) => x.id === tab.id && x.readOnly === true));
+  } finally {
+    backend.openPath = oldOpen;
+    backend.sessionLoadBuffer = oldLoadBuf;
+  }
+});
+
+test("paged save passes external acknowledgement and Save As allows overwriting", async () => {
+  const calls = [];
+  const oldPagedSave = backend.pagedSave;
+  const oldDropEdits = backend.pagedDropEdits;
+  backend.pagedSave = async (id, target, overwrite, expected) => {
+    calls.push({ id, target, overwrite, expected });
+    return { path: target ?? "C:/big.log", name: target ? "copy.log" : "big.log", mtime: 999, size: 100 };
+  };
+  backend.pagedDropEdits = async () => {};
+  try {
+    const tab = memoryTab({
+      kind: "paged",
+      path: "C:/big.log",
+      name: "big.log",
+      externalAck: 777,
+      paged: { commit: async () => {} },
+    });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "x" }) });
+    await app.writeTab(tab, tab.path, false);
+    assert.deepEqual(calls[0], { id: tab.id, target: undefined, overwrite: false, expected: 777 });
+    tab.externalAck = 888;
+    await app.writeTab(tab, "C:/copy.log", true);
+    assert.deepEqual(calls[1], { id: tab.id, target: "C:/copy.log", overwrite: true, expected: null });
+  } finally {
+    backend.pagedSave = oldPagedSave;
+    backend.pagedDropEdits = oldDropEdits;
+  }
+});
+
+test("failed UTF-8 retry after unrepresentable encoding restores previous encoding", async () => {
+  const { E_UNREPRESENTABLE } = load("backend-consts");
+  const oldConfirm = dialogs.confirm3;
+  dialogs.confirm3 = async () => "yes"; // Save as UTF-8
+  try {
+    const tab = memoryTab({ encoding: "Windows-1252" });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "日本語" }) });
+    let encodingDuringRetry;
+    app.writeTab = async (t) => {
+      encodingDuringRetry = t.encoding;
+      return false;
+    };
+    const ok = await app.handleSaveError(tab, tab.path, false, new Error(E_UNREPRESENTABLE + "Windows-1252"));
+    assert.equal(ok, false);
+    assert.equal(encodingDuringRetry, "UTF-8");
+    assert.equal(tab.encoding, "Windows-1252");
+  } finally {
+    dialogs.confirm3 = oldConfirm;
+  }
+});
+
+test("changing line endings on a paged tab schedules recovery log storage", async () => {
+  const oldEol = backend.pagedSetEol;
+  const oldStore = backend.pagedStoreEdits;
+  const eolCalls = [];
+  const storedIds = [];
+  backend.pagedSetEol = async (id, eol) => eolCalls.push([id, eol]);
+  backend.pagedStoreEdits = async (id) => storedIds.push(id);
+  try {
+    const tab = memoryTab({ kind: "paged", eol: "CRLF", paged: { commit: async () => {} } });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "a" }), dispatch() {} });
+    await app.setEol(tab, "LF");
+    assert.deepEqual(eolCalls, [[tab.id, "LF"]]);
+    assert.deepEqual(storedIds, [tab.id]);
+    assert.equal(tab.eol, "LF");
+    assert.equal(tab.dirty, true);
+  } finally {
+    backend.pagedSetEol = oldEol;
+    backend.pagedStoreEdits = oldStore;
+  }
+});
+
+test("follow mode updates head fingerprint on growth and reloads into paged mode at 48 MiB", async () => {
+  const oldTailCheck = backend.tailCheck;
+  let reloaded = false;
+  let call = 0;
+  backend.tailCheck = async () => {
+    call++;
+    if (call === 1) {
+      return { status: "appended", offset: 120, mtime: 10, text: "line2\n", headHash: 5555, headLen: 120 };
+    }
+    return { status: "appended", offset: 48 * 1024 * 1024, mtime: 11, text: "more\n", headHash: 5555, headLen: 65536 };
+  };
+  try {
+    const tab = memoryTab({
+      dirty: false,
+      revision: 0,
+      savedRevision: 0,
+      tail: { offset: 0, headHash: 0, headLen: 0, paused: false, pending: "", timer: undefined, busy: false, missing: false },
+    });
+    const view = {
+      state: EditorState.create({ doc: "" }),
+      scrollDOM: { scrollTop: 0, scrollHeight: 100, clientHeight: 100 },
+      dispatch(spec) {
+        this.state = this.state.update(spec).state;
+      },
+    };
+    const app = fakeApp(tab, view);
+    app.reload = async () => {
+      reloaded = true;
+    };
+    await app.pollTail(tab);
+    assert.equal(tab.tail.headHash, 5555);
+    assert.equal(tab.tail.headLen, 120);
+    assert.equal(reloaded, false);
+    await app.pollTail(tab);
+    assert.equal(reloaded, true);
+  } finally {
+    backend.tailCheck = oldTailCheck;
+  }
+});
+
+test("clipboard paste applies clipboardInputFilter and cut aborts when editor state changes during copy", async () => {
+  const { pagedLineExtensions } = load("paged");
+  const realClipboard = load("clipboard");
+  const oldRead = clipboard.readText;
+  const oldWrite = clipboard.writeText;
+  try {
+    clipboard.readText = async () => "alpha\r\nbeta\rgamma";
+    let state = EditorState.create({ doc: "", extensions: pagedLineExtensions });
+    const view = {
+      get state() {
+        return state;
+      },
+      dispatch(spec) {
+        state = state.update(spec).state;
+      },
+      focus() {},
+    };
+    await realClipboard.pasteClipboard(view);
+    assert.equal(state.doc.toString(), "alpha\nbeta\ngamma");
+
+    const pending = deferred();
+    clipboard.writeText = async () => pending.promise;
+    state = EditorState.create({ doc: "hello world", selection: { anchor: 0, head: 5 } });
+    const cutPromise = realClipboard.copySelection(view, true);
+    state = state.update({ changes: { from: 0, to: 11, insert: "replaced" } }).state;
+    pending.resolve();
+    await cutPromise;
+    assert.equal(state.doc.toString(), "replaced", "cut must not delete from a changed editor state");
+  } finally {
+    clipboard.readText = oldRead;
+    clipboard.writeText = oldWrite;
+  }
+});
+
+test("removing bookmarked lines handles adjacent trailing lines without overlapping change error", () => {
+  const { buildCommands } = load("commands");
+  const { bookmarkField, toggleBookmarkAt } = load("bookmarks");
+  const runCase = (doc, lines) => {
+    let state = EditorState.create({ doc, extensions: [bookmarkField] });
+    for (const ln of lines) {
+      state = state.update({ effects: toggleBookmarkAt.of(state.doc.line(ln).from) }).state;
+    }
+    const view = {
+      get state() {
+        return state;
+      },
+      dispatch(spec) {
+        state = state.update(spec).state;
+      },
+    };
+    const app = fakeApp({ kind: "memory", readOnly: false }, view);
+    const cmds = buildCommands(app, {}, {});
+    cmds.find((c) => c.id === "bookmark.removeLines").run();
+    return state.doc.toString();
+  };
+  assert.equal(runCase("one\ntwo\nthree", [2, 3]), "one");
+  assert.equal(runCase("one\ntwo\nthree", [1, 2, 3]), "");
+  assert.equal(runCase("one\ntwo\nthree\nfour", [1, 3, 4]), "two");
+});
+
+test("numeric sort handles non-numeric lines without corrupting comparator order", () => {
+  const { buildCommands } = load("commands");
+  let state = EditorState.create({ doc: "10\nbeta\n2\nalpha\n-1" });
+  const view = {
+    get state() {
+      return state;
+    },
+    dispatch(spec) {
+      state = state.update(spec).state;
+    },
+  };
+  const app = fakeApp({ kind: "memory", readOnly: false }, view);
+  const cmds = buildCommands(app, {}, {});
+  cmds.find((c) => c.id === "edit.sortNum").run();
+  assert.equal(state.doc.toString(), "-1\n2\n10\nalpha\nbeta");
+});
+
+test("regex replacement decodes backslash escape sequences matching the Rust engine", () => {
+  const { replacementAt } = load("replace");
+  const text = "foo=bar";
+  const regexQuery = new SearchQuery({ search: "(\\w+)=(\\w+)", regexp: true, literal: false, replace: "$1\\n\\t$2\\\\end" });
+  assert.equal(replacementAt(regexQuery, text, 0, text.length), "foo\n\tbar\\end");
+  const literalQuery = new SearchQuery({ search: "foo=bar", regexp: false, literal: true, replace: "a\\nb\\tc" });
+  assert.equal(replacementAt(literalQuery, text, 0, text.length), "a\\nb\\tc");
+  // CRLF escape at EOF maps selection cleanly after CodeMirror normalizes CRLF to LF.
+  const crlfQuery = new SearchQuery({ search: "abc", regexp: true, literal: false, replace: "a\\r\\nb" });
+  const state = EditorState.create({ doc: "abc" });
+  const rep = replacementAt(crlfQuery, state.doc.toString(), 0, 3);
+  const changes = state.changes({ from: 0, to: 3, insert: rep });
+  const next = state.update({ changes, selection: { anchor: changes.mapPos(3, 1) } }).state;
+  assert.equal(next.doc.toString(), "a\nb");
+  assert.equal(next.selection.main.head, 3);
+});
+
+test("settings validation rejects out-of-range numbers, floats on integer keys, invalid enums, prototype keys and bad macros", () => {
+  const real = load("settings");
+  const raw = JSON.parse(
+    '{"tabSize":0,"fontSize":14.5,"pagedWindowLines":1000.5,"previewMaxWidth":0,"defaultEol":"BAD","language":"fr","keymapPreset":"vim","sidebarTab":"other","keyOverrides":{"__proto__":"Ctrl+A","file.save":123,"file.open":"Ctrl+O"},"macros":[{"name":"ok","steps":[{"type":"cmd","id":"file.save"},{"type":"text","text":"hi"}]},{"name":123,"steps":[]},{"name":"badstep","steps":[{"type":"bogus"}]}]}'
+  );
+  const v = real.validSettings(raw);
+  assert.equal(v.tabSize, undefined);
+  assert.equal(v.fontSize, undefined);
+  assert.equal(v.pagedWindowLines, undefined);
+  assert.equal(v.previewMaxWidth, 0, "0 means full width and must be allowed");
+  assert.equal(v.defaultEol, undefined);
+  assert.equal(v.language, undefined);
+  assert.equal(v.keymapPreset, undefined);
+  assert.equal(v.sidebarTab, undefined);
+  assert.deepEqual(v.keyOverrides, { "file.open": "Ctrl+O" });
+  assert.equal(Object.prototype.hasOwnProperty.call(v.keyOverrides, "__proto__"), false);
+  assert.deepEqual(v.macros, [{ name: "ok", steps: [{ type: "cmd", id: "file.save" }, { type: "text", text: "hi" }] }]);
+});
+
+test("i18n interpolation does not expand dollar replacement patterns in substituted values", () => {
+  const realI18n = load("i18n");
+  assert.equal(realI18n.t("File {name} saved", { name: "$& $1 $$" }), "File $& $1 $$ saved");
+});
+
+test("paged gotoLine and multi-line selectMatch handle capped windows and multi-line ranges", async () => {
+  const oldWin = backend.pagedWindow;
+  const loadedStarts = [];
+  backend.pagedWindow = async (_id, firstLine) => {
+    loadedStarts.push(firstLine);
+    if (firstLine === 0) {
+      return { text: "l0\nl1\n", firstLine: 0, count: 2, totalLines: 500, truncated: false, lossy: false };
+    }
+    return { text: "abcde\nfghij\nklmno\n", firstLine, count: 3, totalLines: 500, truncated: false, lossy: false };
+  };
+  try {
+    const holder = { state: EditorState.create({ doc: "" }) };
+    const ctrl = new PagedController("p-nav", 500, pagedHost(holder));
+    await ctrl.gotoLine(100);
+    assert.equal(ctrl.firstLine, 100);
+    assert.deepEqual(loadedStarts, [0, 100]);
+
+    await ctrl.selectMatch({ line: 100, col: 2, endLine: 102, endCol: 3, len: 13, offset: 0 });
+    const sel = holder.state.selection.main;
+    assert.equal(holder.state.sliceDoc(sel.from, sel.to), "cde\nfghij\nklm");
+  } finally {
+    backend.pagedWindow = oldWin;
+  }
+});
+
+test("hex raw snapshot round-trip and writeHexNow uses hexStamp mtime and preserves encoding on reopenPaged", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const fixedBuf = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])), 0);
+  assert.equal(fixedBuf.overwrite(3, Uint8Array.from([9])), 0);
+  assert.equal(fixedBuf.canUndo, false, "zero-byte overwrite at EOF must not push an undo entry");
+
+  const buf = await HexBuffer.load(memSource(Uint8Array.from([1, 2, 3])));
+  buf.insert(3, Uint8Array.from([4, 5]));
+  const rawSnap = buf.rawSnapshot();
+  assert.ok(rawSnap);
+  assert.equal(rawSnap.meta.bytesFile, true);
+  assert.deepEqual([...rawSnap.raw], [1, 2, 3, 4, 5]);
+  const restored = await HexBuffer.restore(rawSnap.meta, memSource(Uint8Array.from([1, 2, 3])), rawSnap.raw);
+  assert.deepEqual([...restored.bytes()], [1, 2, 3, 4, 5]);
+
+  const oldStamp = backend.hexSourceStamp;
+  const oldWrite = backend.writeBytes;
+  const oldOpen = backend.openPath;
+  let capturedMtime;
+  let reopenedEncoding;
+  backend.hexSourceStamp = async () => ({ size: 3, mtime: 777, headHash: 1, headLen: 3, tailHash: 1, tailLen: 3 });
+  backend.writeBytes = async (_p, _b, expectedMtime) => {
+    capturedMtime = expectedMtime;
+    throw new Error("stop after check");
+  };
+  backend.openPath = async (_id, _p, _paged, encoding) => {
+    reopenedEncoding = encoding;
+    return { kind: "paged", lineCount: 1 };
+  };
+  try {
+    const tab = memoryTab({
+      kind: "paged",
+      encoding: "Windows-1252",
+      mtime: 111,
+      hexStamp: { size: 3, mtime: 777, headHash: 1, headLen: 3, tailHash: 1, tailLen: 3 },
+      hex: restored,
+      revision: 0,
+      savedRevision: 0,
+      paged: { firstLine: 0, totalLines: 1, cursorLine: () => 0, resetRevisions() {}, load: async () => {} },
+    });
+    const app = fakeApp(tab, { state: EditorState.create({ doc: "abc" }) });
+    const oldClose = backend.pagedClose;
+    backend.pagedClose = async () => {};
+    try {
+      assert.equal(await app.writeHexNow(tab, tab.path, false), false);
+      assert.equal(capturedMtime, 777);
+      assert.equal(reopenedEncoding, "Windows-1252");
+    } finally {
+      backend.pagedClose = oldClose;
+    }
+  } finally {
+    backend.hexSourceStamp = oldStamp;
+    backend.writeBytes = oldWrite;
+    backend.openPath = oldOpen;
+  }
+});
+
+test("bomless UTF-16 byte mapping reports zero BOM bytes and maps UTF-16 code units", () => {
+  const { createByteMap } = load("bytemap");
+  const doc = EditorState.create({ doc: "AB" }).doc;
+  const noBomLe = createByteMap(doc, "UTF-16LE-NOBOM", "LF", 4);
+  assert.ok(noBomLe);
+  assert.equal(noBomLe.toByte(0), 0);
+  assert.equal(noBomLe.toByte(1), 2);
+  assert.equal(noBomLe.toPos(2), 1);
+  assert.equal(createByteMap(doc, "UTF-16LE-NOBOM", "LF", 6), null, "BOM-less UTF-16 must not accept a 2-byte BOM size");
+  const withBom = createByteMap(doc, "UTF-16LE", "LF", 6);
+  assert.ok(withBom);
+  assert.equal(withBom.toByte(0), 2);
+});
+
+test("flushSettings writes pending debounced settings, awaits in-flight saves and retries after failures", async () => {
+  const real = load("settings");
+  const oldSave = backend.settingsSave;
+  const oldSetTimeout = global.window.setTimeout;
+  let savedCount = 0;
+  let timerCb = null;
+  global.window.setTimeout = (cb) => {
+    timerCb = cb;
+    return 1;
+  };
+  backend.settingsSave = async () => {
+    savedCount++;
+  };
+  try {
+    real.updateSettings({ tabSize: 2 }, { silent: true });
+    assert.equal(savedCount, 0);
+    await real.flushSettings();
+    assert.equal(savedCount, 1);
+    await real.flushSettings();
+    assert.equal(savedCount, 1, "flushing again without changes is a no-op");
+
+    // In-flight debounced save must be awaited by flushSettings.
+    const inflight = deferred();
+    let finished = false;
+    backend.settingsSave = async () => {
+      savedCount++;
+      await inflight.promise;
+      finished = true;
+    };
+    real.updateSettings({ tabSize: 4 }, { silent: true });
+    timerCb();
+    const waitFlush = real.flushSettings();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(finished, false);
+    inflight.resolve();
+    await waitFlush;
+    assert.equal(finished, true);
+
+    // Failed flush must keep settings dirty so a subsequent retry saves.
+    let failOnce = true;
+    backend.settingsSave = async () => {
+      savedCount++;
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("disk busy");
+      }
+    };
+    real.updateSettings({ tabSize: 8 }, { silent: true });
+    await assert.rejects(real.flushSettings(), /disk busy/);
+    const beforeRetry = savedCount;
+    await real.flushSettings();
+    assert.equal(savedCount, beforeRetry + 1);
+  } finally {
+    backend.settingsSave = oldSave;
+    global.window.setTimeout = oldSetTimeout;
+  }
+});
+
+test("hex paste preloads chunks from the selection start rather than the trailing cursor", async () => {
+  const { HexBuffer } = load("hexbuffer");
+  const { HexView } = load("ui/hexview");
+  const buffer = await HexBuffer.load(memSource(new Uint8Array(64)));
+  const readyCalls = [];
+  const origReady = buffer.ready.bind(buffer);
+  buffer.ready = async (from, to) => {
+    readyCalls.push([from, to]);
+    return origReady(from, to);
+  };
+  const hex = Object.create(HexView.prototype);
+  Object.assign(hex, {
+    session: { buffer, readOnly: null },
+    cursor: 20,
+    anchor: 10,
+    pane: "hex",
+    insertMode: false,
+  });
+  hex.changed = () => {};
+  hex.moveTo = () => {};
+  const oldRead = clipboard.readText;
+  clipboard.readText = async () => "AA BB CC";
+  try {
+    await hex.paste();
+    assert.deepEqual(readyCalls, [[10, 13]]);
+  } finally {
+    clipboard.readText = oldRead;
+  }
 });
 
 (async () => {

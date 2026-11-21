@@ -78,6 +78,8 @@ export interface PagedMatch {
   col: number;
   len: number;
   offset: number;
+  endLine?: number;
+  endCol?: number;
 }
 
 export interface FileHit {
@@ -126,6 +128,8 @@ export interface TailCheck {
   text: string;
   offset: number;
   mtime: number;
+  headHash?: number | null;
+  headLen?: number | null;
 }
 
 export interface PagedTailCheck {
@@ -166,8 +170,8 @@ export const backend = {
     invoke<Window>("paged_window", { id, firstLine, count }),
   pagedCommit: (id: string, firstLine: number, count: number, text: string) =>
     invoke<number>("paged_commit", { id, firstLine, count, text }),
-  pagedSave: (id: string, path?: string, overwriteExternal = false) =>
-    invoke<SaveResult>("paged_save", { id, path: path ?? null, overwriteExternal }),
+  pagedSave: (id: string, path?: string, overwriteExternal = false, expectedMtime: number | null = null) =>
+    invoke<SaveResult>("paged_save", { id, path: path ?? null, overwriteExternal, expectedMtime }),
   pagedClose: (id: string) => invoke<void>("paged_close", { id }),
   pagedSetEol: (id: string, eol: Eol) => invoke<void>("paged_set_eol", { id, eol }),
   pagedFind: (id: string, opts: FindOpts, fromLine: number, fromCol: number, backwards: boolean, scoped = false) =>
@@ -188,7 +192,16 @@ export const backend = {
   sessionStoreBuffer: (id: string, text: string, generation: number) => invoke<void>("session_store_buffer", { id, text, generation }),
   sessionLoadBuffer: (id: string) => invoke<string | null>("session_load_buffer", { id }),
   sessionStoreHex: (id: string, recovery: HexRecovery, generation: number) => invoke<void>("session_store_hex", { id, recovery, generation }),
+  sessionStoreHexRaw: (id: string, recovery: HexRecovery, bytes: Uint8Array, generation: number) =>
+    invoke<void>("session_store_hex_raw", bytes, {
+      headers: {
+        "x-id": encodeURIComponent(id),
+        "x-generation": String(generation),
+        "x-meta": encodeURIComponent(JSON.stringify(recovery)),
+      },
+    }),
   sessionLoadHex: (id: string) => invoke<HexRecovery | null>("session_load_hex", { id }),
+  sessionLoadHexBytes: async (id: string) => new Uint8Array(await invoke<ArrayBuffer>("session_load_hex_bytes", { id })),
   sessionDropHex: (id: string, generation: number) => invoke<void>("session_drop_hex", { id, generation }),
   hexSourceStamp: (path: string) => invoke<HexStamp>("hex_source_stamp", { path }),
   /** True when unsaved text or a large-file edit log is stored for the tab. */

@@ -9,6 +9,7 @@ type TextField = HTMLInputElement | HTMLTextAreaElement;
 
 /** The focused text input (find box, dialogs), if any. */
 function activeField(): TextField | null {
+  if (typeof document === "undefined") return null;
   const el = document.activeElement;
   if (el instanceof HTMLTextAreaElement) return el;
   if (el instanceof HTMLInputElement && /^(text|search|url|email|number|)$/.test(el.type)) return el;
@@ -49,7 +50,7 @@ export async function copySelection(view: EditorView, cut = false): Promise<void
     toDelete = lines.map((l) => ({ from: l.from, to: Math.min(l.to + 1, state.doc.length) }));
   }
   await writeText(text);
-  if (cut && !state.readOnly) view.dispatch({ changes: toDelete, userEvent: "delete.cut", scrollIntoView: true });
+  if (cut && !state.readOnly && view.state === state) view.dispatch({ changes: toDelete, userEvent: "delete.cut", scrollIntoView: true });
   view.focus();
 }
 
@@ -67,6 +68,7 @@ export async function pasteClipboard(view: EditorView): Promise<void> {
     return;
   }
   if (view.state.readOnly) return;
+  for (const filter of view.state.facet(EditorView.clipboardInputFilter)) text = filter(text, view.state);
   view.dispatch(view.state.replaceSelection(text), { userEvent: "input.paste", scrollIntoView: true });
   view.focus();
 }

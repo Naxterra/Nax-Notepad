@@ -866,6 +866,10 @@ pub fn hex_path(id: &str) -> PathBuf {
     buffers_dir().join(format!("{}.hex.json", sanitize(id)))
 }
 
+pub fn hex_bytes_path(id: &str) -> PathBuf {
+    buffers_dir().join(format!("{}.hex.bin", sanitize(id)))
+}
+
 /// (newest stored, newest dropped), separate from text revisions.
 fn hex_generations() -> &'static Mutex<HashMap<String, (u64, u64)>> {
     static MAP: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
@@ -877,6 +881,11 @@ pub fn store_hex(id: &str, recovery: &serde_json::Value, generation: u64) -> Res
     store_hex_at(&hex_path(id), id, recovery, generation)
 }
 
+pub fn store_hex_raw(id: &str, recovery: &serde_json::Value, raw_bytes: &[u8], generation: u64) -> Result<(), String> {
+    ensure_dirs()?;
+    store_hex_raw_at(&hex_path(id), id, recovery, raw_bytes, generation)
+}
+
 fn store_hex_at(path: &Path, id: &str, recovery: &serde_json::Value, generation: u64) -> Result<(), String> {
     let lock = target_lock(path);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -884,6 +893,19 @@ fn store_hex_at(path: &Path, id: &str, recovery: &serde_json::Value, generation:
     if generation <= dropped || generation < stored { return Ok(()); }
     let bytes = serde_json::to_vec(recovery).map_err(|e| e.to_string())?;
     replace_atomic_locked(path, |f| f.write_all(&bytes))?;
+    hex_generations().lock().unwrap_or_else(|e| e.into_inner()).entry(id.into()).or_default().0 = generation;
+    Ok(())
+}
+
+fn store_hex_raw_at(path: &Path, id: &str, recovery: &serde_json::Value, raw_bytes: &[u8], generation: u64) -> Result<(), String> {
+    let lock = target_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (stored, dropped) = hex_generations().lock().unwrap_or_else(|e| e.into_inner()).get(id).copied().unwrap_or_default();
+    if generation <= dropped || generation < stored { return Ok(()); }
+    let bin_path = path.with_extension("bin");
+    let meta_bytes = serde_json::to_vec(recovery).map_err(|e| e.to_string())?;
+    replace_atomic_locked(&bin_path, |f| f.write_all(raw_bytes))?;
+    replace_atomic_locked(path, |f| f.write_all(&meta_bytes))?;
     hex_generations().lock().unwrap_or_else(|e| e.into_inner()).entry(id.into()).or_default().0 = generation;
     Ok(())
 }
@@ -905,11 +927,17 @@ fn drop_hex_at(path: &Path, id: &str, generation: u64) -> Result<(), String> {
     // Persist a tombstone before removal: a failed delete cannot resurrect old byte edits.
     replace_atomic_locked(path, |f| f.write_all(b"null"))?;
     let _ = fs::remove_file(path);
+    let _ = fs::remove_file(path.with_extension("bin"));
     Ok(())
 }
 
 pub fn load_hex(id: &str) -> Result<Option<serde_json::Value>, String> {
     load_hex_from(&hex_path(id))
+}
+
+pub fn load_hex_bytes(id: &str) -> Result<Vec<u8>, String> {
+    let path = hex_bytes_path(id);
+    read_patiently(&path).map_err(|e| format!("Cannot read the saved byte changes in {}: {e}", path.display()))
 }
 
 fn load_hex_from(path: &Path) -> Result<Option<serde_json::Value>, String> {
@@ -1039,7 +1067,16 @@ fn prune_buffers_in(s: &Session, buffers: &Path) {
                 // A newer byte snapshot may have completed after the frontend captured this
                 // session. Its own metadata lets the next start recover it. Explicit Save,
                 // Discard and Close write a tombstone and remove it instead.
-                if name.ends_with(".hex.json") && load_hex_from(&e.path()).map(|v| v.is_some()).unwrap_or(true) { continue; }
+                if name.ends_with(".hex.json") || name.ends_with(".hex.bin") {
+                    let json_path = if name.ends_with(".hex.json") { e.path() } else { e.path().with_extension("json") };
+                    let lock = target_lock(&json_path);
+                    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if load_hex_from(&json_path).map(|v| v.is_some()).unwrap_or(true) {
+                        continue;
+                    }
+                    let _ = fs::remove_file(e.path());
+                    continue;
+                }
                 let _ = fs::remove_file(e.path());
             }
         }
@@ -1530,5 +1567,21 @@ mod tests {
         assert!(target.is_dir());
         let leftovers = std::fs::read_dir(dir.path()).unwrap().flatten().count();
         assert_eq!(leftovers, 1, "only the directory itself should remain");
+    }
+
+    #[test]
+    fn raw_hex_recovery_stores_binary_companion_and_cleans_it_up_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.hex.json");
+        let bin = dir.path().join("raw.hex.bin");
+        let meta = serde_json::json!({"version":1,"tab":{"id":"raw","path":"x.bin","kind":"memory"},"buffer":{"originalSize":4,"bytesFile":true}});
+        store_hex_raw_at(&path, "raw-hex-test", &meta, &[0xDE, 0xAD, 0xBE, 0xEF], 1).unwrap();
+        assert_eq!(load_hex_from(&path).unwrap(), Some(meta));
+        assert_eq!(fs::read(&bin).unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        // Pruning an empty session keeps both metadata and binary companion.
+        prune_buffers_in(&Session::default(), dir.path());
+        assert!(path.exists() && bin.exists());
+        drop_hex_at(&path, "raw-hex-test", 1).unwrap();
+        assert!(!path.exists() && !bin.exists());
     }
 }

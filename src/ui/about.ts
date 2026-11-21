@@ -53,9 +53,14 @@ export function openAboutDialog(): void {
   );
   box.tabIndex = -1;
   box.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" || e.key === "Enter") {
+    if (e.key === "Escape") {
       e.preventDefault();
       close();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && box.contains(active) && (active.tagName === "BUTTON" || active.tagName === "A")) active.click();
+      else close();
     }
   });
   const close = showModal(box);

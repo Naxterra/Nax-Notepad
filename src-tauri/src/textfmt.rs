@@ -138,8 +138,28 @@ pub fn decode_as(bytes: &[u8], label: &str) -> Result<Decoded, String> {
                 (encoding_rs::UTF_8, bytes, "UTF-8".into())
             }
         }
-        "UTF-16LE" => (encoding_rs::UTF_16LE, if bom == Bom::Utf16Le { &bytes[2..] } else { bytes }, "UTF-16LE".into()),
-        "UTF-16BE" => (encoding_rs::UTF_16BE, if bom == Bom::Utf16Be { &bytes[2..] } else { bytes }, "UTF-16BE".into()),
+        "UTF-16LE" => {
+            if bom == Bom::Utf16Le {
+                (encoding_rs::UTF_16LE, &bytes[2..], "UTF-16LE".into())
+            } else {
+                (encoding_rs::UTF_16LE, bytes, "UTF-16LE-NOBOM".into())
+            }
+        }
+        "UTF-16LE-NOBOM" => (encoding_rs::UTF_16LE, bytes, "UTF-16LE-NOBOM".into()),
+        "UTF-16BE" => {
+            if bom == Bom::Utf16Be {
+                (encoding_rs::UTF_16BE, &bytes[2..], "UTF-16BE".into())
+            } else {
+                (encoding_rs::UTF_16BE, bytes, "UTF-16BE-NOBOM".into())
+            }
+        }
+        "UTF-16BE-NOBOM" => (encoding_rs::UTF_16BE, bytes, "UTF-16BE-NOBOM".into()),
+        "ISO-8859-1" => {
+            let text: String = bytes.iter().map(|&b| b as char).collect();
+            let sample_end = text.char_indices().map(|(i, _)| i).find(|&i| i >= 1 << 16).unwrap_or(text.len());
+            let eol = detect_eol(text[..sample_end].as_bytes());
+            return Ok(Decoded { text, encoding: "ISO-8859-1".into(), eol, had_errors: false });
+        }
         other => {
             let enc = Encoding::for_label(other.as_bytes()).ok_or_else(|| format!("Unknown encoding: {other}"))?;
             (enc, bytes, enc.name().to_string())
@@ -205,10 +225,45 @@ pub fn encode_with(text: &str, encoding: &str, eol: Eol, lossy: bool) -> Result<
                 out.extend_from_slice(&u.to_le_bytes());
             }
         }
+        "UTF-16LE-NOBOM" => {
+            for u in normalized.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+        }
         "UTF-16BE" => {
             out.extend_from_slice(&[0xFE, 0xFF]);
             for u in normalized.encode_utf16() {
                 out.extend_from_slice(&u.to_be_bytes());
+            }
+        }
+        "UTF-16BE-NOBOM" => {
+            for u in normalized.encode_utf16() {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
+        }
+        "ISO-8859-1" => {
+            let mut bad: Vec<char> = Vec::new();
+            let mut bad_count = 0usize;
+            for c in normalized.chars() {
+                let code = c as u32;
+                if code <= 0xFF {
+                    out.push(code as u8);
+                } else {
+                    bad_count += 1;
+                    if bad.len() < 10 && !bad.contains(&c) {
+                        bad.push(c);
+                    }
+                    if lossy {
+                        out.push(b'?');
+                    }
+                }
+            }
+            if bad_count > 0 && !lossy {
+                return Err(EncodeError::Unrepresentable {
+                    encoding: "ISO-8859-1".to_string(),
+                    chars: bad,
+                    count: bad_count,
+                });
             }
         }
         label => {
@@ -337,5 +392,16 @@ mod tests {
         assert_eq!(detect_eol(b"a\r\nb\nc\r\n"), Eol::CrLf);
         assert_eq!(detect_eol(b"a\rb\r"), Eol::Cr);
         assert_eq!(detect_eol(b"no breaks"), Eol::CrLf);
+    }
+
+    #[test]
+    fn iso_8859_1_rejects_windows_1252_only_characters_and_preserves_bomless_utf16() {
+        assert!(encode("€", "ISO-8859-1", Eol::Lf).unwrap_err().starts_with(E_UNREPRESENTABLE));
+        let dec = decode_as(b"Gr\xfc\xdfe", "ISO-8859-1").unwrap();
+        assert_eq!((dec.encoding.as_str(), dec.text.as_str()), ("ISO-8859-1", "Grüße"));
+        assert_eq!(encode(&dec.text, "ISO-8859-1", Eol::Lf).unwrap(), b"Gr\xfc\xdfe");
+        let bomless = decode_as(&[b'h', 0, b'i', 0], "UTF-16LE").unwrap();
+        assert_eq!((bomless.encoding.as_str(), bomless.text.as_str()), ("UTF-16LE-NOBOM", "hi"));
+        assert_eq!(encode("hi", "UTF-16LE-NOBOM", Eol::Lf).unwrap(), vec![b'h', 0, b'i', 0]);
     }
 }

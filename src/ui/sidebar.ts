@@ -45,6 +45,8 @@ export function mountSidebar(app: App, root: HTMLElement): Sidebar {
   root.append(header, foldersPane, functionsPane);
 
   const expanded = new Set<string>();
+  let foldersSeq = 0;
+  const dirSeq = new WeakMap<HTMLElement, number>();
 
   async function addFolder(): Promise<void> {
     const d = await openDialog({ directory: true, title: t("Add folder to workspace") });
@@ -59,14 +61,19 @@ export function mountSidebar(app: App, root: HTMLElement): Sidebar {
     void renderFolders();
   }
 
-  async function renderDir(path: string, container: HTMLElement, depth: number): Promise<void> {
+  async function renderDir(path: string, container: HTMLElement, depth: number, rootSeq = foldersSeq): Promise<void> {
+    const seq = (dirSeq.get(container) ?? 0) + 1;
+    dirSeq.set(container, seq);
+    container.replaceChildren();
     let entries;
     try {
       entries = await backend.listDir(path);
     } catch (e) {
+      if (rootSeq !== foldersSeq || dirSeq.get(container) !== seq) return;
       container.append(h("div", { class: "side-item error", style: `padding-left:${8 + depth * 14}px` }, errorText(e)));
       return;
     }
+    if (rootSeq !== foldersSeq || dirSeq.get(container) !== seq) return;
     for (const e of entries) {
       const row = h("div", { class: "side-item" + (e.isDir ? " dir" : ""), title: e.path, style: `padding-left:${8 + depth * 14}px` });
       const open = expanded.has(e.path.toLowerCase());
@@ -75,11 +82,13 @@ export function mountSidebar(app: App, root: HTMLElement): Sidebar {
       const children = h("div");
       container.append(children);
       if (e.isDir) {
-        if (open) await renderDir(e.path, children, depth + 1);
+        if (open) await renderDir(e.path, children, depth + 1, rootSeq);
+        if (rootSeq !== foldersSeq || dirSeq.get(container) !== seq) return;
         row.addEventListener("click", async () => {
           const key = e.path.toLowerCase();
           if (expanded.has(key)) {
             expanded.delete(key);
+            dirSeq.set(children, (dirSeq.get(children) ?? 0) + 1);
             children.replaceChildren();
             (row.firstChild as HTMLElement).textContent = "▸";
           } else {
@@ -109,12 +118,14 @@ export function mountSidebar(app: App, root: HTMLElement): Sidebar {
   }
 
   async function renderFolders(): Promise<void> {
+    const seq = ++foldersSeq;
     tree.replaceChildren();
     if (!settings.workspaceFolders.length) {
       tree.append(h("div", { class: "side-empty" }, t("Add a folder to browse its files here.")));
       return;
     }
     for (const folder of settings.workspaceFolders) {
+      if (seq !== foldersSeq) return;
       const key = folder.toLowerCase();
       if (!expanded.has(key) && !expanded.has("!" + key)) expanded.add(key);
       const open = expanded.has(key);
@@ -125,6 +136,7 @@ export function mountSidebar(app: App, root: HTMLElement): Sidebar {
         if (expanded.has(key)) {
           expanded.delete(key);
           expanded.add("!" + key);
+          dirSeq.set(children, (dirSeq.get(children) ?? 0) + 1);
           children.replaceChildren();
           (row.firstChild as HTMLElement).textContent = "▸";
         } else {
@@ -142,7 +154,7 @@ export function mountSidebar(app: App, root: HTMLElement): Sidebar {
           { label: t("Find in Files…"), run: () => window.dispatchEvent(new CustomEvent("nax:findInFolder", { detail: folder })) },
         ]);
       });
-      if (open) await renderDir(folder, children, 1);
+      if (open) await renderDir(folder, children, 1, seq);
     }
   }
 

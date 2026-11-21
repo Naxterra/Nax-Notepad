@@ -296,8 +296,8 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
       scopeLost();
       return false;
     }
-    const matches: { from: number; to: number }[] = [];
     let hit: { from: number; to: number } | null = null;
+    let knownCount: { index: number; total: number } | null = null;
     if (!backwards) {
       const start = fromSelEnd ? sel.to : sel.from;
       let c = q.getCursor(state, Math.max(sc.from, start), sc.to);
@@ -312,10 +312,27 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
         }
       }
     } else {
+      let total = 0;
+      let beforeHit: { from: number; to: number } | null = null;
+      let beforeIdx = 0;
+      let lastHit: { from: number; to: number } | null = null;
       const c = q.getCursor(state, sc.from, sc.to);
-      for (let r = c.next(); !r.done; r = c.next()) matches.push(r.value);
-      const before = matches.filter((m) => m.from < sel.from);
-      hit = before.length ? before[before.length - 1] : matches.length ? (toast(t("Wrapped to end")), matches[matches.length - 1]) : null;
+      for (let r = c.next(); !r.done; r = c.next()) {
+        total++;
+        lastHit = r.value;
+        if (r.value.from < sel.from) {
+          beforeHit = r.value;
+          beforeIdx = total;
+        }
+      }
+      if (beforeHit) {
+        hit = beforeHit;
+        knownCount = { index: beforeIdx, total };
+      } else if (lastHit) {
+        hit = lastHit;
+        toast(t("Wrapped to end"));
+        knownCount = { index: total, total };
+      }
     }
     if (!hit) {
       status.textContent = t("Not found");
@@ -323,7 +340,11 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
     }
     app.view.dispatch({ selection: EditorSelection.range(hit.from, hit.to), scrollIntoView: true, effects: setQuery.of(q) });
     status.textContent = "";
-    updateCounter(q, sc, hit.from);
+    if (knownCount) {
+      counter.textContent = state.doc.length <= 20_000_000 && knownCount.total ? `${knownCount.index} / ${knownCount.total.toLocaleString()}` : "";
+    } else {
+      updateCounter(q, sc, hit.from);
+    }
     return true;
   }
 
@@ -417,11 +438,16 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
     const state = app.view.state;
     const sel = state.selection.main;
     if (tab.kind === "paged") {
+      if (toggles.inSelection && !tab.paged?.scopeActive) {
+        scopeLost();
+        return;
+      }
       // Replace the current selection if it is a match, then find the next one.
       const text = state.doc.toString();
       if (!sel.empty && selectionIsMatch(q, text, sel.from, sel.to)) {
         const rep = replacementAt(q, text, sel.from, sel.to);
-        app.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: rep }, selection: { anchor: sel.from + rep.length }, userEvent: "input.replace" });
+        const changes = state.changes({ from: sel.from, to: sel.to, insert: rep });
+        app.view.dispatch({ changes, selection: { anchor: changes.mapPos(sel.to, 1) }, userEvent: "input.replace" });
       }
       await findPaged(false);
       return;
@@ -433,7 +459,8 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
       const r = c.next();
       if (!r.done && r.value.from === sel.from && r.value.to === sel.to) {
         const rep = replacementAt(q, state.doc.toString(), sel.from, sel.to);
-        app.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: rep }, selection: { anchor: sel.from + rep.length }, userEvent: "input.replace" });
+        const changes = state.changes({ from: sel.from, to: sel.to, insert: rep });
+        app.view.dispatch({ changes, selection: { anchor: changes.mapPos(sel.to, 1) }, userEvent: "input.replace" });
       }
     }
     findMemory(false);
@@ -550,12 +577,21 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
       const link = h("a", { href: "#", class: "results-note link" }, " · " + t("{n} files not searched", { n: res.skippedCount.toLocaleString() }));
       link.addEventListener("click", (e) => {
         e.preventDefault();
-        renderResults(t("Files not searched"), [
-          {
-            title: "",
-            rows: res.skipped.map((s) => ({ line: -1, text: `${s.path}  —  ${REASONS[s.reason] ?? s.reason}`, go: () => void app.openFiles([s.path]) })),
-          },
-        ]);
+        const back = h("a", { href: "#", class: "results-note link" }, " · " + t("Back to hits"));
+        back.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          showFileResults(res, root);
+        });
+        renderResults(
+          t("Files not searched"),
+          [
+            {
+              title: "",
+              rows: res.skipped.map((s) => ({ line: -1, text: `${s.path}  —  ${REASONS[s.reason] ?? s.reason}`, go: () => void app.openFiles([s.path]) })),
+            },
+          ],
+          [back]
+        );
         results.querySelectorAll(".result-line").forEach((el) => (el.textContent = ""));
       });
       notes.push(link);
@@ -729,7 +765,8 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
     visible = false;
     panel.style.display = "none";
     status.textContent = "";
-    app.view.dispatch({ effects: setQuery.of(filterActive ? query() : null) });
+    const nextQuery = filterActive ? query() : null;
+    app.applySettingsToAll(() => [setQuery.of(nextQuery)]);
     app.view.focus();
   }
 
@@ -742,6 +779,7 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
     if (filterActive) scheduleFilter();
   });
   panel.addEventListener("keydown", (e) => {
+    const plainAlt = e.altKey && !e.ctrlKey && !e.metaKey && !e.getModifierState?.("AltGraph");
     if (e.key === "Escape") {
       e.preventDefault();
       close();
@@ -749,16 +787,16 @@ export function mountFind(app: App, top: HTMLElement, bottom: HTMLElement, hexVi
       e.preventDefault();
       if (mode === "files" || e.target === dirInput || e.target === globInput) void searchFiles();
       else if (e.target === replaceInput) void replaceOne();
-      else if (e.altKey) void findAll("doc");
+      else if (plainAlt) void findAll("doc");
       else if (e.shiftKey) prev();
       else next();
-    } else if (e.altKey && e.key.toLowerCase() === "c") {
+    } else if (plainAlt && e.key.toLowerCase() === "c") {
       e.preventDefault();
       tCase.click();
-    } else if (e.altKey && e.key.toLowerCase() === "w") {
+    } else if (plainAlt && e.key.toLowerCase() === "w") {
       e.preventDefault();
       tWord.click();
-    } else if (e.altKey && e.key.toLowerCase() === "r") {
+    } else if (plainAlt && e.key.toLowerCase() === "r") {
       e.preventDefault();
       tRegex.click();
     }

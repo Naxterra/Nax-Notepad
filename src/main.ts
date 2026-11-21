@@ -11,7 +11,7 @@ import { backend, errorText, FinishedSaves } from "./backend";
 import { addMacroCommands, buildCommands, Command, installKeybindings, recorder, runCommand } from "./commands";
 import { compartments, lineNumbersExt } from "./editor";
 import { applyKeymap } from "./keymap";
-import { loadSettings, onSettingsChange, settings, updateSettings } from "./settings";
+import { flushSettings, loadSettings, onSettingsChange, settings, updateSettings } from "./settings";
 import { applyTheme, onSystemThemeChange } from "./theme";
 import { confirm3, contextMenu, h, isModalOpen, message, toast } from "./ui/dialogs";
 import { copySelection, deleteSelection, pasteClipboard, selectAllIn } from "./clipboard";
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
         }
         inspectors[i].refresh();
       }
-    });
+    }).catch((e) => console.warn("syncHex failed", e));
   };
   app.on("active", syncHex);
   app.on("layout", syncHex);
@@ -346,6 +346,7 @@ async function main(): Promise<void> {
       for (;;) {
         try {
           await app.flushAll();
+          await flushSettings().catch((e) => console.warn("settings flush failed", e));
           break;
         } catch (e) {
           const r = await confirm3(
@@ -381,17 +382,6 @@ async function main(): Promise<void> {
   } finally {
     markRestored();
   }
-  if (saves.failed.length) {
-    const files = saves.failed.map((f) => `${f.target}\n${t("Copies:")} ${f.kept.join(", ")}`).join("\n\n");
-    void message(
-      t("Interrupted save not finished"),
-      t("Nax-Notepad stopped while saving these files and could not finish the save safely, because the file was changed afterwards, is missing or is in use. Nothing was overwritten. The text you were saving and the previous content are kept in the copies listed:\n\n{files}", { files })
-    );
-  }
-  const finished = saves.finished;
-  if (finished.length) {
-    void message(t("Interrupted save finished"), t("Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}", { files: finished.join("\n") }));
-  }
   const startup = await backend.startupFiles().catch(() => [] as string[]);
   if (startup.length) await app.openFiles(startup);
   else if (!restored) app.newTab();
@@ -401,10 +391,26 @@ async function main(): Promise<void> {
   await win.setFocus();
   app.view.focus();
 
+  if (saves.failed.length || saves.finished.length) {
+    void (async () => {
+      if (saves.failed.length) {
+        const files = saves.failed.map((f) => `${f.target}\n${t("Copies:")} ${f.kept.join(", ")}`).join("\n\n");
+        await message(
+          t("Interrupted save not finished"),
+          t("Nax-Notepad stopped while saving these files and could not finish the save safely, because the file was changed afterwards, is missing or is in use. Nothing was overwritten. The text you were saving and the previous content are kept in the copies listed:\n\n{files}", { files })
+        );
+      }
+      if (saves.finished.length) {
+        await message(t("Interrupted save finished"), t("Nax-Notepad stopped while saving these files. The save was finished now, so they contain the text you saved:\n\n{files}", { files: saves.finished.join("\n") }));
+      }
+    })();
+  }
+
   // Language change: persist everything, then reload the UI with the new strings
   window.addEventListener("nax:reload", () => {
     app
       .flushAll()
+      .then(() => flushSettings())
       .then(() => location.reload())
       .catch((e) => void message(t("Unsaved text could not be stored"), errorText(e)));
   });

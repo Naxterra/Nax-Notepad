@@ -17,6 +17,8 @@ export interface HexSnapshot {
   originalSize: number;
   /** Complete edited bytes for resizable files, encoded as base64. */
   bytes?: string;
+  /** Complete edited bytes stored in a companion binary recovery file. */
+  bytesFile?: boolean;
   /** Sparse overwrites for large files; the original must still match its recorded stamp. */
   patches?: [number, number][];
 }
@@ -71,12 +73,17 @@ export class HexBuffer {
   }
 
   /** Rebuild a dirty buffer without expanding a large source into memory. */
-  static restore(snapshot: HexSnapshot, source: ByteSource): HexBuffer {
+  static restore(snapshot: HexSnapshot, source: ByteSource, rawBytes?: Uint8Array): HexBuffer {
     const invalid = () => new Error(t("The saved byte changes are damaged and could not be restored."));
     if (!Number.isSafeInteger(snapshot.originalSize) || snapshot.originalSize < 0 || snapshot.originalSize !== source.size) throw invalid();
-    if ((typeof snapshot.bytes === "string") === Array.isArray(snapshot.patches)) throw invalid();
+    const hasBytes = typeof snapshot.bytes === "string" || snapshot.bytesFile === true;
+    const hasPatches = Array.isArray(snapshot.patches);
+    if (hasBytes === hasPatches) throw invalid();
     let data: Uint8Array | null = null;
-    if (typeof snapshot.bytes === "string") {
+    if (snapshot.bytesFile === true) {
+      if (snapshot.originalSize > FULL_LIMIT || !rawBytes) throw invalid();
+      data = rawBytes.slice();
+    } else if (typeof snapshot.bytes === "string") {
       if (snapshot.originalSize > FULL_LIMIT) throw invalid();
       try { data = Uint8Array.from(atob(snapshot.bytes), (ch) => ch.charCodeAt(0)); }
       catch { throw invalid(); }
@@ -96,6 +103,12 @@ export class HexBuffer {
     let binary = "";
     for (let i = 0; i < this.data.length; i += 0x8000) binary += String.fromCharCode(...this.data.subarray(i, i + 0x8000));
     return { originalSize: this.originalSize, bytes: btoa(binary) };
+  }
+
+  /** Metadata snapshot for raw binary IPC storage (avoids base64 JSON bloat for large buffers). */
+  rawSnapshot(): { meta: HexSnapshot; raw: Uint8Array } | null {
+    if (!this.resizable) return null;
+    return { meta: { originalSize: this.originalSize, bytesFile: true }, raw: this.data.slice() };
   }
 
   get size(): number {
@@ -219,7 +232,7 @@ export class HexBuffer {
     const before = this.slice(at, at + inside);
     if (inside < bytes.length) {
       // Writing past the end of a small file appends.
-      this.apply({ kind: "set", at, before, after: bytes.subarray(0, inside) }, true);
+      if (inside > 0) this.apply({ kind: "set", at, before, after: bytes.subarray(0, inside) }, true);
       this.apply({ kind: "insert", at: at + inside, bytes: bytes.slice(inside) }, true);
     } else this.apply({ kind: "set", at, before, after: bytes.slice() }, true);
     return bytes.length;
