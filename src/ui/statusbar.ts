@@ -39,7 +39,9 @@ export function mountStatusBar(app: App, root: HTMLElement, actions: StatusActio
   const right = h("div", { class: "sb-right" }, lp, indent, eol, enc, lang, zoom);
   root.append(left, right);
 
-  lp.addEventListener("click", () => app.active && app.toggleLivePreview(app.active));
+  lp.addEventListener("click", () => {
+    if (app.active) void app.toggleLivePreview(app.active);
+  });
   hexBadge.addEventListener("click", () => app.active && app.toggleHexView(app.active));
   rec.addEventListener("click", () => actions.run("macro.record"));
   tail.addEventListener("click", () => actions.run("view.followPause"));

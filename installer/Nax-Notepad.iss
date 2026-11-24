@@ -2,7 +2,7 @@
 ; Build with: powershell -File build.ps1   (compiles the app, then runs ISCC on this file)
 
 #ifndef AppVersion
-  #define AppVersion "0.5.10"
+  #define AppVersion "0.5.11"
 #endif
 #ifndef SourceExe
   #define SourceExe "..\src-tauri\target\release\nax-notepad.exe"

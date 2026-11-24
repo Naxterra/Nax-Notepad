@@ -496,7 +496,7 @@ export function buildCommands(app: App, find: FindPanel, extras: CommandExtras):
     { id: "view.lineNumbers", title: t("Line Numbers"), category: t("View"), run: () => updateSettings({ lineNumbers: !settings.lineNumbers }), checked: () => settings.lineNumbers },
     { id: "view.whitespace", title: t("Show Whitespace"), category: t("View"), run: () => updateSettings({ showWhitespace: !settings.showWhitespace }), checked: () => settings.showWhitespace },
     { id: "view.eol", title: t("Show Line Endings"), category: t("View"), run: () => updateSettings({ showEol: !settings.showEol }), checked: () => settings.showEol },
-    { id: "view.livePreview", title: t("Markdown Live Preview"), key: "Ctrl+Shift+V", category: t("View"), run: () => app.active && app.toggleLivePreview(app.active), checked: () => !!app.active?.livePreview && app.active.languageName === "Markdown" },
+    { id: "view.livePreview", title: t("Markdown Live Preview"), key: "Ctrl+Shift+V", category: t("View"), run: () => { if (app.active) return app.toggleLivePreview(app.active); }, checked: () => !!app.active?.livePreview && app.active.languageName === "Markdown" },
     { id: "view.zoomIn", title: t("Zoom In"), key: "Ctrl+=", category: t("View"), run: () => updateSettings({ fontSize: Math.min(72, settings.fontSize + 1) }) },
     { id: "view.zoomOut", title: t("Zoom Out"), key: "Ctrl+-", category: t("View"), run: () => updateSettings({ fontSize: Math.max(6, settings.fontSize - 1) }) },
     { id: "view.zoomReset", title: t("Reset Zoom"), key: "Ctrl+0", category: t("View"), run: () => updateSettings({ fontSize: 14 }) },

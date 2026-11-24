@@ -97,8 +97,9 @@ export function mountDocToolbar(app: App, root: HTMLElement, pane: 0 | 1): { ren
     }
 
     const parts: HTMLElement[] = [];
-    if (tab.languageName === "Markdown" && mode !== "hex") {
-      parts.push(h("button", { class: "tool-btn" + (tab.livePreview ? " on" : ""), "aria-pressed": String(tab.livePreview), title: t("Toggle Markdown Live Preview (Ctrl+Shift+V)"), click: () => app.toggleLivePreview(tab) }, icon("eye"), h("span", {}, t("Live Preview"))));
+    if ((tab.languageName === "Markdown" || (!own.path && !tab.languageName)) && mode !== "hex") {
+      const lpOn = tab.languageName === "Markdown" && tab.livePreview;
+      parts.push(h("button", { class: "tool-btn" + (lpOn ? " on" : ""), "aria-pressed": String(lpOn), title: t("Toggle Markdown Live Preview (Ctrl+Shift+V)"), click: () => void app.toggleLivePreview(tab) }, icon("eye"), h("span", {}, t("Live Preview"))));
     }
     parts.push(seg);
     if (own.path) {

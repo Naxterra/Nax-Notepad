@@ -61,15 +61,23 @@ function load(name) {
         return dialogs;
       case "clipboard":
         return clipboard;
+      case "livepreview":
+        return { livePreview: () => ["live-preview-ext"] };
       case "editor":
         return {
           systemChange: load("readonly").systemChange,
-          compartments: { lineNumbers: { reconfigure: () => [] }, readOnly: { reconfigure: () => [] }, whitespace: { reconfigure: () => [] } },
+          compartments: {
+            lineNumbers: { reconfigure: () => [] },
+            readOnly: { reconfigure: () => [] },
+            whitespace: { reconfigure: () => [] },
+            language: { reconfigure: (ext) => ({ language: ext }) },
+            livePreview: { reconfigure: (ext) => ({ livePreview: ext }) },
+          },
           lineNumbersExt: () => [],
           createState: () => EditorState.create({ doc: "" }),
-          languageByName: () => null,
+          languageByName: (n) => (n === "Markdown" ? { name: "Markdown" } : null),
           languageForFile: () => null,
-          loadLanguage: async () => [],
+          loadLanguage: async (d) => (d ? [d.name] : []),
         };
       case "readonly":
       case "paged":
@@ -2459,6 +2467,32 @@ test("hex paste preloads chunks from the selection start rather than the trailin
   } finally {
     clipboard.readText = oldRead;
   }
+});
+
+test("toggling Markdown Live Preview on a plain-text tab switches it to Markdown and turns preview on", async () => {
+  const tab = memoryTab({ path: null, untitled: 1, name: "new 1", languageName: null, livePreview: true });
+  const dispatched = [];
+  const app = fakeApp(tab, {
+    state: EditorState.create({ doc: "# Heading\n\n**bold**" }),
+    dispatch(spec) {
+      dispatched.push(spec);
+    },
+  });
+  delete app.applyLanguage;
+  await app.toggleLivePreview(tab);
+  assert.equal(tab.languageName, "Markdown");
+  assert.equal(tab.livePreview, true);
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].effects, [{ language: ["Markdown"] }, { livePreview: ["live-preview-ext"] }]);
+  // Toggling again while already in Markdown switches to Source view.
+  await app.toggleLivePreview(tab);
+  assert.equal(tab.languageName, "Markdown");
+  assert.equal(tab.livePreview, false);
+  assert.deepEqual(dispatched[1].effects, { livePreview: [] });
+  // Toggling once more re-enables Live Preview.
+  await app.toggleLivePreview(tab);
+  assert.equal(tab.livePreview, true);
+  assert.deepEqual(dispatched[2].effects, { livePreview: ["live-preview-ext"] });
 });
 
 (async () => {

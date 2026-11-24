@@ -584,6 +584,7 @@ export class App {
   private async applyLanguage(tab: Tab, desc: LanguageDescription | null): Promise<void> {
     tab.languageName = desc?.name ?? null;
     const ext: Extension = desc ? await loadLanguage(desc) : [];
+    if (!this.tabs.includes(tab)) return;
     const effects = [
       compartments.language.reconfigure(ext),
       compartments.livePreview.reconfigure(tab.livePreview && tab.languageName === "Markdown" ? livePreview(this.lpConfig(tab)) : []),
@@ -1525,10 +1526,19 @@ export class App {
     return { spaces: i ? i.spaces : settings.insertSpaces, size: i && i.size > 0 ? i.size : settings.tabSize };
   }
 
-  toggleLivePreview(tab: Tab): void {
+  async toggleLivePreview(tab: Tab): Promise<void> {
+    if (tab.hexView && !tab.splitView) {
+      await this.setViewMode(tab, "text");
+      if (tab.hexView && !tab.splitView) return;
+    }
+    if (tab.languageName !== "Markdown") {
+      tab.livePreview = true;
+      await this.setLanguage(tab, "Markdown");
+      return;
+    }
     tab.livePreview = !tab.livePreview;
     this.dispatchTo(tab, {
-      effects: compartments.livePreview.reconfigure(tab.livePreview && tab.languageName === "Markdown" ? livePreview(this.lpConfig(tab)) : []),
+      effects: compartments.livePreview.reconfigure(tab.livePreview ? livePreview(this.lpConfig(tab)) : []),
     });
     this.emit("status");
     this.scheduleSessionSave();
@@ -2098,7 +2108,10 @@ export class App {
         if (m.dirty) this.lostEdits.push(m.name ?? untitledName(m.untitled ?? 1));
         // untitled with no stored buffer: empty tab
         tab = this.makeTab({ id: meta.id, name: untitledName(m.untitled ?? 1), kind: "memory", untitled: m.untitled ?? null, livePreview: m.livePreview, pane, readOnly: m.readOnly });
-        tab.state = this.buildState(tab, "", []);
+        const desc = m.languageName ? languageByName(m.languageName) : null;
+        tab.languageName = desc?.name ?? null;
+        const langExt: Extension = desc ? await loadLanguage(desc) : [];
+        tab.state = this.buildState(tab, "", langExt);
         this.insertTab(tab);
       }
     }
